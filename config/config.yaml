@@ -1,0 +1,44 @@
+# Customer Retention Analytics Platform — Configuration
+#
+# Single source of truth for all tunable values, per Repository
+# Architecture v1.0 Section 5: "one YAML file, one loader, no magic
+# numbers in code."
+#
+# All values in this file are loaded by the application's configuration
+# module instead of being hard-coded inside the source code.
+#
+# STATUS (Commit 1): Structure only.
+# Values will be populated in the commits where those decisions are made.
+# No value should be added before it is justified by implementation.
+
+paths:
+  raw_data: null # TODO (Commit 3 — database engine ADR)
+  interim_db: null # TODO (Commit 3)
+  processed_dataset: null # TODO (Commit 3)
+  models_dir: artifacts/models
+  evaluation_dir: artifacts/evaluation
+  runs_dir: artifacts/runs
+  outputs_dir: outputs
+
+reproducibility:
+  seed: null # TODO (Commit 4 — EDA & baseline analysis)
+
+data:
+  test_size: null # TODO (Commit 4)
+  cv_folds: null # TODO (Commit 7 — candidate model comparison)
+  cv_repeats: null # TODO (Commit 7)
+
+business:
+  k: null # TODO (ADR — frozen K default)
+  risk_tiers: null # TODO (Commit 9 — evaluation & error analysis)
+  economics:
+    arpu_proxy: null # TODO (Commit 11 — decision-support outputs)
+    offer_cost: null # TODO (Commit 11)
+
+tuning:
+  budget_per_model: null # TODO (ADR before Commit 8)
+  objective_metric: null # TODO (ADR before Commit 8)
+
+inference:
+  input_schema: null # TODO (Commit 10)
+  output_path: null # TODO (Commit 10)
