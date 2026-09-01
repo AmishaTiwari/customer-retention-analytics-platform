@@ -13,15 +13,14 @@ authors = [
     { name = "Amisha Tiwari", email = "amitiwari66@gmail.com" },
 ]
 
-# No database library is included yet: the local analytical database engine
-# (SQLite vs DuckDB) is an open decision deferred to a later commit and will
-# be added via an ADR.
+# duckdb is the local analytical database engine used for SQL-based data preparation.
 dependencies = [
     "pandas~=2.2",
     "numpy~=1.26",
     "scikit-learn~=1.6",
     "xgboost~=3.3",
     "pyyaml~=6.0",
+    "duckdb~=1.1",
 ]
 
 [project.optional-dependencies]

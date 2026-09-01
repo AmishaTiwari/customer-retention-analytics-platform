@@ -1,8 +1,17 @@
-"""Central logging configuration.
+"""Central logging configuration, shared by every module in the package."""
 
-Configures Python's standard `logging` module once, used by every module
-in the package. No `print` statements are permitted elsewhere in the
-package, per Repository Architecture v1.0 Section 6.
+import logging
 
-Not yet implemented — scaffolded in Commit 1.
-"""
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure the root logger once; safe to call multiple times."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root.addHandler(handler)
+    root.setLevel(level)

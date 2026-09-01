@@ -1,8 +1,6 @@
 # Customer Retention Analytics Platform — Configuration
 #
-# Single source of truth for all tunable values, per Repository
-# Architecture v1.0 Section 5: "one YAML file, one loader, no magic
-# numbers in code."
+# Single source of truth for all tunable values.
 #
 # All values in this file are loaded by the application's configuration
 # module instead of being hard-coded inside the source code.
