@@ -10,8 +10,8 @@
 # No value should be added before it is justified by implementation.
 
 paths:
-  raw_data: null # TODO (Commit 3 — database engine ADR)
-  interim_db: null # TODO (Commit 3)
+  raw_data: data/raw
+  interim_db: data/interim/retention_platform.duckdb
   processed_dataset: null # TODO (Commit 3)
   models_dir: artifacts/models
   evaluation_dir: artifacts/evaluation

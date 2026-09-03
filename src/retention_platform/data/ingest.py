@@ -14,12 +14,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from retention_platform.config import load_config
 from retention_platform.logging_setup import setup_logging
 
 logger = logging.getLogger("retention_platform.data.ingest")
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RAW_DIR = REPO_ROOT / "data" / "raw"
 
 
 @dataclass(frozen=True)
@@ -179,7 +177,7 @@ def verify_raw_data(raw_dir: Path | None = None) -> None:
     Raises RawDataVerificationError listing every mismatch found across all
     files if any file fails verification.
     """
-    raw_dir = raw_dir or DEFAULT_RAW_DIR
+    raw_dir = raw_dir or load_config()["paths"]["raw_data"]
     all_errors: list[str] = []
 
     for spec in RAW_FILE_SPECS:

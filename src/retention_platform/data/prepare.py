@@ -14,14 +14,12 @@ from pathlib import Path
 
 import duckdb
 
+from retention_platform.config import load_config
 from retention_platform.logging_setup import setup_logging
 
 logger = logging.getLogger("retention_platform.data.prepare")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_RAW_DIR = REPO_ROOT / "data" / "raw"
-DEFAULT_INTERIM_DIR = REPO_ROOT / "data" / "interim"
-DEFAULT_DB_PATH = DEFAULT_INTERIM_DIR / "retention_platform.duckdb"
 STAGING_SQL_DIR = REPO_ROOT / "sql" / "01_staging"
 
 _CREATE_TABLE_RE = re.compile(
@@ -46,7 +44,7 @@ def run_staging(
     staging_dir: Path | None = None,
 ) -> None:
     """Execute every SQL script in sql/01_staging/, in filename order."""
-    raw_dir = raw_dir or DEFAULT_RAW_DIR
+    raw_dir = raw_dir or load_config()["paths"]["raw_data"]
     staging_dir = staging_dir or STAGING_SQL_DIR
 
     scripts = sorted(staging_dir.glob("*.sql"))
@@ -68,8 +66,9 @@ def run_staging(
 def main() -> None:
     setup_logging()
 
-    DEFAULT_INTERIM_DIR.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(DEFAULT_DB_PATH))
+    db_path = load_config()["paths"]["interim_db"]
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = duckdb.connect(str(db_path))
     try:
         run_staging(conn)
     except StagingError as exc:
