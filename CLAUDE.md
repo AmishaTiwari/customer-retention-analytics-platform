@@ -39,3 +39,11 @@ If a package appears to be missing:
 3. If it genuinely is not declared yet, stop and ask before installing anything, rather than installing it into whatever Python happens to be active in the current shell.
 
 A `VIRTUAL_ENV does not match the project environment path` warning from `uv run` is expected and harmless if it appears -- it means `uv` correctly ignored a stray environment variable from outside this project and used `.venv` anyway. It is not a sign the command ran against the wrong environment.
+
+## Exception handling at entry points
+
+Every module's main() must catch every exception type that the functions it calls can realistically raise -- not only the exception type the module defines for itself. If a function calls into another module (for example, load_config() from config.py) and that module can raise its own exception, main() must catch it explicitly, log it clearly via the logger, and exit non-zero -- the same way it already handles its own module's exception type.
+
+Do not assume a dependency's exception is "someone else's problem" simply because it wasn't raised by this module's own code. An entry point is responsible for narrating every failure a user could encounter when running it, not just the failures this file's own logic introduces.
+
+This does not mean wrapping every internal function call in its own try/except -- letting exceptions propagate naturally up to main() is correct and expected. The requirement is specifically that main()'s exception handling is complete: covering every failure mode reachable from that entry point, including ones originating in imported modules.

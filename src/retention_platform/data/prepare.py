@@ -14,7 +14,7 @@ from pathlib import Path
 
 import duckdb
 
-from retention_platform.config import load_config
+from retention_platform.config import ConfigValidationError, load_config
 from retention_platform.logging_setup import setup_logging
 
 logger = logging.getLogger("retention_platform.data.prepare")
@@ -66,16 +66,21 @@ def run_staging(
 def main() -> None:
     setup_logging()
 
-    db_path = load_config()["paths"]["interim_db"]
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path))
+    conn = None
     try:
+        db_path = load_config()["paths"]["interim_db"]
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = duckdb.connect(str(db_path))
         run_staging(conn)
     except StagingError as exc:
         logger.error("Data preparation (staging) failed: %s", exc)
         sys.exit(1)
+    except ConfigValidationError as exc:
+        logger.error("Configuration error:\n%s", exc)
+        sys.exit(1)
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
     logger.info("Data preparation (staging) complete.")
 

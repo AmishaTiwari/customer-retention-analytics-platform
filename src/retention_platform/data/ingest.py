@@ -14,7 +14,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from retention_platform.config import load_config
+from retention_platform.config import ConfigValidationError, load_config
 from retention_platform.logging_setup import setup_logging
 
 logger = logging.getLogger("retention_platform.data.ingest")
@@ -208,6 +208,9 @@ def main() -> None:
         verify_raw_data()
     except RawDataVerificationError as exc:
         logger.error("Raw data verification failed:\n%s", exc)
+        sys.exit(1)
+    except ConfigValidationError as exc:
+        logger.error("Configuration error:\n%s", exc)
         sys.exit(1)
     logger.info("Raw data verification passed for all %d expected files.", len(RAW_FILE_SPECS))
 
