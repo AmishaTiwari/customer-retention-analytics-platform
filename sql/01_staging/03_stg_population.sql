@@ -1,10 +1,20 @@
 -- Loads raw Population CSV into stg_population with normalized column names
--- and types. Zip Code is cast to VARCHAR since it is an identifier, not a
--- quantity, and DuckDB would otherwise infer it as numeric.
+-- and types. Column types are declared explicitly via read_csv's columns
+-- parameter so DuckDB never infers (and silently converts) a column's type
+-- on its own -- notably Zip Code, which must stay VARCHAR since it is an
+-- identifier, not a quantity.
 
 CREATE OR REPLACE TABLE stg_population AS
 SELECT
-    CAST("ID" AS INTEGER) AS id,
-    CAST("Zip Code" AS VARCHAR) AS zip_code,
-    CAST("Population" AS INTEGER) AS population
-FROM read_csv('{raw_dir}/telco_customer_churn_population.csv', header = true);
+    "ID" AS id,
+    "Zip Code" AS zip_code,
+    "Population" AS population
+FROM read_csv(
+    '{raw_dir}/telco_customer_churn_population.csv',
+    header = true,
+    columns = {
+        'ID': 'INTEGER',
+        'Zip Code': 'VARCHAR',
+        'Population': 'INTEGER'
+    }
+);
