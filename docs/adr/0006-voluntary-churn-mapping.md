@@ -24,9 +24,9 @@ The crosstab of `Churn Category` × `Churn Reason`, for churned customers only, 
 | Attitude | 314 | Attitude of support person, attitude of service provider |
 | Dissatisfaction | 303 | Product/service dissatisfaction, network reliability, limited services, poor online/phone support expertise |
 | Price | 211 | Price too high, extra data charges, long distance charges, lack of affordable speed |
-| Other | 200 | Don't know (130), Moved (46), Deceased (6), Poor expertise of phone support (18) |
+| Other | 200 | Don't know (130), Moved (46), Deceased (6), Poor expertise of online support (18) |
 
-One data-placement observation: "Poor expertise of phone support" (18 rows) is grouped under `Churn Category = Other` in the source data, despite reading identically in substance to the phone/online support expertise reasons already grouped under `Dissatisfaction`. This is treated as a data-placement inconsistency in the source categorization, not a distinct reason requiring its own business judgment.
+One data-placement observation: "Poor expertise of online support" (18 rows) is grouped under `Churn Category = Other` in the source data, despite reading identically in substance to the phone/online support expertise reasons already grouped under `Dissatisfaction` (which separately includes "Poor expertise of phone support," 12 rows, correctly placed there). This is treated as a data-placement inconsistency in the source categorization, not a distinct reason requiring its own business judgment.
 
 ---
 
@@ -40,7 +40,7 @@ The following mapping is applied to construct `is_voluntary_churn`:
 | Attitude (all reasons) | Voluntary |
 | Dissatisfaction (all reasons) | Voluntary |
 | Price (all reasons) | Voluntary |
-| Other → "Poor expertise of phone support" | Voluntary (reclassified as Dissatisfaction) |
+| Other → "Poor expertise of online support" | Voluntary (reclassified as Dissatisfaction) |
 | Other → "Moved" | Voluntary (assumption — see below) |
 | Other → "Don't know" | Voluntary (assumption — see below) |
 | Other → "Deceased" | **Excluded from the modeling dataset entirely** |
@@ -56,7 +56,7 @@ The classifications above rest on two different kinds of grounding, and this dis
 **Backed directly by the dataset (not a judgment call):**
 
 - Competitor, Attitude, Dissatisfaction, and Price all describe reasons where the customer explicitly cited a factor that led them to actively cancel. These map to voluntary churn with no interpretive gap between the raw data and the Business Design's definition.
-- "Poor expertise of phone support" reclassified under Dissatisfaction is a data-quality correction, not a business judgment — the reason text itself is indistinguishable from reasons already classified as Dissatisfaction.
+- "Poor expertise of online support" reclassified under Dissatisfaction is a data-quality correction, not a business judgment — the reason text itself is indistinguishable from reasons already classified as Dissatisfaction.
 - "Deceased" is factually not a customer choice, and does not fit the Business Design's involuntary definition either (not fraud, not non-payment, not an operational reason). Excluding these rows is the only option that doesn't misrepresent what happened.
 
 **Explicit project assumptions, not proven by the data (judgment calls):**
@@ -73,7 +73,7 @@ These two assumptions collectively affect 176 of 1,869 churned rows (~9.4%) and 
 - `sql/03_target/` implements this mapping to construct `is_voluntary_churn`, the modeling target.
 - The 6 `Deceased` rows are excluded from the modeling dataset at the SQL layer, not just from the target — they do not belong in either class.
 - `docs/data_dictionary_leakage_audit.md` will classify `Churn Category` and `Churn Reason` as Target Construction Only (used to build the target, excluded from modeling features) and will reference this ADR for the disposition rationale.
-- `tests/test_target.py` will assert this mapping's behavior directly (e.g. deceased rows excluded, moved/don't-know rows treated as voluntary, poor-phone-support-expertise rows reclassified) through self-documenting test names, without repeating this ADR's reasoning inline.
+- `tests/test_target.py` will assert this mapping's behavior directly (e.g. deceased rows excluded, moved/don't-know rows treated as voluntary, poor-online-support-expertise rows reclassified) through self-documenting test names, without repeating this ADR's reasoning inline.
 - If the "Moved" or "Don't know" assumptions are ever revisited (for example, if a future iteration wants a three-class target: voluntary / involuntary / unknown), that would require a new ADR superseding this one, not a silent change to `sql/03_target/`.
 
 ---
