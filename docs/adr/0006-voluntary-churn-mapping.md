@@ -20,13 +20,13 @@ The crosstab of `Churn Category` × `Churn Reason`, for churned customers only, 
 
 | Churn Category | Count | Reasons |
 |---|---|---|
-| Competitor | 841 | Better devices, better offer, more data, higher download speeds |
-| Attitude | 314 | Attitude of support person, attitude of service provider |
-| Dissatisfaction | 303 | Product/service dissatisfaction, network reliability, limited services, poor online/phone support expertise |
-| Price | 211 | Price too high, extra data charges, long distance charges, lack of affordable speed |
-| Other | 200 | Don't know (130), Moved (46), Deceased (6), Poor expertise of online support (18) |
+| Competitor | 841 | Better devices (313), better offer (311), more data (117), higher download speeds (100) |
+| Attitude | 314 | Attitude of support person (220), attitude of service provider (94) |
+| Dissatisfaction | 303 | Product dissatisfaction (77), network reliability (72), service dissatisfaction (63), limited range of services (37), lack of self-service on website (29), poor expertise of online support (13), poor expertise of phone support (12) |
+| Price | 211 | Price too high (78), long distance charges (64), extra data charges (39), lack of affordable download/upload speed (30) |
+| Other | 200 | Don't know (130), Moved (46), Poor expertise of online support (18), Deceased (6) |
 
-One data-placement observation: "Poor expertise of online support" (18 rows) is grouped under `Churn Category = Other` in the source data, despite reading identically in substance to the phone/online support expertise reasons already grouped under `Dissatisfaction` (which separately includes "Poor expertise of phone support," 12 rows, correctly placed there). This is treated as a data-placement inconsistency in the source categorization, not a distinct reason requiring its own business judgment.
+One data-placement observation: "Poor expertise of online support" appears under two different categories in the source data — 18 rows under `Churn Category = Other`, and a separate 13 rows already correctly placed under `Churn Category = Dissatisfaction`. The 18 rows under `Other` are treated as a data-placement inconsistency (reading identically in substance to the Dissatisfaction-category reasons), not a distinct reason requiring its own business judgment. The 13 rows already under Dissatisfaction require no reclassification. "Poor expertise of phone support" (12 rows) is separately and correctly placed under Dissatisfaction, and is unrelated to this reclassification.
 
 ---
 
