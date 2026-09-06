@@ -1,8 +1,8 @@
 """Runs the versioned SQL scripts against the local DuckDB database.
 
-Currently executes sql/01_staging/ and sql/02_cleaning/. Later stages
-(target, modeling view) will be added as additional steps in main() without
-changing how staging/cleaning run.
+Currently executes sql/01_staging/, sql/02_cleaning/, and sql/03_target/.
+Later stages (modeling view) will be added as additional steps in main()
+without changing how the existing stages run.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ logger = logging.getLogger("retention_platform.data.prepare")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 STAGING_SQL_DIR = REPO_ROOT / "sql" / "01_staging"
 CLEANING_SQL_DIR = REPO_ROOT / "sql" / "02_cleaning"
+TARGET_SQL_DIR = REPO_ROOT / "sql" / "03_target"
 
 _CREATE_TABLE_RE = re.compile(
     r"CREATE\s+OR\s+REPLACE\s+TABLE\s+(\w+)", re.IGNORECASE
@@ -34,6 +35,10 @@ class StagingError(Exception):
 
 class CleaningError(Exception):
     """Raised when a cleaning SQL script fails to execute."""
+
+
+class TargetConstructionError(Exception):
+    """Raised when a target-construction SQL script fails to execute."""
 
 
 def _table_name_from_sql(sql_text: str, script_path: Path) -> str:
@@ -90,6 +95,30 @@ def run_cleaning(
         logger.info("%s: %d rows", table_name, row_count)
 
 
+def run_target(
+    conn: duckdb.DuckDBPyConnection,
+    target_dir: Path | None = None,
+) -> None:
+    """Execute every SQL script in sql/03_target/, in filename order."""
+    target_dir = target_dir or TARGET_SQL_DIR
+
+    scripts = sorted(target_dir.glob("*.sql"))
+    for script_path in scripts:
+        sql_text = script_path.read_text(encoding="utf-8")
+
+        try:
+            table_name = _table_name_from_sql(sql_text, script_path)
+            conn.execute(sql_text)
+        except Exception as exc:
+            logger.error("Target-construction script %s failed: %s", script_path.name, exc)
+            raise TargetConstructionError(
+                f"Target-construction script {script_path.name} failed: {exc}"
+            ) from exc
+
+        row_count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        logger.info("%s: %d rows", table_name, row_count)
+
+
 def main() -> None:
     setup_logging()
 
@@ -100,11 +129,15 @@ def main() -> None:
         conn = duckdb.connect(str(db_path))
         run_staging(conn)
         run_cleaning(conn)
+        run_target(conn)
     except StagingError as exc:
         logger.error("Data preparation (staging) failed: %s", exc)
         sys.exit(1)
     except CleaningError as exc:
         logger.error("Data preparation (cleaning) failed: %s", exc)
+        sys.exit(1)
+    except TargetConstructionError as exc:
+        logger.error("Data preparation (target construction) failed: %s", exc)
         sys.exit(1)
     except ConfigValidationError as exc:
         logger.error("Configuration error:\n%s", exc)
@@ -113,7 +146,7 @@ def main() -> None:
         if conn is not None:
             conn.close()
 
-    logger.info("Data preparation (staging + cleaning) complete.")
+    logger.info("Data preparation (staging + cleaning + target) complete.")
 
 
 if __name__ == "__main__":
