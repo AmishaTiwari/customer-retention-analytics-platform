@@ -21,6 +21,7 @@ dependencies = [
     "xgboost~=3.3",
     "pyyaml~=6.0",
     "duckdb~=1.1",
+    "matplotlib~=3.11",
 ]
 
 [project.optional-dependencies]
