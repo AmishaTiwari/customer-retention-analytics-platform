@@ -1,11 +1,25 @@
 -- Adds four hypothesis-driven derived features on top of the modeling
 -- view:
 --   num_addon_services -- count of the 8 opted-in add-on services.
+--     Hypothesis: customers with fewer bundled services have less
+--     invested in the relationship and lower switching cost, making
+--     them more likely to churn.
 --   is_month_to_month -- flags customers on a month-to-month contract.
+--     Hypothesis: the absence of a contract term removes friction
+--     from leaving, so month-to-month customers churn more easily
+--     than customers under a fixed-term contract.
 --   internet_without_security -- flags internet customers with no
 --     online security add-on.
+--     Hypothesis: internet customers who decline security coverage
+--     are more exposed to service dissatisfaction (e.g. malware,
+--     unwanted charges) that can drive churn.
 --   no_addons_despite_internet -- flags internet customers who opted
 --     into zero add-on services.
+--     Hypothesis: distinguishes customers who have zero add-ons
+--     because they lack internet service (structural, the majority
+--     of the num_addon_services = 0 group) from the small group who
+--     have internet but declined every add-on, a distinct pattern
+--     worth isolating even though it covers only 81 customers.
 
 CREATE OR REPLACE TABLE feat_churn AS
 SELECT
