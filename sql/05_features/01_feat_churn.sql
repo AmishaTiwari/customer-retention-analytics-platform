@@ -1,9 +1,11 @@
--- Adds three hypothesis-driven derived features on top of the modeling
+-- Adds four hypothesis-driven derived features on top of the modeling
 -- view:
 --   num_addon_services -- count of the 8 opted-in add-on services.
 --   is_month_to_month -- flags customers on a month-to-month contract.
 --   internet_without_security -- flags internet customers with no
 --     online security add-on.
+--   no_addons_despite_internet -- flags internet customers who opted
+--     into zero add-on services.
 
 CREATE OR REPLACE TABLE feat_churn AS
 SELECT
@@ -61,6 +63,9 @@ SELECT
     (contract = 'Month-to-Month') AS is_month_to_month,
 
     (internet_service = true AND online_security = false)
-        AS internet_without_security
+        AS internet_without_security,
+
+    (internet_service = true AND num_addon_services = 0)
+        AS no_addons_despite_internet
 
 FROM mv_churn;

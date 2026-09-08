@@ -72,6 +72,21 @@ def test_internet_without_security_flag_correct(conn):
     assert count == 0
 
 
+def test_no_addons_despite_internet_count(conn):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM feat_churn WHERE no_addons_despite_internet = true"
+    ).fetchone()[0]
+    assert count == 81
+
+
+def test_no_addons_despite_internet_false_when_no_internet(conn):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM feat_churn "
+        "WHERE internet_service = false AND no_addons_despite_internet != false"
+    ).fetchone()[0]
+    assert count == 0
+
+
 @pytest.mark.parametrize(
     "column", ["customer_id", "is_voluntary_churn", "tenure_in_months", "contract"]
 )
