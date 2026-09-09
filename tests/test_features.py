@@ -87,6 +87,21 @@ def test_no_addons_despite_internet_false_when_no_internet(conn):
     assert count == 0
 
 
+def test_is_tenure_censored_matches_tenure(conn):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM feat_churn "
+        "WHERE (tenure_in_months = 72) != is_tenure_censored"
+    ).fetchone()[0]
+    assert count == 0
+
+
+def test_is_tenure_censored_count(conn):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM feat_churn WHERE is_tenure_censored = true"
+    ).fetchone()[0]
+    assert count == 362
+
+
 @pytest.mark.parametrize(
     "column", ["customer_id", "is_voluntary_churn", "tenure_in_months", "contract"]
 )

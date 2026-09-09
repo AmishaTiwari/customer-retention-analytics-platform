@@ -1,4 +1,4 @@
--- Adds four hypothesis-driven derived features on top of the modeling
+-- Adds five hypothesis-driven derived features on top of the modeling
 -- view:
 --   num_addon_services -- count of the 8 opted-in add-on services.
 --     Hypothesis: customers with fewer bundled services have less
@@ -20,6 +20,16 @@
 --     of the num_addon_services = 0 group) from the small group who
 --     have internet but declined every add-on, a distinct pattern
 --     worth isolating even though it covers only 81 customers.
+--   is_tenure_censored -- flags customers recorded at exactly 72
+--     months of tenure.
+--     Hypothesis: tenure_in_months is measured as of a fixed
+--     reporting-quarter end date, so 72 (the dataset's documented
+--     maximum) represents right-censoring -- customers whose actual
+--     tenure may be 72 months or longer are all recorded as exactly
+--     72, making this boundary a data-generation artifact worth
+--     isolating rather than a genuine loyalty signal. The boundary is
+--     justified by this documented measurement ceiling, not by a
+--     statistical test of a churn-rate discontinuity at this value.
 
 CREATE OR REPLACE TABLE feat_churn AS
 SELECT
@@ -80,6 +90,8 @@ SELECT
         AS internet_without_security,
 
     (internet_service = true AND num_addon_services = 0)
-        AS no_addons_despite_internet
+        AS no_addons_despite_internet,
+
+    (tenure_in_months = 72) AS is_tenure_censored
 
 FROM mv_churn;
