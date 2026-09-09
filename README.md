@@ -39,6 +39,9 @@ A few of the engineering decisions behind this repository, each recorded as an A
 - **Python 3.12** was standardized on to ensure compatibility with XGBoost and the broader ML ecosystem — [ADR-0001](docs/adr/0001-python-version.md)
 - **Planning documents are kept in a private planning repository**, separate from this public codebase, to keep this repository focused on the implemented system — [ADR-0002](docs/adr/0002-exclude-planning-docs-from-public-repo.md)
 - **`uv` is used for environment and dependency management**, giving a single-command, reproducible setup — [ADR-0003](docs/adr/0003-use-uv.md)
+- **DuckDB is used as the local analytical database engine** for all SQL-based data preparation, chosen over SQLite for its native CSV reading, warehouse-style SQL dialect, and clean pandas interop — [ADR-0004](docs/adr/0004-database-engine.md)
+- **The raw dataset is committed to the repository** under `data/raw/` rather than downloaded at run time, so `make reproduce` works for a stranger with no dependency on an external mirror staying available — [ADR-0005](docs/adr/0005-raw-data-commit-policy.md)
+- **The voluntary-churn target mapping is derived from `Churn Category`/`Churn Reason`**, excluding deceased customers entirely and documenting which classifications are dataset-backed versus explicit project assumptions — [ADR-0006](docs/adr/0006-voluntary-churn-mapping.md)
 
 More Architecture Decision Records (ADRs) will be added as the project evolves, documenting significant engineering decisions throughout the implementation.
 
