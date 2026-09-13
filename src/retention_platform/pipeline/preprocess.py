@@ -8,11 +8,17 @@ Regression, Random Forest, and XGBoost.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import duckdb
+import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from retention_platform.pipeline.split import split_feat_churn
 
 # Columns retained separately, never part of X.
 IDENTIFIER_COLUMN = "customer_id"
@@ -126,4 +132,49 @@ def build_preprocessing_pipeline() -> ColumnTransformer:
         # isn't one of the five CATEGORICAL_COLUMNS -- is treated as
         # numeric and scaled.
         remainder=StandardScaler(),
+    )
+
+
+@dataclass(frozen=True)
+class ModelInputs:
+    """Model-ready train/test arrays, targets, ids, and the fitted transformer.
+
+    X_train/X_test are already transformed (encoded + scaled). preprocessor
+    is the fitted transformer itself, returned for reuse against new data --
+    persisting it to disk is out of scope here.
+    """
+
+    X_train: np.ndarray
+    X_test: np.ndarray
+    y_train: pd.Series
+    y_test: pd.Series
+    id_train: pd.Series
+    id_test: pd.Series
+    preprocessor: ColumnTransformer
+
+
+def prepare_model_inputs(conn: duckdb.DuckDBPyConnection) -> ModelInputs:
+    """Split feat_churn, select columns, and fit/apply preprocessing.
+
+    Fits build_preprocessing_pipeline() on the train split only, then
+    transforms both train and test with that fitted transformer. This is
+    the single entry point a model-training step should call to go from
+    a database connection to ready-to-train arrays.
+    """
+    split = split_feat_churn(conn)
+    X_train, y_train, id_train = select_model_columns(split.train)
+    X_test, y_test, id_test = select_model_columns(split.test)
+
+    preprocessor = build_preprocessing_pipeline()
+    X_train_transformed = preprocessor.fit_transform(X_train)
+    X_test_transformed = preprocessor.transform(X_test)
+
+    return ModelInputs(
+        X_train=X_train_transformed,
+        X_test=X_test_transformed,
+        y_train=y_train,
+        y_test=y_test,
+        id_train=id_train,
+        id_test=id_test,
+        preprocessor=preprocessor,
     )

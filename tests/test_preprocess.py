@@ -28,6 +28,7 @@ from retention_platform.pipeline.preprocess import (
     INTERNET_TYPE_SENTINEL,
     OFFER_SENTINEL,
     build_preprocessing_pipeline,
+    prepare_model_inputs,
     select_model_columns,
 )
 from retention_platform.pipeline.split import split_feat_churn
@@ -136,3 +137,29 @@ def test_structural_null_maps_to_sentinel_category(train_test_columns, column, s
 def test_transform_on_test_matches_train_column_count(fitted_pipeline_output):
     Xt_train, Xt_test = fitted_pipeline_output
     assert Xt_test.shape[1] == Xt_train.shape[1]
+
+
+@pytest.fixture(scope="module")
+def model_inputs(conn):
+    return prepare_model_inputs(conn)
+
+
+def test_prepare_model_inputs_succeeds_end_to_end(model_inputs):
+    assert model_inputs.X_train.shape[0] > 0
+    assert model_inputs.X_test.shape[0] > 0
+    assert model_inputs.X_train.shape[1] == model_inputs.X_test.shape[1]
+
+
+def test_returned_preprocessor_is_already_fitted(model_inputs, train_test_columns):
+    X_train, _X_test = train_test_columns
+    reapplied = model_inputs.preprocessor.transform(X_train)
+    np.testing.assert_array_equal(reapplied, model_inputs.X_train)
+
+
+def test_ids_correspond_to_targets_in_length_and_order(model_inputs, train_test_columns):
+    X_train, X_test = train_test_columns
+
+    assert len(model_inputs.id_train) == len(model_inputs.y_train) == len(X_train)
+    assert len(model_inputs.id_test) == len(model_inputs.y_test) == len(X_test)
+    assert model_inputs.id_train.index.equals(model_inputs.y_train.index)
+    assert model_inputs.id_test.index.equals(model_inputs.y_test.index)
