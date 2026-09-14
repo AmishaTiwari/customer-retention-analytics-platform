@@ -76,7 +76,6 @@ SELECT
     total_extra_data_charges,
     total_long_distance_charges,
     total_revenue,
-    satisfaction_score,
 
     (online_security::INTEGER + online_backup::INTEGER +
      device_protection_plan::INTEGER + premium_tech_support::INTEGER +

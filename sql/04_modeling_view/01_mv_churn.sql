@@ -3,7 +3,10 @@
 -- columns are permanently excluded, enforced simply by never selecting
 -- them (not by filtering them out after the fact):
 --   1. Post-outcome/temporal leakage columns: churn_score, cltv,
---      churn_category, churn_reason.
+--      churn_category, churn_reason, and satisfaction_score (near-perfect
+--      deterministic separation by churn outcome -- scores 1-2 are always
+--      churned, 4-5 never churned -- the signature of a value assigned
+--      using knowledge of the outcome).
 --   2. Target-derived columns that would trivially expose the target:
 --      customer_status, churn_label, churn_value.
 
@@ -55,13 +58,10 @@ SELECT
     s.total_refunds,
     s.total_extra_data_charges,
     s.total_long_distance_charges,
-    s.total_revenue,
-
-    st.satisfaction_score
+    s.total_revenue
 
 FROM tgt_churn t
 INNER JOIN cln_demographics d ON t.customer_id = d.customer_id
 INNER JOIN stg_location l ON t.customer_id = l.customer_id
 LEFT JOIN stg_population p ON l.zip_code = p.zip_code
-INNER JOIN cln_services s ON t.customer_id = s.customer_id
-INNER JOIN stg_status st ON t.customer_id = st.customer_id;
+INNER JOIN cln_services s ON t.customer_id = s.customer_id;

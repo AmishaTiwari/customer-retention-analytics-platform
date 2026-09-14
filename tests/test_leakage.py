@@ -26,6 +26,7 @@ POST_OUTCOME_LEAKAGE_COLUMNS = [
     "cltv",
     "churn_category",
     "churn_reason",
+    "satisfaction_score",
 ]
 
 # Target-derived columns: would trivially expose the target itself.

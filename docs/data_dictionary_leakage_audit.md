@@ -101,7 +101,7 @@ This document records the disposition of every raw column across the five source
 | Customer ID | VARCHAR | Identifier | Join key. |
 | Count | INTEGER | Excluded (Other) | Constant reporting artifact. |
 | Quarter | VARCHAR | Excluded (Other) | Constant value ("Q3"). |
-| Satisfaction Score | INTEGER | Feature | Empirically verified as fully populated across all `Customer Status` values (Stayed, Joined, Churned alike) during Dataset Understanding, Stage 2 — reflects ongoing customer sentiment, not an exit-only survey artifact. |
+| Satisfaction Score | INTEGER | Excluded (Leakage) | Fully populated across all `Customer Status` values (Stayed, Joined, Churned alike), which was the original basis for classifying this as a Feature — but that check only established availability, not independence from the outcome. A direct check of churn rate by score value found near-perfect deterministic separation: scores 1 and 2 are 100% churned, scores 4 and 5 are 0% churned, and only score 3 is mixed. This is the signature of a value assigned using knowledge of the outcome, not an independent predictive signal. |
 | Customer Status | VARCHAR | Target Construction Only | Directly represents the outcome the target is built from; including it as a feature would trivially expose the target to the model. |
 | Churn Label | BOOLEAN | Target Construction Only | A direct restatement of Customer Status (Churned vs. not); converted to BOOLEAN in `sql/02_cleaning/`; same exposure risk as Customer Status. |
 | Churn Value | INTEGER | Target Construction Only | Numeric restatement of Churn Label; same exposure risk. |
@@ -115,13 +115,15 @@ This document records the disposition of every raw column across the five source
 ## Summary
 
 - **62 raw columns** across 5 source tables (Demographics: 9, Location: 9, Population: 3, Services: 30, Status: 11).
-- **44 columns** carried into the final modeling dataset (`mv_churn`): 42 features, plus the `customer_id` identifier and the `is_voluntary_churn` target. See `sql/04_modeling_view/01_mv_churn.sql` for the exact join and selection logic.
-- **The remaining 18 raw columns are excluded from the modeling feature set**, across four distinct reasons — not one:
+- **43 columns** carried into the final modeling dataset (`mv_churn`): 41 features, plus the `customer_id` identifier and the `is_voluntary_churn` target. See `sql/04_modeling_view/01_mv_churn.sql` for the exact join and selection logic.
+- **The remaining 19 raw columns are excluded from the modeling feature set**, across four distinct reasons — not one:
   - **5 identifiers** (join keys or row identity, not predictive features): `Customer ID` (Demographics, Location, Services, Status), `Zip Code` (Population)
   - **5 target-construction-only columns**, which break down further into two different roles:
     - **3 target-derived** (would trivially expose the target if included as features): `Customer Status`, `Churn Label`, `Churn Value`
     - **2 target-construction inputs** (used to build the target per ADR-0006, then excluded once the target exists — not leakage in the temporal sense): `Churn Category`, `Churn Reason`
-  - **2 post-outcome / temporal leakage columns** (business-meaning-based exclusions, not empirically confirmed in this dataset — see individual rationale): `Churn Score`, `CLTV`
+  - **3 post-outcome / temporal leakage columns**, which break down further into two different kinds of evidence:
+    - **2 business-meaning-based exclusions, not empirically confirmed in this dataset** (see individual rationale): `Churn Score`, `CLTV`
+    - **1 empirically confirmed exclusion**: `Satisfaction Score` — fully populated across all outcome values, but a direct check of churn rate by score value found near-perfect deterministic separation by outcome
   - **8 other exclusions**, unrelated to leakage or the target — constant values or non-customer identifiers: `Count` (4 occurrences: Demographics, Location, Services, Status), `Quarter` (2 occurrences: Services, Status), `Lat Long` (1, Location), `ID` (1, Population)
-- **Reconciliation:** 42 features + 5 identifiers + 5 target-construction-only + 2 leakage + 8 other = **62**, matching the total raw column count exactly.
+- **Reconciliation:** 41 features + 5 identifiers + 5 target-construction-only + 3 leakage + 8 other = **62**, matching the total raw column count exactly.
 - All target-construction-only and leakage exclusions are enforced structurally in `mv_churn` by never being selected (not filtered after the fact), and verified permanently absent via `tests/test_leakage.py`.
