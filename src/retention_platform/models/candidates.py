@@ -30,31 +30,39 @@ def predict_business_heuristic(df: pd.DataFrame) -> pd.Series:
     return df["is_month_to_month"].astype(bool)
 
 
-def fit_logistic_regression(X_train: np.ndarray, y_train: pd.Series) -> LogisticRegression:
+def fit_logistic_regression(
+    X_train: np.ndarray, y_train: pd.Series, random_state: int
+) -> LogisticRegression:
     """Fit a Logistic Regression on already-preprocessed X_train/y_train.
 
-    Only random_state is set, to match this project's reproducibility
-    seed -- every other hyperparameter (including class_weight) is left
-    at scikit-learn's default. This model is deliberately untuned;
-    hyperparameter search is a separate later stage.
-    """
-    model = LogisticRegression(random_state=42)
-    model.fit(X_train, y_train)
-    return model
-
-
-def fit_random_forest(X_train: np.ndarray, y_train: pd.Series) -> RandomForestClassifier:
-    """Fit a Random Forest on already-preprocessed X_train/y_train.
-
-    random_state matches this project's reproducibility seed. n_estimators
-    is pinned explicitly to 100 rather than relying on scikit-learn's
-    current default, so this baseline's behavior doesn't silently drift if
-    a future scikit-learn version changes that default. Every other
+    random_state is supplied by the caller (matching this project's
+    reproducibility seed) rather than hardcoded here, so this function
+    never falls out of sync with config/config.yaml. Every other
     hyperparameter (including class_weight) is left at scikit-learn's
     default. This model is deliberately untuned; hyperparameter search is
     a separate later stage.
     """
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model = LogisticRegression(random_state=random_state)
+    model.fit(X_train, y_train)
+    return model
+
+
+def fit_random_forest(
+    X_train: np.ndarray, y_train: pd.Series, random_state: int
+) -> RandomForestClassifier:
+    """Fit a Random Forest on already-preprocessed X_train/y_train.
+
+    random_state is supplied by the caller (matching this project's
+    reproducibility seed) rather than hardcoded here, so this function
+    never falls out of sync with config/config.yaml. n_estimators is
+    pinned explicitly to 100 rather than relying on scikit-learn's current
+    default, so this baseline's behavior doesn't silently drift if a
+    future scikit-learn version changes that default. Every other
+    hyperparameter (including class_weight) is left at scikit-learn's
+    default. This model is deliberately untuned; hyperparameter search is
+    a separate later stage.
+    """
+    model = RandomForestClassifier(n_estimators=100, random_state=random_state)
     model.fit(X_train, y_train)
     return model
 

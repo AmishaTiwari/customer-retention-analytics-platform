@@ -14,6 +14,7 @@ import duckdb
 import numpy as np
 import pytest
 
+from retention_platform.config import load_config
 from retention_platform.data.prepare import (
     run_cleaning,
     run_modeling_view,
@@ -47,33 +48,38 @@ def model_inputs(conn):
 
 
 @pytest.fixture(scope="module")
-def fitted_model(model_inputs):
-    return fit_logistic_regression(model_inputs.X_train, model_inputs.y_train)
+def seed():
+    return load_config()["reproducibility"]["seed"]
 
 
-def test_class_weight_left_at_default(fitted_model):
-    assert fitted_model.class_weight is None
+@pytest.fixture(scope="module")
+def fitted_logistic_regression(model_inputs, seed):
+    return fit_logistic_regression(model_inputs.X_train, model_inputs.y_train, seed)
 
 
-def test_predicted_probabilities_within_unit_interval(fitted_model, model_inputs):
-    train_proba = predict_proba(fitted_model, model_inputs.X_train)
-    test_proba = predict_proba(fitted_model, model_inputs.X_test)
+def test_class_weight_left_at_default(fitted_logistic_regression):
+    assert fitted_logistic_regression.class_weight is None
+
+
+def test_predicted_probabilities_within_unit_interval(fitted_logistic_regression, model_inputs):
+    train_proba = predict_proba(fitted_logistic_regression, model_inputs.X_train)
+    test_proba = predict_proba(fitted_logistic_regression, model_inputs.X_test)
 
     assert ((train_proba >= 0.0) & (train_proba <= 1.0)).all()
     assert ((test_proba >= 0.0) & (test_proba <= 1.0)).all()
 
 
-def test_predicted_probabilities_length_matches_input(fitted_model, model_inputs):
-    train_proba = predict_proba(fitted_model, model_inputs.X_train)
-    test_proba = predict_proba(fitted_model, model_inputs.X_test)
+def test_predicted_probabilities_length_matches_input(fitted_logistic_regression, model_inputs):
+    train_proba = predict_proba(fitted_logistic_regression, model_inputs.X_train)
+    test_proba = predict_proba(fitted_logistic_regression, model_inputs.X_test)
 
     assert len(train_proba) == model_inputs.X_train.shape[0]
     assert len(test_proba) == model_inputs.X_test.shape[0]
 
 
-def test_refitting_with_same_random_state_is_reproducible(model_inputs):
-    model_a = fit_logistic_regression(model_inputs.X_train, model_inputs.y_train)
-    model_b = fit_logistic_regression(model_inputs.X_train, model_inputs.y_train)
+def test_refitting_with_same_random_state_is_reproducible(model_inputs, seed):
+    model_a = fit_logistic_regression(model_inputs.X_train, model_inputs.y_train, seed)
+    model_b = fit_logistic_regression(model_inputs.X_train, model_inputs.y_train, seed)
 
     proba_a = predict_proba(model_a, model_inputs.X_test)
     proba_b = predict_proba(model_b, model_inputs.X_test)
@@ -82,8 +88,8 @@ def test_refitting_with_same_random_state_is_reproducible(model_inputs):
 
 
 @pytest.fixture(scope="module")
-def fitted_random_forest(model_inputs):
-    return fit_random_forest(model_inputs.X_train, model_inputs.y_train)
+def fitted_random_forest(model_inputs, seed):
+    return fit_random_forest(model_inputs.X_train, model_inputs.y_train, seed)
 
 
 def test_random_forest_n_estimators_and_class_weight(fitted_random_forest):
@@ -111,9 +117,9 @@ def test_random_forest_predicted_probabilities_length_matches_input(
     assert len(test_proba) == model_inputs.X_test.shape[0]
 
 
-def test_random_forest_refitting_with_same_random_state_is_reproducible(model_inputs):
-    model_a = fit_random_forest(model_inputs.X_train, model_inputs.y_train)
-    model_b = fit_random_forest(model_inputs.X_train, model_inputs.y_train)
+def test_random_forest_refitting_with_same_random_state_is_reproducible(model_inputs, seed):
+    model_a = fit_random_forest(model_inputs.X_train, model_inputs.y_train, seed)
+    model_b = fit_random_forest(model_inputs.X_train, model_inputs.y_train, seed)
 
     proba_a = predict_proba(model_a, model_inputs.X_test)
     proba_b = predict_proba(model_b, model_inputs.X_test)
