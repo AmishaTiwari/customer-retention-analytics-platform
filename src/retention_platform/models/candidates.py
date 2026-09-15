@@ -9,7 +9,9 @@ credible.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 
 
 def predict_business_heuristic(df: pd.DataFrame) -> pd.Series:
@@ -24,3 +26,27 @@ def predict_business_heuristic(df: pd.DataFrame) -> pd.Series:
     higher churn.
     """
     return df["is_month_to_month"].astype(bool)
+
+
+def fit_logistic_regression(X_train: np.ndarray, y_train: pd.Series) -> LogisticRegression:
+    """Fit a Logistic Regression on already-preprocessed X_train/y_train.
+
+    Only random_state is set, to match this project's reproducibility
+    seed -- every other hyperparameter (including class_weight) is left
+    at scikit-learn's default. This model is deliberately untuned;
+    hyperparameter search is a separate later stage.
+    """
+    model = LogisticRegression(random_state=42)
+    model.fit(X_train, y_train)
+    return model
+
+
+def predict_proba_logistic_regression(model: LogisticRegression, X: np.ndarray) -> np.ndarray:
+    """Return the predicted probability of voluntary churn (the positive class).
+
+    This risk score, not a hard 0/1 label, is the primary prediction
+    artifact -- downstream evaluation (Precision@K, Lift@K) ranks
+    customers by score. A hard label can be derived later from a
+    threshold applied to this score, but none is produced here.
+    """
+    return model.predict_proba(X)[:, 1]
