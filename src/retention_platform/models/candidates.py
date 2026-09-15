@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.base import ClassifierMixin
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 
 
@@ -41,7 +43,23 @@ def fit_logistic_regression(X_train: np.ndarray, y_train: pd.Series) -> Logistic
     return model
 
 
-def predict_proba_logistic_regression(model: LogisticRegression, X: np.ndarray) -> np.ndarray:
+def fit_random_forest(X_train: np.ndarray, y_train: pd.Series) -> RandomForestClassifier:
+    """Fit a Random Forest on already-preprocessed X_train/y_train.
+
+    random_state matches this project's reproducibility seed. n_estimators
+    is pinned explicitly to 100 rather than relying on scikit-learn's
+    current default, so this baseline's behavior doesn't silently drift if
+    a future scikit-learn version changes that default. Every other
+    hyperparameter (including class_weight) is left at scikit-learn's
+    default. This model is deliberately untuned; hyperparameter search is
+    a separate later stage.
+    """
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    return model
+
+
+def predict_proba(model: ClassifierMixin, X: np.ndarray) -> np.ndarray:
     """Return the predicted probability of voluntary churn (the positive class).
 
     This risk score, not a hard 0/1 label, is the primary prediction
