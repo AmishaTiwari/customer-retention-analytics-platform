@@ -42,6 +42,7 @@ A few of the engineering decisions behind this repository, each recorded as an A
 - **DuckDB is used as the local analytical database engine** for all SQL-based data preparation, chosen over SQLite for its native CSV reading, warehouse-style SQL dialect, and clean pandas interop — [ADR-0004](docs/adr/0004-database-engine.md)
 - **The raw dataset is committed to the repository** under `data/raw/` rather than downloaded at run time, so `make reproduce` works for a stranger with no dependency on an external mirror staying available — [ADR-0005](docs/adr/0005-raw-data-commit-policy.md)
 - **The voluntary-churn target mapping is derived from `Churn Category`/`Churn Reason`**, excluding deceased customers entirely and documenting which classifications are dataset-backed versus explicit project assumptions — [ADR-0006](docs/adr/0006-voluntary-churn-mapping.md)
+- **The business heuristic baseline flags customers on a month-to-month contract**, chosen over two alternative rules for the best balance of precision, recall, and whole-population coverage — [ADR-0007](docs/adr/0007-business-heuristic-baseline.md)
 
 More Architecture Decision Records (ADRs) will be added as the project evolves, documenting significant engineering decisions throughout the implementation.
 
