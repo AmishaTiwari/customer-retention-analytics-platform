@@ -43,6 +43,7 @@ A few of the engineering decisions behind this repository, each recorded as an A
 - **The raw dataset is committed to the repository** under `data/raw/` rather than downloaded at run time, so `make reproduce` works for a stranger with no dependency on an external mirror staying available — [ADR-0005](docs/adr/0005-raw-data-commit-policy.md)
 - **The voluntary-churn target mapping is derived from `Churn Category`/`Churn Reason`**, excluding deceased customers entirely and documenting which classifications are dataset-backed versus explicit project assumptions — [ADR-0006](docs/adr/0006-voluntary-churn-mapping.md)
 - **The business heuristic baseline flags customers on a month-to-month contract**, chosen over two alternative rules for the best balance of precision, recall, and whole-population coverage — [ADR-0007](docs/adr/0007-business-heuristic-baseline.md)
+- **Final model selection is driven by the Primary Metrics as a set**, with the design's other named considerations (interpretability included, per its explicit textual support) used as tie-breakers when those metrics disagree, without inventing rankings the design doesn't specify — [ADR-0008](docs/adr/0008-model-selection-rule.md)
 
 More Architecture Decision Records (ADRs) will be added as the project evolves, documenting significant engineering decisions throughout the implementation.
 
