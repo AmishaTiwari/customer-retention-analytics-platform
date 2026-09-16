@@ -14,6 +14,7 @@ import pandas as pd
 from sklearn.base import ClassifierMixin
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier
 
 
 def predict_business_heuristic(df: pd.DataFrame) -> pd.Series:
@@ -63,6 +64,31 @@ def fit_random_forest(
     a separate later stage.
     """
     model = RandomForestClassifier(n_estimators=100, random_state=random_state)
+    model.fit(X_train, y_train)
+    return model
+
+
+def fit_xgboost(X_train: np.ndarray, y_train: pd.Series, random_state: int) -> XGBClassifier:
+    """Fit an XGBoost classifier on already-preprocessed X_train/y_train.
+
+    random_state is supplied by the caller (matching this project's
+    reproducibility seed) rather than hardcoded here, so this function
+    never falls out of sync with config/config.yaml. n_estimators (100),
+    max_depth (6), and learning_rate (0.3) are left unset here, i.e. at
+    XGBoost's own library defaults -- these three have been stable across
+    XGBoost's major versions (unlike scikit-learn's RandomForestClassifier
+    n_estimators, which did change), so pinning them would add noise
+    without protecting against a real drift risk. eval_metric is set
+    explicitly to "logloss" -- this selects the metric XGBoost tracks
+    internally during training, matching its own default for this
+    objective; it is not a hyperparameter tuning choice in the later
+    tuning-stage sense, just making an otherwise-implicit default
+    explicit. scale_pos_weight (XGBoost's class-imbalance parameter) is
+    left unset, consistent with LR/RF: imbalance handling is a deliberate
+    future modeling experiment, not a default applied now. This model is
+    deliberately untuned; hyperparameter search is a separate later stage.
+    """
+    model = XGBClassifier(eval_metric="logloss", random_state=random_state)
     model.fit(X_train, y_train)
     return model
 

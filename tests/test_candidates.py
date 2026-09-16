@@ -1,5 +1,5 @@
-"""Data-quality invariant tests for models/candidates.py's Logistic Regression
-and Random Forest.
+"""Data-quality invariant tests for models/candidates.py's Logistic Regression,
+Random Forest, and XGBoost.
 
 Like test_heuristic.py, these tests run the full pipeline (staging,
 cleaning, target construction, modeling view, feature engineering)
@@ -25,6 +25,7 @@ from retention_platform.features.build import run_features
 from retention_platform.models.candidates import (
     fit_logistic_regression,
     fit_random_forest,
+    fit_xgboost,
     predict_proba,
 )
 from retention_platform.pipeline.preprocess import prepare_model_inputs
@@ -120,6 +121,41 @@ def test_random_forest_predicted_probabilities_length_matches_input(
 def test_random_forest_refitting_with_same_random_state_is_reproducible(model_inputs, seed):
     model_a = fit_random_forest(model_inputs.X_train, model_inputs.y_train, seed)
     model_b = fit_random_forest(model_inputs.X_train, model_inputs.y_train, seed)
+
+    proba_a = predict_proba(model_a, model_inputs.X_test)
+    proba_b = predict_proba(model_b, model_inputs.X_test)
+
+    np.testing.assert_array_equal(proba_a, proba_b)
+
+
+@pytest.fixture(scope="module")
+def fitted_xgboost(model_inputs, seed):
+    return fit_xgboost(model_inputs.X_train, model_inputs.y_train, seed)
+
+
+def test_xgboost_eval_metric_pinned(fitted_xgboost):
+    assert fitted_xgboost.eval_metric == "logloss"
+
+
+def test_xgboost_predicted_probabilities_within_unit_interval(fitted_xgboost, model_inputs):
+    train_proba = predict_proba(fitted_xgboost, model_inputs.X_train)
+    test_proba = predict_proba(fitted_xgboost, model_inputs.X_test)
+
+    assert ((train_proba >= 0.0) & (train_proba <= 1.0)).all()
+    assert ((test_proba >= 0.0) & (test_proba <= 1.0)).all()
+
+
+def test_xgboost_predicted_probabilities_length_matches_input(fitted_xgboost, model_inputs):
+    train_proba = predict_proba(fitted_xgboost, model_inputs.X_train)
+    test_proba = predict_proba(fitted_xgboost, model_inputs.X_test)
+
+    assert len(train_proba) == model_inputs.X_train.shape[0]
+    assert len(test_proba) == model_inputs.X_test.shape[0]
+
+
+def test_xgboost_refitting_with_same_random_state_is_reproducible(model_inputs, seed):
+    model_a = fit_xgboost(model_inputs.X_train, model_inputs.y_train, seed)
+    model_b = fit_xgboost(model_inputs.X_train, model_inputs.y_train, seed)
 
     proba_a = predict_proba(model_a, model_inputs.X_test)
     proba_b = predict_proba(model_b, model_inputs.X_test)
