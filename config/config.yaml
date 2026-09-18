@@ -23,8 +23,8 @@ reproducibility:
 
 data:
   test_size: 0.2
-  cv_folds: null # TODO (Commit 7 — candidate model comparison)
-  cv_repeats: null # TODO (Commit 7)
+  cv_folds: 5
+  cv_repeats: 1
 
 business:
   k: null # TODO (ADR — frozen K default)
@@ -34,8 +34,8 @@ business:
     offer_cost: null # TODO (Commit 11)
 
 tuning:
-  budget_per_model: null # TODO (ADR before Commit 8)
-  objective_metric: null # TODO (ADR before Commit 8)
+  budget_per_model: 30
+  objective_metric: pr_auc
 
 inference:
   input_schema: null # TODO (Commit 10)
