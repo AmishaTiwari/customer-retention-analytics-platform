@@ -1,5 +1,5 @@
-"""Data-quality invariant tests for models/tune.py's Logistic Regression and
-Random Forest searches.
+"""Data-quality invariant tests for models/tune.py's Logistic Regression,
+Random Forest, and XGBoost searches.
 
 Like test_candidates.py, these tests run the full pipeline (staging,
 cleaning, target construction, modeling view, feature engineering)
@@ -24,7 +24,11 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.features.build import run_features
-from retention_platform.models.tune import tune_logistic_regression, tune_random_forest
+from retention_platform.models.tune import (
+    tune_logistic_regression,
+    tune_random_forest,
+    tune_xgboost,
+)
 from retention_platform.pipeline.preprocess import prepare_model_inputs
 
 
@@ -88,6 +92,52 @@ def test_reproducible_with_same_seed(model_inputs, config):
     # confirm what production runs.
     search_a = tune_logistic_regression(model_inputs.X_train, model_inputs.y_train, config)
     search_b = tune_logistic_regression(model_inputs.X_train, model_inputs.y_train, config)
+
+    assert search_a.best_params_ == search_b.best_params_
+    assert search_a.best_score_ == search_b.best_score_
+
+
+def test_xgboost_unsupported_objective_metric_raises(model_inputs, config):
+    bad_config = copy.deepcopy(config)
+    bad_config["tuning"]["objective_metric"] = "not_a_real_metric"
+
+    with pytest.raises(ValueError, match="not_a_real_metric"):
+        tune_xgboost(model_inputs.X_train, model_inputs.y_train, bad_config)
+
+
+def test_xgboost_best_score_in_valid_range(model_inputs, config):
+    search = tune_xgboost(model_inputs.X_train, model_inputs.y_train, config)
+
+    assert isinstance(search.best_score_, float)
+    assert 0.0 < search.best_score_ <= 1.0
+
+
+def test_xgboost_best_params_keys_match_search_space(model_inputs, config):
+    search = tune_xgboost(model_inputs.X_train, model_inputs.y_train, config)
+
+    # param_distributions is local to tune_xgboost, not exposed as a
+    # module attribute, so there is no clean way to read it back without
+    # introspecting function internals -- the expected key set is
+    # hardcoded here instead.
+    expected_keys = {
+        "n_estimators",
+        "max_depth",
+        "learning_rate",
+        "subsample",
+        "colsample_bytree",
+        "min_child_weight",
+        "scale_pos_weight",
+    }
+    assert set(search.best_params_.keys()) == expected_keys
+
+
+def test_xgboost_reproducible_with_same_seed(model_inputs, config):
+    # Runs the full search twice, so this test is slower than the other
+    # three. The real search space and budget are used both times rather
+    # than a shrunk stand-in, since a smaller search wouldn't actually
+    # confirm what production runs.
+    search_a = tune_xgboost(model_inputs.X_train, model_inputs.y_train, config)
+    search_b = tune_xgboost(model_inputs.X_train, model_inputs.y_train, config)
 
     assert search_a.best_params_ == search_b.best_params_
     assert search_a.best_score_ == search_b.best_score_
