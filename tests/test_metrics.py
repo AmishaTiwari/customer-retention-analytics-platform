@@ -10,7 +10,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from retention_platform.evaluation.metrics import lift_at_k, precision_at_k
+from sklearn.metrics import average_precision_score
+
+from retention_platform.evaluation.metrics import brier_score, lift_at_k, precision_at_k, pr_auc
 
 # y_true has 4 positives out of 10 rows (base rate 0.4). y_score ranks
 # rows 1, 4, 2, 8, 0 highest to lowest (scores 9, 8, 7, 6, 5); the other
@@ -56,3 +58,33 @@ def test_k_rounds_up_to_at_least_one():
     y_score = [5, 1, 2]
 
     assert precision_at_k(y_true, y_score, 0.1) == pytest.approx(1.0)
+
+
+def test_pr_auc_matches_sklearn_directly():
+    # PR-AUC's formula isn't simple enough to hand-verify like
+    # precision_at_k -- this confirms pr_auc wraps
+    # average_precision_score with the arguments in the right order,
+    # not that the metric's value is independently correct.
+    assert pr_auc(Y_TRUE, Y_SCORE) == pytest.approx(
+        average_precision_score(Y_TRUE, Y_SCORE)
+    )
+
+
+def test_pr_auc_mismatched_length_raises():
+    with pytest.raises(ValueError):
+        pr_auc(Y_TRUE, Y_SCORE[:-1])
+
+
+def test_brier_score_hand_computed():
+    # Brier score = mean((y_score - y_true) ** 2).
+    # (0.9-1)^2=0.01, (0.1-0)^2=0.01, (0.6-1)^2=0.16, (0.4-0)^2=0.16
+    # mean = (0.01 + 0.01 + 0.16 + 0.16) / 4 = 0.085
+    y_true = [1, 0, 1, 0]
+    y_score = [0.9, 0.1, 0.6, 0.4]
+
+    assert brier_score(y_true, y_score) == pytest.approx(0.085)
+
+
+def test_brier_score_mismatched_length_raises():
+    with pytest.raises(ValueError):
+        brier_score(Y_TRUE, Y_SCORE[:-1])
