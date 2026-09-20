@@ -1,6 +1,6 @@
 # ADR 0010: Primary K Value for Precision@K and Lift@K
 
-**Status:** Proposed
+**Status:** Accepted
 
 ---
 
