@@ -20,6 +20,15 @@ That reasoning belongs in ADRs (`docs/adr/`), the README, or design documentatio
 
 **Test:** a comment should read as something a developer wrote while working on *this file*, not as an explanation of a decision made in a planning meeting.
 
+## Scratch Files
+
+A `scratch/` folder at the repository root holds one-off exploratory scripts (e.g. ad-hoc metric sweeps, quick sanity checks against fitted models) that support decision-making but are not production code and are not part of any commit's deliverable.
+
+Rules:
+- `scratch/` is entirely git-ignored — nothing inside it is ever committed.
+- Files are reused by overwriting, not multiplied — scratch/ is not a growing archive of past investigations.
+- Any finding worth keeping is promoted out: into an ADR, into production code with tests, or into project documentation. The scratch script itself is never the record of a decision.
+
 ## Markdown formatting
 
 Write every paragraph and bullet point in generated Markdown as a single unbroken line -- no internal hard line breaks within a sentence or bullet. Do not hard-wrap prose at any fixed character width.

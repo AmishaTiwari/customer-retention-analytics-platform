@@ -37,3 +37,8 @@ artifacts/evaluation/*
 !artifacts/evaluation/.gitkeep
 outputs/*
 !outputs/.gitkeep
+
+# One-off exploratory scripts are never version-controlled.
+# Keep .gitkeep so the directory structure remains visible.
+scratch/*
+!scratch/.gitkeep
