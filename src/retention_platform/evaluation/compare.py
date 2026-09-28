@@ -3,8 +3,10 @@ construction, per the Model Comparison Strategy locked in ML System
 Design v1.0.
 
 Currently implemented: running each candidate individually through the
-identical evaluation harness (evaluate_candidate, evaluate_all_candidates).
-Cross-model comparison, ranking, and selection are a later step.
+identical evaluation harness (evaluate_candidate, evaluate_all_candidates),
+and assembling those per-candidate results into a cross-model comparison
+(compare_candidates, format_comparison_table). Ranking and final selection
+per ADR-0008's rule are a later step.
 """
 
 from __future__ import annotations
@@ -33,6 +35,11 @@ PRIMARY_K_FRAC = 0.10
 
 # Sensitivity sweep reported alongside the primary K (ADR-0010).
 SENSITIVITY_K_FRACS = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+# The candidate every other candidate's Precision@K/Lift@K delta is measured
+# against (ADR-0008's "performance relative to the business heuristic
+# baseline" required-context comparison).
+HEURISTIC_CANDIDATE = "business_heuristic"
 
 
 @dataclass(frozen=True)
@@ -109,3 +116,132 @@ def evaluate_all_candidates(
 
     logger.info("Evaluated %d candidates.", len(results))
     return results
+
+
+@dataclass(frozen=True)
+class CandidateKMetrics:
+    """One candidate's Precision@K/Lift@K at a single K, plus its delta
+    against the business heuristic at that same K.
+
+    The deltas are None for the heuristic's own row -- it is not compared
+    against itself.
+    """
+
+    k_frac: float
+    precision_at_k: float
+    lift_at_k: float
+    precision_delta_vs_heuristic: float | None
+    lift_delta_vs_heuristic: float | None
+
+
+@dataclass(frozen=True)
+class CandidateComparison:
+    """One candidate's K-independent metrics plus its per-K breakdown."""
+
+    name: str
+    pr_auc: float
+    brier_score: float
+    per_k: list[CandidateKMetrics]
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    """Cross-model assembly of every candidate's EvaluationResult, keyed
+    by candidate name. Assembly only -- no ranking or selection (ADR-0008's
+    selection rule is a later step)."""
+
+    candidates: dict[str, CandidateComparison]
+
+
+def compare_candidates(results: dict[str, EvaluationResult]) -> ComparisonResult:
+    """Assemble per-candidate EvaluationResults into a cross-model comparison.
+
+    For each K in SENSITIVITY_K_FRACS, pulls each candidate's Precision@K
+    and Lift@K from its own sensitivity_report (never recomputed here), and
+    for every non-heuristic candidate pairs that with its delta against the
+    business heuristic at the same K -- the "performance relative to the
+    business heuristic baseline" required context named in ADR-0008. Each
+    candidate's K-independent pr_auc and brier_score are included once.
+
+    Does not rank or select a winner among candidates; that is ADR-0008's
+    selection rule, applied in a later step.
+    """
+    logger.info(
+        "Comparing %d candidates across %d K values.",
+        len(results),
+        len(SENSITIVITY_K_FRACS),
+    )
+
+    heuristic_by_k = {
+        entry["k_frac"]: entry
+        for entry in results[HEURISTIC_CANDIDATE].sensitivity_report
+    }
+
+    candidates: dict[str, CandidateComparison] = {}
+    for name, result in results.items():
+        per_k = []
+        for entry in result.sensitivity_report:
+            k_frac = entry["k_frac"]
+            if name == HEURISTIC_CANDIDATE:
+                precision_delta = None
+                lift_delta = None
+            else:
+                heuristic_entry = heuristic_by_k[k_frac]
+                precision_delta = entry["precision"] - heuristic_entry["precision"]
+                lift_delta = entry["lift"] - heuristic_entry["lift"]
+
+            per_k.append(
+                CandidateKMetrics(
+                    k_frac=k_frac,
+                    precision_at_k=entry["precision"],
+                    lift_at_k=entry["lift"],
+                    precision_delta_vs_heuristic=precision_delta,
+                    lift_delta_vs_heuristic=lift_delta,
+                )
+            )
+
+        candidates[name] = CandidateComparison(
+            name=name,
+            pr_auc=result.pr_auc,
+            brier_score=result.brier_score,
+            per_k=per_k,
+        )
+
+    logger.info("Assembled comparison for candidates: %s", sorted(candidates))
+    return ComparisonResult(candidates=candidates)
+
+
+def format_comparison_table(comparison: ComparisonResult) -> str:
+    """Render a ComparisonResult as a readable markdown table, one row per
+    candidate per K, suitable for pasting into notes or a future ADR.
+
+    Pure formatting -- performs no computation of its own.
+    """
+    header = (
+        "| Candidate | K | Precision@K | Lift@K | "
+        "ΔPrecision vs heuristic | ΔLift vs heuristic | PR-AUC | Brier |"
+    )
+    separator = "|---|---|---|---|---|---|---|---|"
+    rows = [header, separator]
+
+    for name in sorted(comparison.candidates):
+        candidate = comparison.candidates[name]
+        for k_metrics in candidate.per_k:
+            precision_delta = (
+                "n/a"
+                if k_metrics.precision_delta_vs_heuristic is None
+                else f"{k_metrics.precision_delta_vs_heuristic:+.4f}"
+            )
+            lift_delta = (
+                "n/a"
+                if k_metrics.lift_delta_vs_heuristic is None
+                else f"{k_metrics.lift_delta_vs_heuristic:+.4f}"
+            )
+            rows.append(
+                f"| {candidate.name} | {k_metrics.k_frac:.0%} | "
+                f"{k_metrics.precision_at_k:.4f} | {k_metrics.lift_at_k:.4f} | "
+                f"{precision_delta} | {lift_delta} | "
+                f"{candidate.pr_auc:.4f} | {candidate.brier_score:.4f} |"
+            )
+
+    return "\n".join(rows)

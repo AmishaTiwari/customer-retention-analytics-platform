@@ -23,9 +23,13 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.evaluation.compare import (
+    SENSITIVITY_K_FRACS,
+    ComparisonResult,
     EvaluationResult,
+    compare_candidates,
     evaluate_all_candidates,
     evaluate_candidate,
+    format_comparison_table,
 )
 from retention_platform.features.build import run_features
 from retention_platform.models.candidates import predict_business_heuristic
@@ -128,3 +132,62 @@ def test_ml_candidates_scored_independently_of_heuristic(all_results):
     heuristic_pr_auc = all_results["business_heuristic"].pr_auc
     for name in ["logistic_regression", "random_forest", "xgboost"]:
         assert all_results[name].pr_auc != pytest.approx(heuristic_pr_auc)
+
+
+@pytest.fixture(scope="module")
+def comparison(all_results):
+    return compare_candidates(all_results)
+
+
+def test_compare_candidates_contains_all_candidates_and_k_values(comparison):
+    assert isinstance(comparison, ComparisonResult)
+    assert set(comparison.candidates.keys()) == EXPECTED_CANDIDATE_NAMES
+
+    for candidate in comparison.candidates.values():
+        k_fracs = [k_metrics.k_frac for k_metrics in candidate.per_k]
+        assert k_fracs == SENSITIVITY_K_FRACS
+
+
+@pytest.mark.parametrize(
+    "candidate_name", sorted(EXPECTED_CANDIDATE_NAMES - {"business_heuristic"})
+)
+def test_ml_candidate_deltas_match_independent_computation(
+    comparison, all_results, candidate_name
+):
+    heuristic_by_k = {
+        entry["k_frac"]: entry
+        for entry in all_results["business_heuristic"].sensitivity_report
+    }
+    candidate_by_k = {
+        entry["k_frac"]: entry
+        for entry in all_results[candidate_name].sensitivity_report
+    }
+
+    for k_metrics in comparison.candidates[candidate_name].per_k:
+        heuristic_entry = heuristic_by_k[k_metrics.k_frac]
+        candidate_entry = candidate_by_k[k_metrics.k_frac]
+
+        expected_precision_delta = (
+            candidate_entry["precision"] - heuristic_entry["precision"]
+        )
+        expected_lift_delta = candidate_entry["lift"] - heuristic_entry["lift"]
+
+        assert k_metrics.precision_delta_vs_heuristic == pytest.approx(
+            expected_precision_delta
+        )
+        assert k_metrics.lift_delta_vs_heuristic == pytest.approx(expected_lift_delta)
+
+
+def test_heuristic_deltas_are_none(comparison):
+    for k_metrics in comparison.candidates["business_heuristic"].per_k:
+        assert k_metrics.precision_delta_vs_heuristic is None
+        assert k_metrics.lift_delta_vs_heuristic is None
+
+
+def test_format_comparison_table_contains_all_candidate_names(comparison):
+    table = format_comparison_table(comparison)
+
+    assert isinstance(table, str)
+    assert table
+    for name in EXPECTED_CANDIDATE_NAMES:
+        assert name in table
