@@ -18,6 +18,7 @@ from retention_platform.evaluation.metrics import (
     lift_at_k,
     precision_at_k,
     pr_auc,
+    sensitivity_report,
 )
 
 # y_true has 4 positives out of 10 rows (base rate 0.4). y_score ranks
@@ -123,3 +124,30 @@ def test_confusion_matrix_at_k_invalid_k_frac_raises():
 def test_confusion_matrix_at_k_mismatched_length_raises():
     with pytest.raises(ValueError):
         confusion_matrix_at_k(Y_TRUE, Y_SCORE[:-1], 0.5)
+
+
+def test_sensitivity_report_single_k_matches_direct_calls():
+    report = sensitivity_report(Y_TRUE, Y_SCORE, [0.5])
+    assert len(report) == 1
+    entry = report[0]
+    assert entry["k_frac"] == 0.5
+    cm = confusion_matrix_at_k(Y_TRUE, Y_SCORE, 0.5)
+    assert entry["precision"] == pytest.approx(cm["precision"])
+    assert entry["recall"] == pytest.approx(cm["recall"])
+    assert entry["f1"] == pytest.approx(cm["f1"])
+    assert entry["tp"] == cm["tp"]
+    assert entry["fp"] == cm["fp"]
+    assert entry["tn"] == cm["tn"]
+    assert entry["fn"] == cm["fn"]
+    assert entry["lift"] == pytest.approx(lift_at_k(Y_TRUE, Y_SCORE, 0.5))
+
+
+def test_sensitivity_report_multi_k_preserves_order_and_count():
+    k_fracs = [0.5, 0.3, 0.8]
+    report = sensitivity_report(Y_TRUE, Y_SCORE, k_fracs)
+    assert len(report) == 3
+    assert [entry["k_frac"] for entry in report] == k_fracs
+    for k_frac, entry in zip(k_fracs, report):
+        assert entry["precision"] == pytest.approx(
+            precision_at_k(Y_TRUE, Y_SCORE, k_frac)
+        )

@@ -134,3 +134,51 @@ def confusion_matrix_at_k(y_true, y_score, k_frac: float) -> dict:
         "tp": tp, "fp": fp, "tn": tn, "fn": fn,
         "precision": precision, "recall": recall, "f1": f1,
     }
+
+
+def sensitivity_report(y_true, y_score, k_fracs: list[float]) -> list[dict]:
+    """Per-K sensitivity report across a caller-supplied list of K values.
+
+    Implements this project's interpretation of the "business-oriented
+    threshold analysis" Primary Metric named in ADR-0008 and the ML
+    System Design's Machine Learning Evaluation Strategy: for one
+    model's predictions, report Precision@K, Lift@K, and the
+    confusion-matrix-derived Recall/F1/counts at each K in k_fracs, so
+    a candidate model's behavior can be compared across different
+    outreach-capacity assumptions rather than only at a single
+    operating point.
+
+    This function does not define or assume any particular K value or
+    sensitivity range -- it is a mechanism, not a policy. The actual K
+    values (e.g. the locked {5%, 10%, 15%, 20%, 25%} range, with 10%
+    as the primary operating point) are a business decision made in
+    ADR-0010 and supplied by the caller via k_fracs.
+
+    Returns a list of dicts, one per entry in k_fracs, in the same
+    order as k_fracs. Each dict has keys:
+        k_frac              -- the K value this entry was computed at
+        precision, recall, f1, tp, fp, tn, fn  -- from confusion_matrix_at_k
+        lift                -- from lift_at_k
+
+    Model comparison across multiple candidates (looping this function
+    once per model) and comparison-table construction are out of scope
+    here -- that belongs to compare.py per its own module docstring.
+    No new metric math is introduced: this only orchestrates existing
+    functions across multiple K values.
+    """
+    results = []
+    for k_frac in k_fracs:
+        cm = confusion_matrix_at_k(y_true, y_score, k_frac)
+        lift = lift_at_k(y_true, y_score, k_frac)
+        results.append({
+            "k_frac": k_frac,
+            "precision": cm["precision"],
+            "recall": cm["recall"],
+            "f1": cm["f1"],
+            "tp": cm["tp"],
+            "fp": cm["fp"],
+            "tn": cm["tn"],
+            "fn": cm["fn"],
+            "lift": lift,
+        })
+    return results
