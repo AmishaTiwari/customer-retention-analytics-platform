@@ -36,6 +36,27 @@ def _validate_k_inputs(y_true, y_score, k_frac: float) -> tuple[np.ndarray, np.n
     return y_true, y_score
 
 
+def _top_k_mask(y_true, y_score, k_frac: float) -> tuple[np.ndarray, np.ndarray, int]:
+    """Rank by y_score descending and mark the top k_frac as predicted positive.
+
+    Returns (y_true, y_pred, k) where y_pred is a boolean array aligned
+    with y_true: True for rows in the top k = max(1, round(len(y_score) *
+    k_frac)) by score, False otherwise. This is the project's single
+    canonical "top K by predicted risk" operating point (Business
+    Design Threshold Policy), used by precision_at_k and by
+    confusion_matrix_at_k so ranking logic exists in exactly one place.
+    """
+    y_true, y_score = _validate_k_inputs(y_true, y_score, k_frac)
+
+    k = max(1, round(len(y_score) * k_frac))
+    top_k_indices = np.argsort(y_score)[::-1][:k]
+
+    y_pred = np.zeros(len(y_score), dtype=bool)
+    y_pred[top_k_indices] = True
+
+    return y_true, y_pred, k
+
+
 def precision_at_k(y_true, y_score, k_frac: float) -> float:
     """Fraction of true positives among the top k_frac of ranked predictions.
 
@@ -43,12 +64,8 @@ def precision_at_k(y_true, y_score, k_frac: float) -> float:
     k = max(1, round(len(y_score) * k_frac)) rows, and returns the mean of
     y_true over that slice.
     """
-    y_true, y_score = _validate_k_inputs(y_true, y_score, k_frac)
-
-    k = max(1, round(len(y_score) * k_frac))
-    top_k_indices = np.argsort(y_score)[::-1][:k]
-
-    return float(np.mean(y_true[top_k_indices]))
+    y_true, y_pred, k = _top_k_mask(y_true, y_score, k_frac)
+    return float(np.mean(y_true[y_pred]))
 
 
 def lift_at_k(y_true, y_score, k_frac: float) -> float:
@@ -83,3 +100,37 @@ def brier_score(y_true, y_score) -> float:
     """
     y_true, y_score = _validate_lengths(y_true, y_score)
     return float(brier_score_loss(y_true, y_score))
+
+
+def confusion_matrix_at_k(y_true, y_score, k_frac: float) -> dict:
+    """Confusion matrix and derived Precision/Recall/F1 at the top k_frac
+    by predicted risk (the project's K-based business operating point,
+    not a 0.5 probability threshold).
+
+    Diagnostic/interpretive per ADR-0008's Supporting Metrics
+    classification -- does not independently drive model selection.
+
+    Returns a dict with keys:
+        tp, fp, tn, fn   -- confusion matrix counts (int)
+        precision, recall, f1  -- derived rates (float)
+    """
+    y_true, y_pred, k = _top_k_mask(y_true, y_score, k_frac)
+
+    tp = int(np.sum(y_true[y_pred]))
+    fp = k - tp
+    total_positives = int(np.sum(y_true))
+    fn = total_positives - tp
+    tn = len(y_true) - k - fn
+
+    precision = tp / k
+    recall = tp / total_positives if total_positives > 0 else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": precision, "recall": recall, "f1": f1,
+    }

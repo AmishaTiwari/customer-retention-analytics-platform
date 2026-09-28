@@ -12,7 +12,13 @@ import pytest
 
 from sklearn.metrics import average_precision_score
 
-from retention_platform.evaluation.metrics import brier_score, lift_at_k, precision_at_k, pr_auc
+from retention_platform.evaluation.metrics import (
+    brier_score,
+    confusion_matrix_at_k,
+    lift_at_k,
+    precision_at_k,
+    pr_auc,
+)
 
 # y_true has 4 positives out of 10 rows (base rate 0.4). y_score ranks
 # rows 1, 4, 2, 8, 0 highest to lowest (scores 9, 8, 7, 6, 5); the other
@@ -88,3 +94,32 @@ def test_brier_score_hand_computed():
 def test_brier_score_mismatched_length_raises():
     with pytest.raises(ValueError):
         brier_score(Y_TRUE, Y_SCORE[:-1])
+
+
+def test_confusion_matrix_at_k_hand_computed():
+    result = confusion_matrix_at_k(Y_TRUE, Y_SCORE, 0.5)
+    assert result["tp"] == 4
+    assert result["fp"] == 1
+    assert result["tn"] == 5
+    assert result["fn"] == 0
+
+
+def test_confusion_matrix_at_k_precision_matches_precision_at_k():
+    result = confusion_matrix_at_k(Y_TRUE, Y_SCORE, 0.5)
+    assert result["precision"] == pytest.approx(precision_at_k(Y_TRUE, Y_SCORE, 0.5))
+
+
+def test_confusion_matrix_at_k_recall_and_f1_hand_computed():
+    result = confusion_matrix_at_k(Y_TRUE, Y_SCORE, 0.5)
+    assert result["recall"] == pytest.approx(1.0)
+    assert result["f1"] == pytest.approx(1.6 / 1.8)
+
+
+def test_confusion_matrix_at_k_invalid_k_frac_raises():
+    with pytest.raises(ValueError):
+        confusion_matrix_at_k(Y_TRUE, Y_SCORE, 0)
+
+
+def test_confusion_matrix_at_k_mismatched_length_raises():
+    with pytest.raises(ValueError):
+        confusion_matrix_at_k(Y_TRUE, Y_SCORE[:-1], 0.5)
