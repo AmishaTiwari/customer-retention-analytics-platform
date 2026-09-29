@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 
 import duckdb
+import numpy as np
 
 from retention_platform.evaluation.metrics import (
     brier_score,
@@ -245,3 +246,69 @@ def format_comparison_table(comparison: ComparisonResult) -> str:
             )
 
     return "\n".join(rows)
+
+
+@dataclass(frozen=True)
+class TieBreakerEvidence:
+    """Raw evidence for ADR-0008's Step 3 tie-breakers (prediction
+    stability, training efficiency, model complexity), pulled from one
+    fitted RandomizedSearchCV object. This is evidence gathering only --
+    no weighting, scoring, or ranking of candidates happens here or
+    anywhere in this module; that is ADR-0008's selection rule, applied
+    in a separate, later step.
+    """
+
+    # Cross-validation score spread at the winning configuration --
+    # evidence for ADR-0008's "prediction stability" tie-breaker.
+    prediction_stability_std: float
+
+    # Fit time of the winning configuration -- evidence for ADR-0008's
+    # "training efficiency" tie-breaker.
+    mean_fit_time_best_config: float
+
+    # Average fit time across every sampled configuration in the search,
+    # giving training-efficiency context beyond just the winning config.
+    mean_fit_time_across_search: float
+
+    # The winning hyperparameters as-is, with no derived complexity score:
+    # ADR-0008 names "model complexity" as a tie-breaker but does not
+    # define how to measure it, so this reports the raw search.best_params_
+    # rather than inventing a complexity metric.
+    best_params: dict
+
+
+def extract_tiebreaker_evidence(search) -> TieBreakerEvidence:
+    """Pull ADR-0008 Step 3 tie-breaker evidence from one fitted search.
+
+    search must be a fitted RandomizedSearchCV (as returned by
+    models.tune's tune_* functions), so cv_results_/best_index_/
+    best_params_ are already populated.
+    """
+    cv_results = search.cv_results_
+    best_index = search.best_index_
+
+    return TieBreakerEvidence(
+        prediction_stability_std=float(cv_results["std_test_score"][best_index]),
+        mean_fit_time_best_config=float(cv_results["mean_fit_time"][best_index]),
+        mean_fit_time_across_search=float(np.mean(cv_results["mean_fit_time"])),
+        best_params=dict(search.best_params_),
+    )
+
+
+def collect_tiebreaker_evidence(lr_search, rf_search, xgb_search) -> dict[str, TieBreakerEvidence]:
+    """Collect ADR-0008 Step 3 tie-breaker evidence for the three tuned ML
+    candidates, keyed by candidate name.
+
+    No business_heuristic entry: the heuristic is never tuned, so it has
+    no search object and this tie-breaker evidence does not apply to it.
+    """
+    logger.info("Collecting tie-breaker evidence for 3 ML candidates.")
+
+    evidence = {
+        "logistic_regression": extract_tiebreaker_evidence(lr_search),
+        "random_forest": extract_tiebreaker_evidence(rf_search),
+        "xgboost": extract_tiebreaker_evidence(xgb_search),
+    }
+
+    logger.info("Collected tie-breaker evidence for candidates: %s", sorted(evidence))
+    return evidence

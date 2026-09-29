@@ -26,6 +26,8 @@ from retention_platform.evaluation.compare import (
     SENSITIVITY_K_FRACS,
     ComparisonResult,
     EvaluationResult,
+    TieBreakerEvidence,
+    collect_tiebreaker_evidence,
     compare_candidates,
     evaluate_all_candidates,
     evaluate_candidate,
@@ -67,11 +69,20 @@ def config():
 
 
 @pytest.fixture(scope="module")
-def fitted_candidates(conn, config):
+def fitted_searches(conn, config):
+    # Module-scoped so the Commit 8 search runs once and is shared by every
+    # test needing the fitted search objects (fitted_candidates and the
+    # tie-breaker evidence tests), rather than repeating the slow tuning.
     model_inputs = prepare_model_inputs(conn)
     lr_search = tune_logistic_regression(model_inputs.X_train, model_inputs.y_train, config)
     rf_search = tune_random_forest(model_inputs.X_train, model_inputs.y_train, config)
     xgb_search = tune_xgboost(model_inputs.X_train, model_inputs.y_train, config)
+    return (lr_search, rf_search, xgb_search)
+
+
+@pytest.fixture(scope="module")
+def fitted_candidates(fitted_searches):
+    lr_search, rf_search, xgb_search = fitted_searches
     return (
         lr_search.best_estimator_,
         rf_search.best_estimator_,
@@ -191,3 +202,54 @@ def test_format_comparison_table_contains_all_candidate_names(comparison):
     assert table
     for name in EXPECTED_CANDIDATE_NAMES:
         assert name in table
+
+
+@pytest.fixture(scope="module")
+def tiebreaker_evidence(fitted_searches):
+    lr_search, rf_search, xgb_search = fitted_searches
+    return collect_tiebreaker_evidence(lr_search, rf_search, xgb_search)
+
+
+def test_collect_tiebreaker_evidence_excludes_heuristic(tiebreaker_evidence):
+    assert set(tiebreaker_evidence.keys()) == {
+        "logistic_regression",
+        "random_forest",
+        "xgboost",
+    }
+
+
+@pytest.mark.parametrize(
+    "candidate_name,search_index",
+    [("logistic_regression", 0), ("random_forest", 1), ("xgboost", 2)],
+)
+def test_best_params_matches_search_object_directly(
+    tiebreaker_evidence, fitted_searches, candidate_name, search_index
+):
+    search = fitted_searches[search_index]
+    evidence = tiebreaker_evidence[candidate_name]
+
+    assert isinstance(evidence, TieBreakerEvidence)
+    assert evidence.best_params == search.best_params_
+
+
+@pytest.mark.parametrize(
+    "candidate_name,search_index",
+    [("logistic_regression", 0), ("random_forest", 1), ("xgboost", 2)],
+)
+def test_tiebreaker_numeric_fields_match_search_object_directly(
+    tiebreaker_evidence, fitted_searches, candidate_name, search_index
+):
+    search = fitted_searches[search_index]
+    evidence = tiebreaker_evidence[candidate_name]
+    cv_results = search.cv_results_
+    best_index = search.best_index_
+
+    assert evidence.prediction_stability_std == pytest.approx(
+        cv_results["std_test_score"][best_index]
+    )
+    assert evidence.mean_fit_time_best_config == pytest.approx(
+        cv_results["mean_fit_time"][best_index]
+    )
+    assert evidence.mean_fit_time_across_search == pytest.approx(
+        cv_results["mean_fit_time"].mean()
+    )
