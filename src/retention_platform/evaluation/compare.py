@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import duckdb
 import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_predict
 
 from retention_platform.evaluation.metrics import (
     brier_score,
@@ -41,6 +43,9 @@ SENSITIVITY_K_FRACS = [0.05, 0.10, 0.15, 0.20, 0.25]
 # against (ADR-0008's "performance relative to the business heuristic
 # baseline" required-context comparison).
 HEURISTIC_CANDIDATE = "business_heuristic"
+
+# Calibration method for calibrate_candidate's CalibratedClassifierCV.
+CALIBRATION_METHOD = "sigmoid"
 
 
 @dataclass(frozen=True)
@@ -116,6 +121,94 @@ def evaluate_all_candidates(
     results["xgboost"] = evaluate_candidate(y_true, xgb_scores)
 
     logger.info("Evaluated %d candidates.", len(results))
+    return results
+
+
+def _build_cv(config: dict) -> RepeatedStratifiedKFold:
+    """Build the training-side cross-validation splitter, mirroring
+    models/tune.py's tune_* functions exactly so calibration and
+    out-of-fold scoring use the same fold structure as Commit 8's tuning.
+    """
+    return RepeatedStratifiedKFold(
+        n_splits=config["data"]["cv_folds"],
+        n_repeats=config["data"]["cv_repeats"],
+        random_state=config["reproducibility"]["seed"],
+    )
+
+
+def calibrate_candidate(fitted_model, config: dict) -> CalibratedClassifierCV:
+    """Wrap one already-tuned candidate estimator in an unfitted
+    CalibratedClassifierCV, per the Validation Strategy correction: model
+    comparison and calibration belong on training-side CV, not the test
+    set. fitted_model is a Commit 8 tuned estimator (e.g. a tune_*
+    search's best_estimator_) -- tuning it is the caller's responsibility,
+    not this function's, and no re-tuning happens here. CALIBRATION_METHOD
+    ("sigmoid") is formalized in ADR-0013; see that ADR for the reasoning
+    behind the choice.
+
+    Returns the CalibratedClassifierCV unfitted: fitting happens inside
+    cross_val_predict in evaluate_candidates_cv, one fold at a time, so
+    each fold's calibration is learned only from that fold's own training
+    portion.
+    """
+    return CalibratedClassifierCV(
+        fitted_model, method=CALIBRATION_METHOD, cv=_build_cv(config)
+    )
+
+
+def evaluate_candidates_cv(
+    conn: duckdb.DuckDBPyConnection,
+    calibrated_lr,
+    calibrated_rf,
+    calibrated_xgb,
+    X_train,
+    y_train,
+    config: dict,
+) -> dict[str, EvaluationResult]:
+    """Training-CV counterpart to evaluate_all_candidates: scores every
+    candidate on out-of-fold training predictions instead of X_test/y_test,
+    per the Validation Strategy correction that model comparison belongs on
+    training-side CV, with the test set reserved for a single final
+    evaluation. Returns the same dict[str, EvaluationResult] shape, keyed by
+    the same four candidate names, as evaluate_all_candidates -- a drop-in
+    input to compare_candidates.
+
+    Each ML candidate is an unfitted CalibratedClassifierCV (from
+    calibrate_candidate); cross_val_predict fits and calibrates it fold by
+    fold and returns each row's out-of-fold predicted probability, so no
+    row is ever scored by a model that was trained on it. The heuristic
+    has no fitted state to cross-validate, so it is scored directly against
+    y_train through the same evaluate_candidate() call, keeping all four
+    candidates in one comparable result set.
+    """
+    split = split_feat_churn(conn)
+    cv = _build_cv(config)
+
+    results: dict[str, EvaluationResult] = {}
+
+    logger.info("Evaluating candidate (train CV): business_heuristic")
+    heuristic_scores = predict_business_heuristic(split.train).astype(float)
+    results["business_heuristic"] = evaluate_candidate(y_train, heuristic_scores)
+
+    logger.info("Evaluating candidate (train CV): logistic_regression")
+    lr_oof_scores = cross_val_predict(
+        calibrated_lr, X_train, y_train, cv=cv, method="predict_proba"
+    )[:, 1]
+    results["logistic_regression"] = evaluate_candidate(y_train, lr_oof_scores)
+
+    logger.info("Evaluating candidate (train CV): random_forest")
+    rf_oof_scores = cross_val_predict(
+        calibrated_rf, X_train, y_train, cv=cv, method="predict_proba"
+    )[:, 1]
+    results["random_forest"] = evaluate_candidate(y_train, rf_oof_scores)
+
+    logger.info("Evaluating candidate (train CV): xgboost")
+    xgb_oof_scores = cross_val_predict(
+        calibrated_xgb, X_train, y_train, cv=cv, method="predict_proba"
+    )[:, 1]
+    results["xgboost"] = evaluate_candidate(y_train, xgb_oof_scores)
+
+    logger.info("Evaluated %d candidates (train CV).", len(results))
     return results
 
 

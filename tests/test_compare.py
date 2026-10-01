@@ -12,8 +12,12 @@ test in this file via a module-scoped fixture.
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import duckdb
 import pytest
+from sklearn.calibration import CalibratedClassifierCV
 
 from retention_platform.config import load_config
 from retention_platform.data.prepare import (
@@ -23,14 +27,17 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.evaluation.compare import (
+    CALIBRATION_METHOD,
     SENSITIVITY_K_FRACS,
     ComparisonResult,
     EvaluationResult,
     TieBreakerEvidence,
+    calibrate_candidate,
     collect_tiebreaker_evidence,
     compare_candidates,
     evaluate_all_candidates,
     evaluate_candidate,
+    evaluate_candidates_cv,
     format_comparison_table,
 )
 from retention_platform.features.build import run_features
@@ -253,3 +260,105 @@ def test_tiebreaker_numeric_fields_match_search_object_directly(
     assert evidence.mean_fit_time_across_search == pytest.approx(
         cv_results["mean_fit_time"].mean()
     )
+
+
+@pytest.fixture(scope="module")
+def calibrated_candidates(fitted_candidates, config):
+    return tuple(calibrate_candidate(model, config) for model in fitted_candidates)
+
+
+@pytest.mark.parametrize(
+    "candidate_index", [0, 1, 2], ids=["logistic_regression", "random_forest", "xgboost"]
+)
+def test_calibrate_candidate_returns_unfitted_wrapper(
+    fitted_candidates, calibrated_candidates, candidate_index
+):
+    fitted_model = fitted_candidates[candidate_index]
+    calibrated = calibrated_candidates[candidate_index]
+
+    assert isinstance(calibrated, CalibratedClassifierCV)
+    assert not hasattr(calibrated, "calibrated_classifiers_")
+    assert calibrated.estimator is fitted_model
+    assert calibrated.method == CALIBRATION_METHOD
+
+
+@pytest.fixture(scope="module")
+def cv_results(conn, calibrated_candidates, config):
+    # Reruns 3x 5-fold calibrated CV, so shared module-wide rather than
+    # re-run per test.
+    model_inputs = prepare_model_inputs(conn)
+    calibrated_lr, calibrated_rf, calibrated_xgb = calibrated_candidates
+    return evaluate_candidates_cv(
+        conn,
+        calibrated_lr,
+        calibrated_rf,
+        calibrated_xgb,
+        model_inputs.X_train,
+        model_inputs.y_train,
+        config,
+    )
+
+
+def test_cv_results_contains_all_four_candidates(cv_results):
+    assert set(cv_results.keys()) == EXPECTED_CANDIDATE_NAMES
+
+
+@pytest.mark.parametrize("candidate_name", sorted(EXPECTED_CANDIDATE_NAMES))
+def test_cv_result_contains_all_six_metrics(cv_results, candidate_name):
+    result = cv_results[candidate_name]
+
+    assert isinstance(result, EvaluationResult)
+    assert isinstance(result.precision_at_k, float)
+    assert isinstance(result.lift_at_k, float)
+    assert isinstance(result.pr_auc, float)
+    assert isinstance(result.brier_score, float)
+    assert isinstance(result.confusion_matrix_at_k, dict)
+    assert isinstance(result.sensitivity_report, list)
+    assert len(result.sensitivity_report) == 5
+
+
+@pytest.mark.parametrize(
+    "candidate_name", ["logistic_regression", "random_forest", "xgboost"]
+)
+def test_cv_results_differ_from_test_set_results(all_results, cv_results, candidate_name):
+    # evaluate_candidates_cv scores training-CV out-of-fold predictions,
+    # evaluate_all_candidates scores test-set predictions -- these are
+    # different data, so their pr_auc values should not coincide. This
+    # does not assert which is better, only that the two functions are
+    # genuinely scoring different things rather than duplicating each
+    # other's work.
+    assert cv_results[candidate_name].pr_auc != pytest.approx(
+        all_results[candidate_name].pr_auc
+    )
+
+
+def test_compare_candidates_accepts_cv_results(cv_results):
+    comparison = compare_candidates(cv_results)
+
+    assert isinstance(comparison, ComparisonResult)
+    assert set(comparison.candidates.keys()) == EXPECTED_CANDIDATE_NAMES
+
+    for candidate in comparison.candidates.values():
+        k_fracs = [k_metrics.k_frac for k_metrics in candidate.per_k]
+        assert k_fracs == SENSITIVITY_K_FRACS
+
+
+def test_evaluate_candidates_cv_never_references_test_set():
+    # Cheap, explicit tripwire: a future edit that silently reintroduces
+    # X_test/y_test usage into this function should fail here rather than
+    # only be caught by someone reading the diff. Parsed via ast rather
+    # than a raw substring check, so the function's own docstring (which
+    # names X_test/y_test in prose, describing what it deliberately does
+    # NOT use) doesn't trip a false positive -- only actual identifier
+    # references (variable names, attribute access) count.
+    source = inspect.getsource(evaluate_candidates_cv)
+    func_node = ast.parse(source).body[0]
+
+    forbidden_names = {"X_test", "y_test"}
+    referenced_names = {
+        node.id for node in ast.walk(func_node) if isinstance(node, ast.Name)
+    } | {
+        node.attr for node in ast.walk(func_node) if isinstance(node, ast.Attribute)
+    }
+
+    assert not (referenced_names & forbidden_names)
