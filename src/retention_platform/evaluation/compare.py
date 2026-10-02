@@ -3,10 +3,13 @@ construction, per the Model Comparison Strategy locked in ML System
 Design v1.0.
 
 Currently implemented: running each candidate individually through the
-identical evaluation harness (evaluate_candidate, evaluate_all_candidates),
-and assembling those per-candidate results into a cross-model comparison
-(compare_candidates, format_comparison_table). Ranking and final selection
-per ADR-0008's rule are a later step.
+identical evaluation harness (evaluate_candidate), comparing candidates on
+training-side CV (calibrate_candidate, evaluate_candidates_cv) and
+assembling those results into a cross-model comparison (compare_candidates,
+format_comparison_table), and -- once selection is decided elsewhere --
+scoring the selected model against the held-out test set
+(evaluate_final_model_on_test). Ranking and final selection per ADR-0008's
+rule are a later step; this module does not perform them.
 """
 
 from __future__ import annotations
@@ -79,48 +82,61 @@ def evaluate_candidate(y_true, y_score) -> EvaluationResult:
     )
 
 
-def evaluate_all_candidates(
-    conn: duckdb.DuckDBPyConnection,
-    fitted_lr,
-    fitted_rf,
-    fitted_xgb,
-) -> dict[str, EvaluationResult]:
-    """Evaluate the business heuristic and the three fitted ML candidates.
+_VALID_FINAL_MODEL_NAMES = {"logistic_regression", "random_forest", "xgboost"}
 
-    The heuristic reads the unencoded, feat_churn-shaped test split
-    directly (predict_business_heuristic), while the ML candidates read
-    the preprocessed test matrix (predict_proba) -- each candidate is
-    called through its own correct interface rather than forcing one
-    interface on both. The three ML candidates must already be fitted
-    (e.g. via models.tune's tune_* functions' best_estimator_) --
-    tuning them is the caller's responsibility, not this function's.
-    All four candidates are scored against the same y_test, so results
-    are directly comparable. Returns one EvaluationResult per candidate,
-    keyed by candidate name.
+
+def evaluate_final_model_on_test(
+    conn: duckdb.DuckDBPyConnection,
+    final_model,
+    final_model_name: str,
+) -> dict[str, EvaluationResult]:
+    """Score the selected model and the fixed business heuristic against
+    the held-out test set -- the single, final use of X_test/y_test in
+    this module.
+
+    Protocol: the test set is reserved for the final evaluation of the
+    selected model plus the fixed business heuristic. Candidate
+    comparison and selection never use it (see evaluate_candidates_cv).
+    The heuristic is a fixed, unfitted baseline that is not part of
+    selection, so scoring it on test cannot bias the selection decision
+    -- it is included so the held-out report shows the selected model
+    next to the baseline, as ADR-0008 requires. Call this once, only
+    after selection has already been decided elsewhere.
+
+    final_model must already be fitted (a plain predict_proba-capable
+    estimator, e.g. a tune_* search's best_estimator_, or a calibrated
+    estimator if calibration was selected) -- fitting or calibrating it
+    is the caller's responsibility, not this function's. final_model_name
+    must be one of "logistic_regression", "random_forest", or "xgboost";
+    "business_heuristic" is rejected since the heuristic is handled
+    separately here, not passed in as final_model.
+
+    Loads split_feat_churn(conn) and prepare_model_inputs(conn) itself,
+    so test-set access is contained to this one function. Returns
+    {"business_heuristic": ..., final_model_name: ...}, the same
+    dict[str, EvaluationResult] shape as the other evaluation functions.
     """
+    if final_model_name not in _VALID_FINAL_MODEL_NAMES:
+        raise ValueError(
+            f"final_model_name must be one of {sorted(_VALID_FINAL_MODEL_NAMES)}, "
+            f"got {final_model_name!r}"
+        )
+
     split = split_feat_churn(conn)
     model_inputs = prepare_model_inputs(conn)
     y_true = model_inputs.y_test
 
     results: dict[str, EvaluationResult] = {}
 
-    logger.info("Evaluating candidate: business_heuristic")
+    logger.info("Evaluating on test set: business_heuristic")
     heuristic_scores = predict_business_heuristic(split.test).astype(float)
     results["business_heuristic"] = evaluate_candidate(y_true, heuristic_scores)
 
-    logger.info("Evaluating candidate: logistic_regression")
-    lr_scores = predict_proba(fitted_lr, model_inputs.X_test)
-    results["logistic_regression"] = evaluate_candidate(y_true, lr_scores)
+    logger.info("Evaluating on test set: %s", final_model_name)
+    final_model_scores = predict_proba(final_model, model_inputs.X_test)
+    results[final_model_name] = evaluate_candidate(y_true, final_model_scores)
 
-    logger.info("Evaluating candidate: random_forest")
-    rf_scores = predict_proba(fitted_rf, model_inputs.X_test)
-    results["random_forest"] = evaluate_candidate(y_true, rf_scores)
-
-    logger.info("Evaluating candidate: xgboost")
-    xgb_scores = predict_proba(fitted_xgb, model_inputs.X_test)
-    results["xgboost"] = evaluate_candidate(y_true, xgb_scores)
-
-    logger.info("Evaluated %d candidates.", len(results))
+    logger.info("Evaluated final model on test set: %s", sorted(results))
     return results
 
 
@@ -165,13 +181,13 @@ def evaluate_candidates_cv(
     y_train,
     config: dict,
 ) -> dict[str, EvaluationResult]:
-    """Training-CV counterpart to evaluate_all_candidates: scores every
-    candidate on out-of-fold training predictions instead of X_test/y_test,
-    per the Validation Strategy correction that model comparison belongs on
-    training-side CV, with the test set reserved for a single final
-    evaluation. Returns the same dict[str, EvaluationResult] shape, keyed by
-    the same four candidate names, as evaluate_all_candidates -- a drop-in
-    input to compare_candidates.
+    """Scores every candidate on out-of-fold training predictions instead of
+    X_test/y_test, per the Validation Strategy correction that model
+    comparison belongs on training-side CV, with the test set reserved for
+    a single final evaluation (evaluate_final_model_on_test). Returns
+    dict[str, EvaluationResult] keyed by business_heuristic,
+    logistic_regression, random_forest, and xgboost -- a drop-in input to
+    compare_candidates.
 
     Each ML candidate is an unfitted CalibratedClassifierCV (from
     calibrate_candidate); cross_val_predict fits and calibrates it fold by

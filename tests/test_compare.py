@@ -2,12 +2,14 @@
 
 Like test_candidates.py, these tests run the full pipeline (staging,
 cleaning, target construction, modeling view, feature engineering)
-against the real committed data/raw/ files, then call
-evaluate_all_candidates -- which tunes and evaluates all three ML
-candidates via models.tune, plus the business heuristic -- to assert
-claims about the harness's real behavior. This is slow: it runs the full
-Commit 8 search for all three ML model families once, shared across every
-test in this file via a module-scoped fixture.
+against the real committed data/raw/ files, then tune all three ML
+candidates via models.tune, to assert claims about the harness's real
+behavior: training-side CV comparison (calibrate_candidate,
+evaluate_candidates_cv, compare_candidates, format_comparison_table), the
+tie-breaker evidence functions, and the final held-out evaluation
+(evaluate_final_model_on_test). This is slow: it runs the full Commit 8
+search for all three ML model families once, shared across every test in
+this file via a module-scoped fixture.
 """
 
 from __future__ import annotations
@@ -32,12 +34,14 @@ from retention_platform.evaluation.compare import (
     ComparisonResult,
     EvaluationResult,
     TieBreakerEvidence,
+    _build_cv,
     calibrate_candidate,
     collect_tiebreaker_evidence,
     compare_candidates,
-    evaluate_all_candidates,
     evaluate_candidate,
     evaluate_candidates_cv,
+    evaluate_final_model_on_test,
+    extract_tiebreaker_evidence,
     format_comparison_table,
 )
 from retention_platform.features.build import run_features
@@ -98,18 +102,21 @@ def fitted_candidates(fitted_searches):
 
 
 @pytest.fixture(scope="module")
-def all_results(conn, fitted_candidates):
-    fitted_lr, fitted_rf, fitted_xgb = fitted_candidates
-    return evaluate_all_candidates(conn, fitted_lr, fitted_rf, fitted_xgb)
+def final_model_result(conn, fitted_candidates):
+    # fitted_candidates[0] is the plain tuned LR -- these tests only check
+    # evaluate_final_model_on_test's mechanics, so any valid final_model
+    # name/estimator pair will do.
+    final_model = fitted_candidates[0]
+    return evaluate_final_model_on_test(conn, final_model, "logistic_regression")
 
 
-def test_all_four_candidates_present(all_results):
-    assert set(all_results.keys()) == EXPECTED_CANDIDATE_NAMES
+def test_final_model_result_contains_expected_keys(final_model_result):
+    assert set(final_model_result.keys()) == {"business_heuristic", "logistic_regression"}
 
 
-@pytest.mark.parametrize("candidate_name", sorted(EXPECTED_CANDIDATE_NAMES))
-def test_each_result_contains_all_six_metrics(all_results, candidate_name):
-    result = all_results[candidate_name]
+@pytest.mark.parametrize("candidate_name", ["business_heuristic", "logistic_regression"])
+def test_final_model_result_contains_all_six_metrics(final_model_result, candidate_name):
+    result = final_model_result[candidate_name]
 
     assert isinstance(result, EvaluationResult)
     assert isinstance(result.precision_at_k, float)
@@ -121,64 +128,63 @@ def test_each_result_contains_all_six_metrics(all_results, candidate_name):
     assert len(result.sensitivity_report) == 5
 
 
-def test_results_keyed_to_correct_candidate_name(all_results):
-    for name, result in all_results.items():
-        assert name in EXPECTED_CANDIDATE_NAMES
-        assert isinstance(result, EvaluationResult)
-
-
-def test_heuristic_result_matches_direct_computation(conn, all_results):
+def test_final_model_heuristic_result_matches_direct_computation(conn, final_model_result):
     # Exercises the heuristic path independently: predict_business_heuristic
     # on the raw, unencoded test split, then the same evaluate_candidate
-    # harness -- should match what evaluate_all_candidates produced.
+    # harness -- should match what evaluate_final_model_on_test produced.
     split = split_feat_churn(conn)
     model_inputs = prepare_model_inputs(conn)
     heuristic_scores = predict_business_heuristic(split.test).astype(float)
     direct = evaluate_candidate(model_inputs.y_test, heuristic_scores)
 
-    assert all_results["business_heuristic"].precision_at_k == pytest.approx(
+    assert final_model_result["business_heuristic"].precision_at_k == pytest.approx(
         direct.precision_at_k
     )
-    assert all_results["business_heuristic"].pr_auc == pytest.approx(direct.pr_auc)
+    assert final_model_result["business_heuristic"].pr_auc == pytest.approx(
+        direct.pr_auc
+    )
 
 
-def test_ml_candidates_scored_independently_of_heuristic(all_results):
-    # If an ML candidate were mistakenly scored using the heuristic's raw
+def test_final_model_pr_auc_differs_from_heuristic(final_model_result):
+    # If the final model were mistakenly scored using the heuristic's raw
     # boolean flag instead of its own predicted probabilities, its pr_auc
     # would exactly equal the heuristic's. Confirming they differ checks
-    # that each ML candidate went through its own predict_proba path.
-    heuristic_pr_auc = all_results["business_heuristic"].pr_auc
-    for name in ["logistic_regression", "random_forest", "xgboost"]:
-        assert all_results[name].pr_auc != pytest.approx(heuristic_pr_auc)
+    # that the final model went through its own predict_proba path.
+    assert final_model_result["logistic_regression"].pr_auc != pytest.approx(
+        final_model_result["business_heuristic"].pr_auc
+    )
+
+
+def test_evaluate_final_model_on_test_rejects_unknown_name(conn, fitted_candidates):
+    final_model = fitted_candidates[0]
+    with pytest.raises(ValueError):
+        evaluate_final_model_on_test(conn, final_model, "unknown_model")
+
+
+def test_evaluate_final_model_on_test_rejects_business_heuristic(conn, fitted_candidates):
+    final_model = fitted_candidates[0]
+    with pytest.raises(ValueError):
+        evaluate_final_model_on_test(conn, final_model, "business_heuristic")
 
 
 @pytest.fixture(scope="module")
-def comparison(all_results):
-    return compare_candidates(all_results)
-
-
-def test_compare_candidates_contains_all_candidates_and_k_values(comparison):
-    assert isinstance(comparison, ComparisonResult)
-    assert set(comparison.candidates.keys()) == EXPECTED_CANDIDATE_NAMES
-
-    for candidate in comparison.candidates.values():
-        k_fracs = [k_metrics.k_frac for k_metrics in candidate.per_k]
-        assert k_fracs == SENSITIVITY_K_FRACS
+def comparison(cv_results):
+    return compare_candidates(cv_results)
 
 
 @pytest.mark.parametrize(
     "candidate_name", sorted(EXPECTED_CANDIDATE_NAMES - {"business_heuristic"})
 )
 def test_ml_candidate_deltas_match_independent_computation(
-    comparison, all_results, candidate_name
+    comparison, cv_results, candidate_name
 ):
     heuristic_by_k = {
         entry["k_frac"]: entry
-        for entry in all_results["business_heuristic"].sensitivity_report
+        for entry in cv_results["business_heuristic"].sensitivity_report
     }
     candidate_by_k = {
         entry["k_frac"]: entry
-        for entry in all_results[candidate_name].sensitivity_report
+        for entry in cv_results[candidate_name].sensitivity_report
     }
 
     for k_metrics in comparison.candidates[candidate_name].per_k:
@@ -318,17 +324,23 @@ def test_cv_result_contains_all_six_metrics(cv_results, candidate_name):
 
 
 @pytest.mark.parametrize(
-    "candidate_name", ["logistic_regression", "random_forest", "xgboost"]
+    "candidate_name,candidate_index",
+    [("logistic_regression", 0), ("random_forest", 1), ("xgboost", 2)],
 )
-def test_cv_results_differ_from_test_set_results(all_results, cv_results, candidate_name):
+def test_cv_results_differ_from_test_set_results(
+    conn, fitted_candidates, cv_results, candidate_name, candidate_index
+):
     # evaluate_candidates_cv scores training-CV out-of-fold predictions,
-    # evaluate_all_candidates scores test-set predictions -- these are
-    # different data, so their pr_auc values should not coincide. This
-    # does not assert which is better, only that the two functions are
-    # genuinely scoring different things rather than duplicating each
-    # other's work.
+    # evaluate_final_model_on_test scores test-set predictions -- these
+    # are different data, so their pr_auc values should not coincide.
+    # This does not assert which is better, only that the two functions
+    # are genuinely scoring different things rather than duplicating
+    # each other's work.
+    final_model = fitted_candidates[candidate_index]
+    test_set_result = evaluate_final_model_on_test(conn, final_model, candidate_name)
+
     assert cv_results[candidate_name].pr_auc != pytest.approx(
-        all_results[candidate_name].pr_auc
+        test_set_result[candidate_name].pr_auc
     )
 
 
@@ -343,22 +355,51 @@ def test_compare_candidates_accepts_cv_results(cv_results):
         assert k_fracs == SENSITIVITY_K_FRACS
 
 
-def test_evaluate_candidates_cv_never_references_test_set():
-    # Cheap, explicit tripwire: a future edit that silently reintroduces
-    # X_test/y_test usage into this function should fail here rather than
-    # only be caught by someone reading the diff. Parsed via ast rather
-    # than a raw substring check, so the function's own docstring (which
-    # names X_test/y_test in prose, describing what it deliberately does
-    # NOT use) doesn't trip a false positive -- only actual identifier
-    # references (variable names, attribute access) count.
-    source = inspect.getsource(evaluate_candidates_cv)
+def _referenced_identifiers(func) -> set[str]:
+    # Parsed via ast rather than a raw substring check, so a function's
+    # own docstring (which may name X_test/y_test in prose, describing
+    # what it deliberately does NOT use) doesn't trip a false positive --
+    # only actual identifier references (variable names, attribute
+    # access) count.
+    source = inspect.getsource(func)
     func_node = ast.parse(source).body[0]
 
-    forbidden_names = {"X_test", "y_test"}
-    referenced_names = {
-        node.id for node in ast.walk(func_node) if isinstance(node, ast.Name)
-    } | {
-        node.attr for node in ast.walk(func_node) if isinstance(node, ast.Attribute)
-    }
+    names = {node.id for node in ast.walk(func_node) if isinstance(node, ast.Name)}
+    attrs = {node.attr for node in ast.walk(func_node) if isinstance(node, ast.Attribute)}
+    return names | attrs
 
-    assert not (referenced_names & forbidden_names)
+
+_FORBIDDEN_TEST_SET_IDENTIFIERS = {"X_test", "y_test", "test"}
+
+_FUNCTIONS_THAT_MUST_NOT_TOUCH_TEST_SET = {
+    "evaluate_candidates_cv": evaluate_candidates_cv,
+    "calibrate_candidate": calibrate_candidate,
+    "_build_cv": _build_cv,
+    "evaluate_candidate": evaluate_candidate,
+    "compare_candidates": compare_candidates,
+    "format_comparison_table": format_comparison_table,
+    "extract_tiebreaker_evidence": extract_tiebreaker_evidence,
+    "collect_tiebreaker_evidence": collect_tiebreaker_evidence,
+}
+
+
+@pytest.mark.parametrize(
+    "func", _FUNCTIONS_THAT_MUST_NOT_TOUCH_TEST_SET.values(),
+    ids=_FUNCTIONS_THAT_MUST_NOT_TOUCH_TEST_SET.keys(),
+)
+def test_function_never_references_test_set(func):
+    # Cheap, explicit tripwire: a future edit that silently reintroduces
+    # X_test/y_test/.test usage into any of these functions should fail
+    # here rather than only be caught by someone reading the diff. Only
+    # evaluate_final_model_on_test may touch the test set in this module.
+    referenced = _referenced_identifiers(func)
+    assert not (referenced & _FORBIDDEN_TEST_SET_IDENTIFIERS)
+
+
+def test_evaluate_final_model_on_test_does_reference_test_set():
+    # Positive control: confirms the tripwire above isn't passing
+    # vacuously (e.g. because _referenced_identifiers silently returns
+    # nothing) by checking it correctly flags the one function that is
+    # supposed to reference the test set.
+    referenced = _referenced_identifiers(evaluate_final_model_on_test)
+    assert referenced & _FORBIDDEN_TEST_SET_IDENTIFIERS
