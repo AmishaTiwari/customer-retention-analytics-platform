@@ -8,7 +8,7 @@
 
 The locked ML System Design requires probability calibration to be "fitted using data independent of final evaluation," and lists calibration assessment as one of the Primary Metrics that feed ADR-0008's model-selection rule, alongside Precision@K, Lift@K, and PR-AUC. What it doesn't specify is *which* calibration method to use — that was left open, the same way ADR-0009 later had to fix the tuning objective and search strategy the design had also left open.
 
-This ADR is being written slightly out of order: `calibrate_candidate()` in `evaluation/compare.py` already implements `CalibratedClassifierCV(method="sigmoid")`, added while correcting Commit 9's model-selection protocol (see the ADR-0012 amendment). This document simply makes that choice official and puts the reasoning on record, so it exists in the project's history rather than only in code.
+This ADR is being written slightly out of order: `calibrate_candidate()` in `evaluation/compare.py` already implements `CalibratedClassifierCV(method="sigmoid")`, added while correcting Commit 9's model-selection protocol (see ADR-0014). This document simply makes that choice official and puts the reasoning on record, so it exists in the project's history rather than only in code.
 
 scikit-learn's `CalibratedClassifierCV` supports two methods: Platt scaling (`sigmoid`) and isotonic regression (`isotonic`).
 
@@ -34,7 +34,7 @@ The deciding factor is sample size. Each CV fold's training portion has roughly 
 
 - `CALIBRATION_METHOD` in `evaluation/compare.py` is fixed to `"sigmoid"`, used both during comparison and for the final model's calibration.
 - If future evidence shows a candidate's calibration curve doesn't fit sigmoid's assumption well, that's a reason to open a new ADR revisiting this choice — not to change it quietly.
-- This ADR only settles the calibration *method*. It's separate from the Commit 9 test-set-usage fix tracked in the ADR-0012 amendment, which settles *where in the pipeline* calibration happens.
+- This ADR only settles the calibration *method*. It's separate from the Commit 9 test-set-usage fix recorded in ADR-0014, which settles *where in the pipeline* calibration happens.
 
 ---
 
