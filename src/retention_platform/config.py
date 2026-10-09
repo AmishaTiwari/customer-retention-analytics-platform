@@ -40,6 +40,44 @@ class ConfigValidationError(Exception):
     """Raised when config/config.yaml is missing required sections or values."""
 
 
+def _is_fraction(value: object) -> bool:
+    """True for an int or float (not bool) with 0 < value <= 1."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= 1
+
+
+def _validate_business(business: object) -> list[str]:
+    """Return problems with business, business.k and business.k_sensitivity.
+
+    Called only when the business key is present; a missing section is
+    already reported as a missing top-level section.
+    """
+    if not isinstance(business, dict):
+        return [f"business must be a mapping, got {business!r}"]
+
+    errors: list[str] = []
+
+    if "k" not in business:
+        errors.append("Missing required key in 'business': 'k'")
+    elif not _is_fraction(business["k"]):
+        errors.append(f"business.k must be a number with 0 < k <= 1, got {business['k']!r}")
+
+    if "k_sensitivity" not in business:
+        errors.append("Missing required key in 'business': 'k_sensitivity'")
+    else:
+        sweep = business["k_sensitivity"]
+        if not isinstance(sweep, list) or not sweep:
+            errors.append(f"business.k_sensitivity must be a non-empty list, got {sweep!r}")
+        else:
+            for index, value in enumerate(sweep):
+                if not _is_fraction(value):
+                    errors.append(
+                        f"business.k_sensitivity[{index}] must be a number with "
+                        f"0 < value <= 1, got {value!r}"
+                    )
+
+    return errors
+
+
 def load_config(config_path: Path | None = None) -> dict:
     """Load, validate, and resolve config/config.yaml.
 
@@ -77,6 +115,9 @@ def load_config(config_path: Path | None = None) -> dict:
         else:
             if not (isinstance(value, str) and value):
                 errors.append(f"paths.{key} must be a non-empty string, got {value!r}")
+
+    if "business" in raw_config:
+        errors.extend(_validate_business(raw_config["business"]))
 
     if errors:
         raise ConfigValidationError(

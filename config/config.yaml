@@ -27,7 +27,10 @@ data:
   cv_repeats: 1
 
 business:
-  k: null # TODO (ADR — frozen K default)
+  # k and k_sensitivity are fractions of the scored population (0.10 = 10%),
+  # not percentages and not customer counts.
+  k: 0.10
+  k_sensitivity: [0.05, 0.10, 0.15, 0.20, 0.25]
   risk_tiers: null # TODO (Commit 9 — evaluation & error analysis)
   economics:
     arpu_proxy: null # TODO (Commit 11 — decision-support outputs)
