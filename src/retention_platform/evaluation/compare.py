@@ -22,6 +22,7 @@ import numpy as np
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_predict
 
+from retention_platform.config import load_config
 from retention_platform.evaluation.metrics import (
     brier_score,
     confusion_matrix_at_k,
@@ -35,12 +36,6 @@ from retention_platform.pipeline.preprocess import prepare_model_inputs
 from retention_platform.pipeline.split import split_feat_churn
 
 logger = logging.getLogger("retention_platform.evaluation.compare")
-
-# Primary K for Precision@K, Lift@K, and the confusion matrix (ADR-0010).
-PRIMARY_K_FRAC = 0.10
-
-# Sensitivity sweep reported alongside the primary K (ADR-0010).
-SENSITIVITY_K_FRACS = [0.05, 0.10, 0.15, 0.20, 0.25]
 
 # The candidate every other candidate's Precision@K/Lift@K delta is measured
 # against (ADR-0008's "performance relative to the business heuristic
@@ -63,6 +58,16 @@ class EvaluationResult:
     sensitivity_report: list[dict]
 
 
+def _k_settings() -> tuple[float, list[float]]:
+    """Return (primary K, sensitivity sweep) from config.
+
+    Both are fractions of the scored population. Config is read on each
+    call, not at import time.
+    """
+    business = load_config()["business"]
+    return business["k"], business["k_sensitivity"]
+
+
 def evaluate_candidate(y_true, y_score) -> EvaluationResult:
     """Run one candidate's predictions through every metrics.py function.
 
@@ -70,15 +75,17 @@ def evaluate_candidate(y_true, y_score) -> EvaluationResult:
     predicted probabilities for the ML models, or the heuristic's boolean
     flag -- metrics.py's functions only require it to be rankable, not a
     calibrated probability. Precision@K, Lift@K, and the confusion matrix
-    use PRIMARY_K_FRAC; sensitivity_report sweeps SENSITIVITY_K_FRACS.
+    use the primary K from config (business.k); sensitivity_report sweeps
+    the K values in config (business.k_sensitivity).
     """
+    primary_k, k_sweep = _k_settings()
     return EvaluationResult(
-        precision_at_k=precision_at_k(y_true, y_score, PRIMARY_K_FRAC),
-        lift_at_k=lift_at_k(y_true, y_score, PRIMARY_K_FRAC),
+        precision_at_k=precision_at_k(y_true, y_score, primary_k),
+        lift_at_k=lift_at_k(y_true, y_score, primary_k),
         pr_auc=pr_auc(y_true, y_score),
         brier_score=brier_score(y_true, y_score),
-        confusion_matrix_at_k=confusion_matrix_at_k(y_true, y_score, PRIMARY_K_FRAC),
-        sensitivity_report=sensitivity_report(y_true, y_score, SENSITIVITY_K_FRACS),
+        confusion_matrix_at_k=confusion_matrix_at_k(y_true, y_score, primary_k),
+        sensitivity_report=sensitivity_report(y_true, y_score, k_sweep),
     )
 
 
@@ -266,8 +273,9 @@ class ComparisonResult:
 def compare_candidates(results: dict[str, EvaluationResult]) -> ComparisonResult:
     """Assemble per-candidate EvaluationResults into a cross-model comparison.
 
-    For each K in SENSITIVITY_K_FRACS, pulls each candidate's Precision@K
-    and Lift@K from its own sensitivity_report (never recomputed here), and
+    For each K in the config sweep (business.k_sensitivity), pulls each
+    candidate's Precision@K and Lift@K from its own sensitivity_report
+    (never recomputed here), and
     for every non-heuristic candidate pairs that with its delta against the
     business heuristic at the same K -- the "performance relative to the
     business heuristic baseline" required context named in ADR-0008. Each
@@ -279,7 +287,7 @@ def compare_candidates(results: dict[str, EvaluationResult]) -> ComparisonResult
     logger.info(
         "Comparing %d candidates across %d K values.",
         len(results),
-        len(SENSITIVITY_K_FRACS),
+        len(_k_settings()[1]),
     )
 
     heuristic_by_k = {

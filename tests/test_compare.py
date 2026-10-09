@@ -30,11 +30,11 @@ from retention_platform.data.prepare import (
 )
 from retention_platform.evaluation.compare import (
     CALIBRATION_METHOD,
-    SENSITIVITY_K_FRACS,
     ComparisonResult,
     EvaluationResult,
     TieBreakerEvidence,
     _build_cv,
+    _k_settings,
     calibrate_candidate,
     collect_tiebreaker_evidence,
     compare_candidates,
@@ -344,7 +344,7 @@ def test_cv_results_differ_from_test_set_results(
     )
 
 
-def test_compare_candidates_accepts_cv_results(cv_results):
+def test_compare_candidates_accepts_cv_results(cv_results, config):
     comparison = compare_candidates(cv_results)
 
     assert isinstance(comparison, ComparisonResult)
@@ -352,7 +352,7 @@ def test_compare_candidates_accepts_cv_results(cv_results):
 
     for candidate in comparison.candidates.values():
         k_fracs = [k_metrics.k_frac for k_metrics in candidate.per_k]
-        assert k_fracs == SENSITIVITY_K_FRACS
+        assert k_fracs == config["business"]["k_sensitivity"]
 
 
 def _referenced_identifiers(func) -> set[str]:
@@ -375,6 +375,7 @@ _FUNCTIONS_THAT_MUST_NOT_TOUCH_TEST_SET = {
     "evaluate_candidates_cv": evaluate_candidates_cv,
     "calibrate_candidate": calibrate_candidate,
     "_build_cv": _build_cv,
+    "_k_settings": _k_settings,
     "evaluate_candidate": evaluate_candidate,
     "compare_candidates": compare_candidates,
     "format_comparison_table": format_comparison_table,
