@@ -29,13 +29,10 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.evaluation.compare import (
-    CALIBRATION_METHOD,
     ComparisonResult,
     EvaluationResult,
     TieBreakerEvidence,
-    _build_cv,
     _k_settings,
-    calibrate_candidate,
     collect_tiebreaker_evidence,
     compare_candidates,
     evaluate_candidate,
@@ -45,6 +42,11 @@ from retention_platform.evaluation.compare import (
     format_comparison_table,
 )
 from retention_platform.features.build import run_features
+from retention_platform.models.calibrate import (
+    CALIBRATION_METHOD,
+    build_cv,
+    calibrate_candidate,
+)
 from retention_platform.models.candidates import predict_business_heuristic
 from retention_platform.models.tune import (
     tune_logistic_regression,
@@ -374,7 +376,7 @@ _FORBIDDEN_TEST_SET_IDENTIFIERS = {"X_test", "y_test", "test"}
 _FUNCTIONS_THAT_MUST_NOT_TOUCH_TEST_SET = {
     "evaluate_candidates_cv": evaluate_candidates_cv,
     "calibrate_candidate": calibrate_candidate,
-    "_build_cv": _build_cv,
+    "build_cv": build_cv,
     "_k_settings": _k_settings,
     "evaluate_candidate": evaluate_candidate,
     "compare_candidates": compare_candidates,

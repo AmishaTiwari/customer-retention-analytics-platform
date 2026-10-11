@@ -4,7 +4,7 @@ Design v1.0.
 
 Currently implemented: running each candidate individually through the
 identical evaluation harness (evaluate_candidate), comparing candidates on
-training-side CV (calibrate_candidate, evaluate_candidates_cv) and
+training-side CV (evaluate_candidates_cv) and
 assembling those results into a cross-model comparison (compare_candidates,
 format_comparison_table), and -- once selection is decided elsewhere --
 scoring the selected model against the held-out test set
@@ -19,8 +19,7 @@ from dataclasses import dataclass
 
 import duckdb
 import numpy as np
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_predict
+from sklearn.model_selection import cross_val_predict
 
 from retention_platform.config import load_config
 from retention_platform.metrics import (
@@ -31,6 +30,7 @@ from retention_platform.metrics import (
     pr_auc,
     sensitivity_report,
 )
+from retention_platform.models.calibrate import build_cv
 from retention_platform.models.candidates import predict_business_heuristic, predict_proba
 from retention_platform.pipeline.preprocess import prepare_model_inputs
 from retention_platform.pipeline.split import split_feat_churn
@@ -41,9 +41,6 @@ logger = logging.getLogger("retention_platform.evaluation.compare")
 # against (ADR-0008's "performance relative to the business heuristic
 # baseline" required-context comparison).
 HEURISTIC_CANDIDATE = "business_heuristic"
-
-# Calibration method for calibrate_candidate's CalibratedClassifierCV.
-CALIBRATION_METHOD = "sigmoid"
 
 
 @dataclass(frozen=True)
@@ -147,38 +144,6 @@ def evaluate_final_model_on_test(
     return results
 
 
-def _build_cv(config: dict) -> RepeatedStratifiedKFold:
-    """Build the training-side cross-validation splitter, mirroring
-    models/tune.py's tune_* functions exactly so calibration and
-    out-of-fold scoring use the same fold structure as Commit 8's tuning.
-    """
-    return RepeatedStratifiedKFold(
-        n_splits=config["data"]["cv_folds"],
-        n_repeats=config["data"]["cv_repeats"],
-        random_state=config["reproducibility"]["seed"],
-    )
-
-
-def calibrate_candidate(fitted_model, config: dict) -> CalibratedClassifierCV:
-    """Wrap one already-tuned candidate estimator in an unfitted
-    CalibratedClassifierCV, per the Validation Strategy correction: model
-    comparison and calibration belong on training-side CV, not the test
-    set. fitted_model is a Commit 8 tuned estimator (e.g. a tune_*
-    search's best_estimator_) -- tuning it is the caller's responsibility,
-    not this function's, and no re-tuning happens here. CALIBRATION_METHOD
-    ("sigmoid") is formalized in ADR-0013; see that ADR for the reasoning
-    behind the choice.
-
-    Returns the CalibratedClassifierCV unfitted: fitting happens inside
-    cross_val_predict in evaluate_candidates_cv, one fold at a time, so
-    each fold's calibration is learned only from that fold's own training
-    portion.
-    """
-    return CalibratedClassifierCV(
-        fitted_model, method=CALIBRATION_METHOD, cv=_build_cv(config)
-    )
-
-
 def evaluate_candidates_cv(
     conn: duckdb.DuckDBPyConnection,
     calibrated_lr,
@@ -205,7 +170,7 @@ def evaluate_candidates_cv(
     candidates in one comparable result set.
     """
     split = split_feat_churn(conn)
-    cv = _build_cv(config)
+    cv = build_cv(config)
 
     results: dict[str, EvaluationResult] = {}
 
