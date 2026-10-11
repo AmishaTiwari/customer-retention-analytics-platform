@@ -1,6 +1,6 @@
 # Platform Output Contract — v1
 
-> **Status:** v1, revision 4. Approved by the owner on 11 Oct 2026 (section 10).
+> **Status:** v1, revision 5. Approved by the owner on 11 Oct 2026 (section 10).
 > **Scope:** the outputs of the Commit 10 inference pipeline only.
 > **Implemented by:** Commit 10 steps 5 to 8. `tests/test_inference.py` asserts conformance to this document (section 9).
 > **Changes after approval:** only by a reviewed amendment (section 8).
@@ -57,11 +57,11 @@ Every failure below ends the command with a **non-zero exit code** and a clear m
 | Class | When it happens | Effect on the output files | Message reports |
 |---|---|---|---|
 | **1. Input validation failure** | The scored table breaks a rule in section 6, before any output is generated | **Neither new file is written. Existing output files stay unchanged.** | The failed condition, naming the column and row where meaningful |
-| **2a. Output generation failure** | After validation, before any file is replaced (for example an error while scoring or building the outputs, or no valid model found) | Neither new file is written. Existing output files stay unchanged. | What failed |
+| **2a. Output generation failure** | Before any output file is replaced, and not an input validation failure (for example no valid model found, the scoring run's tracking folder, configuration snapshot or log file cannot be created at the start of the run, or an error while scoring or building the outputs) | Neither new file is written. Existing output files stay unchanged. | What failed |
 | **2b. Output publication failure** | While the files are being replaced (for example the CSV is locked by another program) | Each file is old or new as a whole. Because the pair is not atomic, the CSV may be new while the summary is still the previous one. The previous CSV is not restored. | Which file was replaced and which was not, and that the pair may be inconsistent until a successful run |
 | **3. Post-publication tracking failure** | Both output files were published (publication succeeded), then a required tracking write failed, so the command as a whole fails | **Both new files are kept.** | That the outputs were generated but tracking failed, and the tracking error |
 
-A scoring run whose required work or tracking did not complete leaves a tracking folder without `metrics.json`.
+A scoring run whose required work or tracking did not complete leaves a tracking folder without `metrics.json`. (If the folder itself could not be created, there is no folder.)
 
 ## 4. Prioritized Outreach List (`prioritized_outreach_list.csv`)
 
@@ -241,6 +241,7 @@ Commit 11 extends the same CSV under a reviewed v2 amendment (section 8).
 - each rejection rule in section 6 fails with a message that names the failed condition, and names the column and row where meaningful; this includes a missing `customer_id`, an empty-string `customer_id` and a whitespace-only `customer_id`
 - after a validation failure, neither output file is written, and pre-existing output files are unchanged byte for byte
 - after a failure before publication starts (class 2a), existing output files are unchanged
+- if the scoring run's tracking folder, configuration snapshot or log file cannot be created at the start of the run, the command ends with a non-zero exit before any output file is written or replaced, and pre-existing output files are unchanged byte for byte (class 2a)
 - if outputs are published and the tracking write then fails, both outputs are kept, the exit is non-zero, and the message says the outputs were generated but tracking failed
 - an unsuccessful run leaves no `metrics.json` in its tracking folder
 
@@ -269,3 +270,5 @@ Owner decisions taken in the review of revision 2 (11 Oct 2026), now part of thi
 Revision 3 also resolves two consistency points raised in that review: publication success versus command success (section 3.2), and empty `customer_id` values (sections 4.3 and 6).
 
 Owner approval of revision 3 (11 Oct 2026), including the rejection of missing, empty-string and whitespace-only `customer_id` values. The owner added one clarification: a previous output file is not retained when its own destination is replaced, even if publication of the pair then fails. Revision 4 changes only the status line and this clarification (sections 3.2, 3.3 and 9).
+
+Owner approval of revision 5 (11 Oct 2026): a failure to create the scoring run's tracking folder, configuration snapshot or log file at the start of the run is class 2a. Class 2a is defined by the failure happening before any output file is replaced, excluding input validation failures; this also settles that "no valid model found" belongs to 2a. Revision 5 changes only the status line, the class 2a trigger (section 3.3), one sentence after the failure table (section 3.3), one conformance bullet (section 9) and this record.
