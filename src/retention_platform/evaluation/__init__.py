@@ -1,1 +1,1 @@
-"""Model evaluation: metrics, comparison, and reporting."""
+"""Model evaluation: candidate comparison and reporting."""

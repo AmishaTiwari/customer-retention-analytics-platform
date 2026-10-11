@@ -12,7 +12,7 @@ import pytest
 
 from sklearn.metrics import average_precision_score
 
-from retention_platform.evaluation.metrics import (
+from retention_platform.metrics import (
     brier_score,
     confusion_matrix_at_k,
     lift_at_k,

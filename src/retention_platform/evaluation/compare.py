@@ -23,7 +23,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_predict
 
 from retention_platform.config import load_config
-from retention_platform.evaluation.metrics import (
+from retention_platform.metrics import (
     brier_score,
     confusion_matrix_at_k,
     lift_at_k,

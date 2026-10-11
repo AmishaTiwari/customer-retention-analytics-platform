@@ -4,8 +4,9 @@ Unit-tested against hand-computed toy cases (tests/test_metrics.py),
 since a subtly wrong Precision@K would poison every downstream
 conclusion and the model-selection decision itself.
 
-Not yet implemented — scaffolded in Commit 1; implemented in Commit 9
-(Evaluation & error analysis).
+Provides precision_at_k, lift_at_k, pr_auc, brier_score,
+confusion_matrix_at_k and sensitivity_report. The top-K functions rank
+rows by score and treat the top fraction as predicted positive.
 """
 
 from __future__ import annotations
