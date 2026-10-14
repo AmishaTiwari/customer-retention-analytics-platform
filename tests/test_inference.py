@@ -3,14 +3,22 @@
 Section A: input validation rules, on a small hand-made schema and small
 synthetic frames (fast, no database).
 Section B: input validation on the real data and the real generated schema.
+Section C: scoring core (score_batch and top_k_count).
 """
 
 from __future__ import annotations
+
+import ast
+import inspect
+import re
+from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import LogisticRegression
 
 from retention_platform.data.prepare import (
     run_cleaning,
@@ -19,16 +27,24 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.features.build import run_features
-from retention_platform.inference import validate
+from retention_platform.inference import score, validate
+from retention_platform.inference.score import ScoringError, score_batch, top_k_count
 from retention_platform.inference.validate import (
     InputValidationError,
     validate_scoring_table,
 )
-from retention_platform.pipeline.preprocess import prepare_model_inputs
+from retention_platform.metrics import confusion_matrix_at_k
+from retention_platform.models.persist import LoadedRun
+from retention_platform.pipeline.preprocess import (
+    build_preprocessing_pipeline,
+    prepare_model_inputs,
+)
 from retention_platform.pipeline.schema import (
     SQL_TYPE_TO_KIND,
+    TARGET_COLUMN,
     build_input_schema,
     read_feat_churn_types,
+    schema_hash,
 )
 from retention_platform.pipeline.split import split_feat_churn
 
@@ -491,3 +507,436 @@ def test_sentinel_written_into_a_real_row_is_rejected(
 
     with pytest.raises(InputValidationError, match=r"internal sentinel.*column 'internet_type'"):
         validate_scoring_table(frame, real_schema)
+
+
+# =============================================================================
+# Section C: scoring core (score_batch and top_k_count)
+# =============================================================================
+
+SCORING_COLUMN_TYPES = {
+    "customer_id": "VARCHAR",
+    "is_voluntary_churn": "BOOLEAN",
+    "gender": "VARCHAR",
+    "age": "INTEGER",
+    "offer": "VARCHAR",
+    "internet_type": "VARCHAR",
+    "contract": "VARCHAR",
+    "payment_method": "VARCHAR",
+    "tenure_in_months": "INTEGER",
+    "married": "BOOLEAN",
+}
+SCORING_INPUT_COLUMNS = [
+    "gender",
+    "age",
+    "offer",
+    "internet_type",
+    "contract",
+    "payment_method",
+    "tenure_in_months",
+    "married",
+]
+K_FRAC = 0.10
+
+
+@pytest.fixture(scope="module")
+def scoring_artifacts():
+    """A small real fitted preprocessor, model and schema."""
+    frame = pd.DataFrame(
+        {
+            "gender": ["Female", "Male"] * 6,
+            "age": [20 + i for i in range(12)],
+            "offer": ["Offer A", None, "Offer B", None] * 3,
+            "internet_type": ["DSL", "Cable", None, "Fiber Optic"] * 3,
+            "contract": ["Month-to-Month", "One Year", "Two Year"] * 4,
+            "payment_method": ["Credit Card", "Mailed Check", "Bank Withdrawal"] * 4,
+            "tenure_in_months": [1 + 3 * i for i in range(12)],
+            "married": [True, False] * 6,
+        }
+    )
+    preprocessor = build_preprocessing_pipeline().fit(frame)
+    model = LogisticRegression().fit(preprocessor.transform(frame), [0, 1] * 6)
+    schema = build_input_schema(SCORING_COLUMN_TYPES, preprocessor)
+    return SimpleNamespace(frame=frame, preprocessor=preprocessor, model=model, schema=schema)
+
+
+def make_run(schema, preprocessor, model) -> LoadedRun:
+    return LoadedRun(
+        run_id="20261011T120000Z",
+        run_dir=Path("unused"),
+        manifest={},
+        schema=schema,
+        schema_hash=schema_hash(schema),
+        preprocessor=preprocessor,
+        model=model,
+    )
+
+
+def scoring_frame(artifacts, ids) -> pd.DataFrame:
+    """A valid scoring table with the given customer ids, built from the
+    rows the preprocessor was fitted on."""
+    base = artifacts.frame
+    picked = base.iloc[[position % len(base) for position in range(len(ids))]]
+    frame = picked.reset_index(drop=True)
+    frame.insert(0, "customer_id", pd.Series(list(ids), dtype=object))
+    return frame
+
+
+class ScriptedPreprocessor:
+    """Records what it is given and returns a placeholder matrix."""
+
+    def __init__(self):
+        self.received = []
+
+    def transform(self, inputs):
+        self.received.append(inputs)
+        return np.zeros((len(inputs), 1))
+
+
+class ScriptedModel:
+    """Returns chosen churn probabilities, in input row order."""
+
+    def __init__(self, values):
+        self.values = values
+        self.calls = 0
+
+    def predict_proba(self, matrix):
+        self.calls += 1
+        values = np.asarray(self.values, dtype=float)
+        return np.column_stack([1 - values, values])
+
+
+def scripted_run(artifacts, values):
+    preprocessor = ScriptedPreprocessor()
+    model = ScriptedModel(values)
+    return make_run(artifacts.schema, preprocessor, model), preprocessor, model
+
+
+def real_run(artifacts) -> LoadedRun:
+    return make_run(artifacts.schema, artifacts.preprocessor, artifacts.model)
+
+
+# top_k_count
+
+
+@pytest.mark.parametrize(
+    "n_rows,k_frac,expected",
+    [(1408, 0.10, 141), (5629, 0.10, 563), (25, 0.10, 2), (1, 0.10, 1), (3, 0.10, 1), (10, 1.0, 10)],
+)
+def test_top_k_count_values(n_rows, k_frac, expected):
+    assert top_k_count(n_rows, k_frac) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -5, 2.5, True, None, "10"], ids=repr)
+def test_top_k_count_rejects_a_bad_row_count(bad):
+    with pytest.raises(ValueError):
+        top_k_count(bad, 0.10)
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.5, 1.0000001, True, None, "0.1"], ids=repr)
+def test_top_k_count_rejects_a_bad_k(bad):
+    with pytest.raises(ValueError):
+        top_k_count(10, bad)
+
+
+@pytest.mark.parametrize(
+    "n_rows,k_frac", [(50, 0.10), (25, 0.10), (1408, 0.10), (7, 0.30), (1, 0.05), (40, 1.0)]
+)
+def test_top_k_count_agrees_with_the_count_metrics_py_uses(n_rows, k_frac):
+    rng = np.random.default_rng(0)
+    y_true = rng.integers(0, 2, n_rows)
+    y_score = rng.random(n_rows)
+
+    matrix = confusion_matrix_at_k(y_true, y_score, k_frac)
+
+    assert top_k_count(n_rows, k_frac) == matrix["tp"] + matrix["fp"]
+
+
+# Table shape
+
+
+def test_the_table_has_the_exact_columns_order_and_dtypes(scoring_artifacts):
+    ids = [f"C{i:02d}" for i in range(12)]
+    table = score_batch(scoring_frame(scoring_artifacts, ids), real_run(scoring_artifacts), K_FRAC)
+
+    assert list(table.columns) == ["customer_id", "churn_probability", "rank", "in_top_k"]
+    assert table["customer_id"].dtype == object
+    assert table["churn_probability"].dtype == np.float64
+    assert table["rank"].dtype == np.int64
+    assert table["in_top_k"].dtype == bool
+    assert all(type(value) is str for value in table["customer_id"])
+    assert list(table.index) == list(range(len(table)))
+
+
+def test_one_row_per_customer_with_the_ids_unchanged(scoring_artifacts):
+    ids = [f"C{i:02d}" for i in range(12)]
+    table = score_batch(scoring_frame(scoring_artifacts, ids), real_run(scoring_artifacts), K_FRAC)
+
+    assert len(table) == 12
+    assert sorted(table["customer_id"]) == sorted(ids)
+
+
+def test_rank_is_one_to_n_and_rows_are_in_ascending_rank(scoring_artifacts):
+    table = score_batch(
+        scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)]),
+        real_run(scoring_artifacts),
+        K_FRAC,
+    )
+
+    assert list(table["rank"]) == list(range(1, 13))
+
+
+def test_probabilities_are_in_range_non_increasing_and_the_models_own_values(scoring_artifacts):
+    ids = [f"C{i:02d}" for i in range(12)]
+    frame = scoring_frame(scoring_artifacts, ids)
+    run = real_run(scoring_artifacts)
+
+    table = score_batch(frame, run, K_FRAC)
+
+    expected = run.model.predict_proba(run.preprocessor.transform(frame[SCORING_INPUT_COLUMNS]))[:, 1]
+    expected_by_id = dict(zip(ids, expected))
+    probabilities = table["churn_probability"].to_numpy()
+    assert np.all((probabilities >= 0) & (probabilities <= 1))
+    assert np.all(np.diff(probabilities) <= 0)
+    for customer_id, probability in zip(table["customer_id"], probabilities):
+        assert probability == expected_by_id[customer_id]
+
+
+# Ties and flags
+
+
+def test_equal_probabilities_are_ordered_by_customer_id_as_text(scoring_artifacts):
+    ids = ["C2", "c1", "C10", "B7", "C1"]
+    run, _, _ = scripted_run(scoring_artifacts, [0.5] * 5)
+
+    table = score_batch(scoring_frame(scoring_artifacts, ids), run, K_FRAC)
+
+    assert list(table["customer_id"]) == ["B7", "C1", "C10", "C2", "c1"]
+
+
+def test_a_tie_across_the_flag_boundary_still_flags_exactly_k_rows(scoring_artifacts):
+    ids = [f"C{i:02d}" for i in range(10)]
+    values = [0.9, 0.9, 0.9, 0.9, 0.9, 0.2, 0.2, 0.2, 0.2, 0.2]
+    run, _, _ = scripted_run(scoring_artifacts, values)
+
+    table = score_batch(scoring_frame(scoring_artifacts, ids), run, 0.30)
+
+    assert top_k_count(10, 0.30) == 3
+    assert table["in_top_k"].sum() == 3
+    assert list(table["in_top_k"]) == [True] * 3 + [False] * 7
+    assert list(table["customer_id"][:3]) == ["C00", "C01", "C02"]
+
+
+@pytest.mark.parametrize(
+    "n_rows,k_frac,expected",
+    [(1, 0.10, 1), (2, 0.10, 1), (10, 0.25, 2), (25, 0.10, 2), (30, 0.10, 3), (7, 1.0, 7), (50, 0.10, 5)],
+)
+def test_flag_counts_follow_the_rule_and_flags_are_the_first_rows(
+    scoring_artifacts, n_rows, k_frac, expected
+):
+    ids = [f"C{i:03d}" for i in range(n_rows)]
+    values = np.linspace(0.99, 0.01, n_rows)
+    run, _, _ = scripted_run(scoring_artifacts, values)
+
+    table = score_batch(scoring_frame(scoring_artifacts, ids), run, k_frac)
+
+    assert expected == top_k_count(n_rows, k_frac)
+    assert int(table["in_top_k"].sum()) == expected
+    assert list(table["in_top_k"]) == [True] * expected + [False] * (n_rows - expected)
+
+
+# Input handling
+
+
+def test_the_callers_frame_is_unchanged(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    original = frame.copy(deep=True)
+
+    score_batch(frame, real_run(scoring_artifacts), K_FRAC)
+
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_shuffled_rows_index_and_columns_give_the_same_table(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    run = real_run(scoring_artifacts)
+    expected = score_batch(frame, run, K_FRAC)
+
+    shuffled_rows = frame.sample(frac=1, random_state=3)
+    random_index = frame.copy()
+    random_index.index = np.random.default_rng(1).permutation(1000)[: len(frame)]
+    reordered_columns = frame[list(reversed(frame.columns))]
+
+    for variant in (shuffled_rows, random_index, reordered_columns):
+        pd.testing.assert_frame_equal(score_batch(variant, run, K_FRAC), expected)
+
+
+def test_true_false_and_one_zero_in_a_boolean_like_column_give_the_same_output(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    as_integers = frame.assign(married=frame["married"].astype("int64"))
+    run = real_run(scoring_artifacts)
+
+    pd.testing.assert_frame_equal(
+        score_batch(as_integers, run, K_FRAC), score_batch(frame, run, K_FRAC)
+    )
+
+
+def test_none_in_the_nullable_columns_reaches_the_preprocessor_as_none(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    run, preprocessor, _ = scripted_run(scoring_artifacts, np.linspace(0.9, 0.1, 12))
+
+    score_batch(frame, run, K_FRAC)
+
+    (received,) = preprocessor.received
+    for column in ("offer", "internet_type"):
+        values = received[column].tolist()
+        assert any(value is None for value in values)
+        assert not any(value is pd.NA or (isinstance(value, float) and value != value) for value in values)
+
+
+def test_a_category_dtype_customer_id_sorts_by_text(scoring_artifacts):
+    ids = ["C2", "c1", "C10", "B7"]
+    frame = scoring_frame(scoring_artifacts, ids)
+    frame["customer_id"] = pd.Categorical(ids, categories=["c1", "C2", "C10", "B7"])
+    run, _, _ = scripted_run(scoring_artifacts, [0.5] * 4)
+
+    table = score_batch(frame, run, K_FRAC)
+
+    assert list(table["customer_id"]) == ["B7", "C10", "C2", "c1"]
+    assert all(type(value) is str for value in table["customer_id"])
+
+
+def _missing_column(frame):
+    return frame.drop(columns=["age"])
+
+
+def _with_target(frame):
+    return frame.assign(**{TARGET_COLUMN: [0, 1] * (len(frame) // 2)})
+
+
+def _duplicate_id(frame):
+    changed = frame.copy()
+    changed.loc[1, "customer_id"] = changed.loc[0, "customer_id"]
+    return changed
+
+
+@pytest.mark.parametrize(
+    "damage", [_missing_column, _with_target, _duplicate_id], ids=["missing-column", "target-present", "duplicate-id"]
+)
+def test_validation_comes_first_and_nothing_is_transformed_or_predicted(scoring_artifacts, damage):
+    frame = damage(scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)]))
+    run, preprocessor, model = scripted_run(scoring_artifacts, np.linspace(0.9, 0.1, 12))
+
+    with pytest.raises(InputValidationError):
+        score_batch(frame, run, K_FRAC)
+
+    assert preprocessor.received == []
+    assert model.calls == 0
+
+
+def test_the_preprocessor_receives_exactly_the_schema_input_columns(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    shuffled_columns = frame[list(reversed(frame.columns))]
+    run, preprocessor, _ = scripted_run(scoring_artifacts, np.linspace(0.9, 0.1, 12))
+
+    score_batch(shuffled_columns, run, K_FRAC)
+
+    (received,) = preprocessor.received
+    assert list(received.columns) == SCORING_INPUT_COLUMNS
+    assert "customer_id" not in received.columns
+    assert TARGET_COLUMN not in received.columns
+
+
+# ScoringError
+
+
+@pytest.mark.parametrize(
+    "values,fragment",
+    [
+        ([0.5, np.nan, 0.5, 0.5], "non-finite"),
+        ([0.5, np.inf, 0.5, 0.5], "non-finite"),
+        ([0.5, 1.5, 0.5, 0.5], "outside [0, 1]"),
+        ([0.5, -0.1, 0.5, 0.5], "outside [0, 1]"),
+        ([0.5, 0.5, 0.5], "shape"),
+        ([0.5] * 5, "shape"),
+    ],
+    ids=["nan", "inf", "above-one", "negative", "too-short", "too-long"],
+)
+def test_unusable_model_output_raises_scoring_error(scoring_artifacts, values, fragment):
+    frame = scoring_frame(scoring_artifacts, ["C01", "C02", "C03", "C04"])
+    run, _, _ = scripted_run(scoring_artifacts, values)
+
+    with pytest.raises(ScoringError, match=re.escape(fragment)):
+        score_batch(frame, run, K_FRAC)
+
+
+def test_scoring_error_names_the_first_offending_customer(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, ["C01", "C02", "C03", "C04"])
+    run, _, _ = scripted_run(scoring_artifacts, [0.5, 2.0, 0.5, 0.5])
+
+    with pytest.raises(ScoringError, match=r"row 1 \(customer_id 'C02'"):
+        score_batch(frame, run, K_FRAC)
+
+
+def no_missing_scoring_frame(artifacts) -> pd.DataFrame:
+    """A valid scoring table whose nullable columns hold no missing values,
+    so that string and category dtypes are accepted for them too."""
+    frame = scoring_frame(artifacts, [f"C{i:02d}" for i in range(12)])
+    frame["offer"] = pd.Series(["Offer A", "Offer B"] * 6, dtype=object)
+    frame["internet_type"] = pd.Series(["DSL", "Cable", "Fiber Optic"] * 4, dtype=object)
+    return frame
+
+
+TEXT_COLUMNS = ("gender", "contract", "payment_method")
+NULLABLE_COLUMNS = ("offer", "internet_type")
+
+DTYPE_VARIANTS = {
+    "string-text-columns": lambda f: f.astype({name: "string" for name in TEXT_COLUMNS}),
+    "category-text-columns": lambda f: f.astype({name: "category" for name in TEXT_COLUMNS}),
+    "int32-numbers": lambda f: f.astype({"age": "int32", "tenure_in_months": "int32"}),
+    "float64-whole-numbers": lambda f: f.astype({"age": "float64", "tenure_in_months": "float64"}),
+    "string-nullable-columns": lambda f: f.astype({name: "string" for name in NULLABLE_COLUMNS}),
+    "category-nullable-columns": lambda f: f.astype({name: "category" for name in NULLABLE_COLUMNS}),
+}
+
+
+@pytest.mark.parametrize("build", list(DTYPE_VARIANTS.values()), ids=list(DTYPE_VARIANTS))
+def test_compatible_dtypes_score_the_same_table_as_the_object_baseline(scoring_artifacts, build):
+    base = no_missing_scoring_frame(scoring_artifacts)
+    run = real_run(scoring_artifacts)
+
+    baseline = score_batch(base, run, K_FRAC)
+    variant = score_batch(build(base), run, K_FRAC)
+
+    pd.testing.assert_frame_equal(variant, baseline)
+
+
+@pytest.mark.parametrize("bad", [0, 1.5, True], ids=repr)
+def test_score_batch_rejects_a_bad_k_frac_on_a_valid_frame(scoring_artifacts, bad):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+
+    with pytest.raises(ValueError, match="k_frac"):
+        score_batch(frame, real_run(scoring_artifacts), bad)
+
+
+def test_scoring_is_deterministic(scoring_artifacts):
+    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
+    run = real_run(scoring_artifacts)
+
+    first = score_batch(frame, run, K_FRAC)
+    second = score_batch(frame, run, K_FRAC)
+
+    pd.testing.assert_frame_equal(first, second, check_exact=True)
+
+
+# Label isolation
+
+
+def test_score_py_never_references_the_target_column():
+    tree = ast.parse(inspect.getsource(score))
+    strings = {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+
+    assert not any(TARGET_COLUMN in text for text in strings)
+    assert TARGET_COLUMN not in names | attributes
+    assert "validate_scoring_table" in names
