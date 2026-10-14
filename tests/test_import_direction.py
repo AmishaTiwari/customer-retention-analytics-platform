@@ -39,7 +39,15 @@ IMPORT_RULES: dict[str, set[str]] = {
     "features/*": {"config", "logging_setup", "data", "features"},
     "pipeline/*": {"config", "logging_setup", "data", "features", "pipeline"},
     "evaluation/*": {"config", "metrics", "models", "pipeline", "evaluation"},
-    "inference/*": {"config", "metrics", "tracking", "models.persist", "inference"},
+    "inference/*": {
+        "config",
+        "logging_setup",
+        "metrics",
+        "tracking",
+        "models.persist",
+        "pipeline.split",
+        "inference",
+    },
 }
 
 

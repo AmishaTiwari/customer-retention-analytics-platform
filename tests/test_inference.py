@@ -5,6 +5,8 @@ synthetic frames (fast, no database).
 Section B: input validation on the real data and the real generated schema.
 Section C: scoring core (score_batch and top_k_count).
 Section D: outputs (the CSV, the run summary and their publication).
+Section E: the scoring command (population selection, run_scoring, main and
+its failure classes).
 """
 
 from __future__ import annotations
@@ -12,9 +14,11 @@ from __future__ import annotations
 import ast
 import copy
 import csv
+import dataclasses
 import inspect
 import io
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -34,7 +38,8 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.features.build import run_features
-from retention_platform.config import REPO_ROOT
+from retention_platform import tracking
+from retention_platform.config import REPO_ROOT, ConfigValidationError, load_config
 from retention_platform.inference import outputs, score, validate
 from retention_platform.inference.outputs import (
     OUTREACH_FILE,
@@ -47,7 +52,15 @@ from retention_platform.inference.outputs import (
     publish_outputs,
     summary_json_bytes,
 )
-from retention_platform.inference.score import ScoringError, score_batch, top_k_count
+from retention_platform.inference.score import (
+    PostPublicationTrackingError,
+    ScoringError,
+    ScoringResult,
+    run_scoring,
+    score_batch,
+    select_scoring_population,
+    top_k_count,
+)
 from retention_platform.inference.validate import (
     InputValidationError,
     validate_scoring_table,
@@ -57,7 +70,9 @@ from retention_platform.models.persist import (
     HELD_OUT_RESULTS_REFERENCE,
     TRAINING_CV_ESTIMATE_TYPE,
     LoadedRun,
+    ModelLoadError,
     build_manifest,
+    publish_run,
 )
 from retention_platform.pipeline.preprocess import (
     build_preprocessing_pipeline,
@@ -71,6 +86,7 @@ from retention_platform.pipeline.schema import (
     schema_hash,
 )
 from retention_platform.pipeline.split import split_feat_churn
+from retention_platform.tracking import TrackingError, format_run_id
 
 # =============================================================================
 # Section A: validation rules on a small hand-made schema
@@ -1562,3 +1578,666 @@ def test_outputs_py_never_references_the_target_column_or_other_file_names():
     }
     assert file_names <= {OUTREACH_FILE, SUMMARY_FILE}
     assert file_names == {OUTREACH_FILE, SUMMARY_FILE}
+
+
+# =============================================================================
+# Section E: the scoring command
+# =============================================================================
+
+SCORING_INSTANT = datetime(2026, 10, 11, 12, 35, 0, tzinfo=timezone.utc)
+COMMAND_RUN_ID = "20261011T123500Z"
+FIRST_MODEL_INSTANT = datetime(2026, 10, 11, 12, 0, 0, tzinfo=timezone.utc)
+SECOND_MODEL_INSTANT = datetime(2026, 10, 11, 12, 10, 0, tzinfo=timezone.utc)
+SCORING_USAGE_ERROR_EXIT = 2
+
+
+class FixedScoringDatetime(datetime):
+    """Makes datetime.now() return SCORING_INSTANT so the run id is known."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return SCORING_INSTANT
+
+
+class SharedConnection:
+    """Wraps the shared test connection so main() cannot close it."""
+
+    def __init__(self, connection):
+        self._connection = connection
+        self.closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture(scope="module", autouse=True)
+def real_folders_untouched():
+    """The tests must never write into the real outputs/ or artifacts/."""
+    folders = [REPO_ROOT / "outputs", REPO_ROOT / "artifacts" / "models", REPO_ROOT / "artifacts" / "runs"]
+    before = {folder: sorted(path.name for path in folder.iterdir()) for folder in folders}
+    yield
+    after = {folder: sorted(path.name for path in folder.iterdir()) for folder in folders}
+    assert after == before
+
+
+@pytest.fixture(scope="module")
+def command_model(conn):
+    """A cheap real model: logistic regression on the real preprocessed
+    training split, with the real generated schema."""
+    inputs = prepare_model_inputs(conn)
+    model = LogisticRegression(max_iter=1000).fit(inputs.X_train, inputs.y_train)
+    return SimpleNamespace(
+        preprocessor=inputs.preprocessor,
+        model=model,
+        schema=build_input_schema(read_feat_churn_types(conn), inputs.preprocessor),
+        train_rows=len(inputs.y_train),
+    )
+
+
+def publish_model(models_dir, parts, instant) -> str:
+    run_id = format_run_id(instant)
+    manifest = build_manifest(
+        run_id=run_id,
+        instant=instant,
+        schema=parts.schema,
+        hyperparameters={},
+        training_cv_metrics={**OUTPUT_METRICS, "training_rows": parts.train_rows},
+        fingerprints={"config_hash": "a" * 64},
+    )
+    publish_run(
+        models_dir, run_id, manifest, parts.preprocessor, parts.model, manifest["input_schema_hash"]
+    )
+    return run_id
+
+
+def make_command_env(tmp_path, parts, model_instants=(FIRST_MODEL_INSTANT,)) -> SimpleNamespace:
+    config = load_config()
+    config["paths"] = {
+        **config["paths"],
+        "runs_dir": tmp_path / "runs",
+        "models_dir": tmp_path / "models",
+        "outputs_dir": tmp_path / "config_outputs_dir_not_used",
+    }
+    model_ids = [publish_model(config["paths"]["models_dir"], parts, i) for i in model_instants]
+    return SimpleNamespace(
+        config=config,
+        model_ids=model_ids,
+        models_dir=config["paths"]["models_dir"],
+        outputs_dir=tmp_path / "outputs",
+        run_dir=config["paths"]["runs_dir"] / "score" / COMMAND_RUN_ID,
+    )
+
+
+def patch_main(monkeypatch, env, conn) -> SharedConnection:
+    """Point main() at the temporary folders, a fixed clock and the shared
+    in-memory database."""
+    shared = SharedConnection(conn)
+    monkeypatch.setattr(score, "load_config", lambda: env.config)
+    monkeypatch.setattr(score, "datetime", FixedScoringDatetime)
+    monkeypatch.setattr(score, "DEFAULT_OUTPUTS_DIR", env.outputs_dir)
+    monkeypatch.setattr(
+        score, "duckdb", SimpleNamespace(connect=lambda *args, **kwargs: shared, Error=duckdb.Error)
+    )
+    return shared
+
+
+def run_command(argv=(), code=1):
+    with pytest.raises(SystemExit) as exc_info:
+        score.main(list(argv))
+    assert exc_info.value.code == code
+
+
+def failure_env(tmp_path, monkeypatch, conn, parts, model_instants=(FIRST_MODEL_INSTANT,)):
+    """An environment with a previous output pair already in place."""
+    env = make_command_env(tmp_path, parts, model_instants)
+    patch_main(monkeypatch, env, conn)
+    write_previous_pair(env.outputs_dir)
+    return env
+
+
+def assert_no_metrics(env):
+    assert not (env.run_dir / "metrics.json").exists()
+
+
+@pytest.fixture(scope="module")
+def reference_run(tmp_path_factory, conn, command_model):
+    """One complete successful run through main() on the reference-like
+    population (n = 1,408, K = 0.10), with what was observed on the way."""
+    tmp_path = tmp_path_factory.mktemp("reference")
+    env = make_command_env(tmp_path, command_model)
+    observed: dict = {}
+    real_score_batch = score.score_batch
+    real_write_metrics = tracking.TrackedRun.write_metrics
+
+    def spy_score_batch(frame, loaded_run, k_frac):
+        observed["population"] = frame.copy(deep=True)
+        return real_score_batch(frame, loaded_run, k_frac)
+
+    def spy_write_metrics(self, metrics):
+        observed["outputs_at_metrics_write"] = sorted(p.name for p in env.outputs_dir.iterdir())
+        return real_write_metrics(self, metrics)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch_main(patch, env, conn)
+        patch.setattr(score, "score_batch", spy_score_batch)
+        patch.setattr(tracking.TrackedRun, "write_metrics", spy_write_metrics)
+        score.main([])
+
+    csv_bytes = (env.outputs_dir / OUTREACH_FILE).read_bytes()
+    summary = json.loads((env.outputs_dir / SUMMARY_FILE).read_text(encoding="utf-8"))
+    return SimpleNamespace(
+        env=env,
+        observed=observed,
+        csv_bytes=csv_bytes,
+        rows=parse_csv(csv_bytes),
+        summary=summary,
+        schema=command_model.schema,
+    )
+
+
+# Outputs of the reference-like run
+
+
+def test_reference_csv_columns_rows_and_ranking(reference_run):
+    rows = reference_run.rows
+    body = rows[1:]
+    probabilities = [float(row[1]) for row in body]
+
+    assert rows[0] == TABLE_COLUMNS
+    assert len(body) == 1408
+    assert len({row[0] for row in body}) == 1408
+    assert [int(row[2]) for row in body] == list(range(1, 1409))
+    assert all(a >= b for a, b in zip(probabilities, probabilities[1:]))
+    assert all(
+        body[i][0] <= body[i + 1][0] for i in range(1407) if probabilities[i] == probabilities[i + 1]
+    )
+
+
+def test_reference_flags_are_exactly_141_and_the_first_rows(reference_run):
+    flags = [row[3] for row in reference_run.rows[1:]]
+
+    assert set(flags) <= {"True", "False"}
+    assert flags.count("True") == 141
+    assert flags == ["True"] * 141 + ["False"] * (1408 - 141)
+
+
+def test_reference_csv_has_no_empty_cell_and_lf_endings(reference_run):
+    assert all(cell != "" for row in reference_run.rows for cell in row)
+    assert b"\r" not in reference_run.csv_bytes
+    assert reference_run.csv_bytes.endswith(b"\n")
+
+
+def test_reference_summary_has_the_contract_keys_and_types(reference_run):
+    summary = reference_run.summary
+
+    assert list(summary) == SUMMARY_KEYS
+    assert list(summary["model_health"]) == MODEL_HEALTH_KEYS
+    assert list(summary["model_health"]["training_cv_metrics"]) == METRIC_KEYS
+    assert isinstance(summary["customers_scored"], int) and not isinstance(summary["customers_scored"], bool)
+    assert isinstance(summary["customers_flagged"], int)
+    assert isinstance(summary["k"], float)
+    assert summary["contract_version"] == "1"
+
+
+def test_reference_summary_agrees_with_the_csv_and_the_run_folders(reference_run):
+    env = reference_run.env
+    summary = reference_run.summary
+    manifest = json.loads((env.models_dir / env.model_ids[0] / "manifest.json").read_text(encoding="utf-8"))
+
+    assert summary["customers_scored"] == len(reference_run.rows) - 1 == 1408
+    assert summary["customers_flagged"] == [row[3] for row in reference_run.rows[1:]].count("True") == 141
+    assert summary["k"] == 0.1
+    assert summary["model_run_id"] == env.model_ids[0]
+    assert (env.models_dir / summary["model_run_id"]).is_dir()
+    assert summary["scoring_run_id"] == env.run_dir.name == COMMAND_RUN_ID
+    assert env.run_dir.is_dir()
+    assert summary["model_health"]["held_out_results_reference"] == "ADR-0014"
+    for key in MODEL_HEALTH_KEYS:
+        assert summary["model_health"][key] == manifest[key]
+
+
+def test_the_frame_given_to_score_batch_has_only_the_id_and_the_schema_columns(reference_run):
+    population = reference_run.observed["population"]
+    expected_columns = ["customer_id", *[column["name"] for column in reference_run.schema["columns"]]]
+
+    assert list(population.columns) == expected_columns
+    assert len(population) == 1408
+    assert TARGET_COLUMN not in population.columns
+    for column in ("offer", "internet_type"):
+        values = population[column].tolist()
+        assert any(value is None for value in values)
+        assert not any(value is pd.NA or (isinstance(value, float) and value != value) for value in values)
+
+
+def test_the_tracking_folder_holds_only_config_log_and_operational_metrics(reference_run):
+    run_dir = reference_run.env.run_dir
+
+    assert sorted(path.name for path in run_dir.iterdir()) == ["config.json", "metrics.json", "run.log"]
+    metrics = json.loads((run_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics == {
+        "k": 0.1,
+        "customers_scored": 1408,
+        "customers_flagged": 141,
+        "model_run_id": reference_run.env.model_ids[0],
+    }
+
+
+def test_metrics_are_written_only_after_both_outputs_are_published(reference_run):
+    assert reference_run.observed["outputs_at_metrics_write"] == sorted([OUTREACH_FILE, SUMMARY_FILE])
+
+
+def test_outputs_go_to_the_passed_folder_not_the_configured_one(reference_run):
+    env = reference_run.env
+
+    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
+    assert not env.config["paths"]["outputs_dir"].exists()
+
+
+def test_the_default_outputs_folder_is_the_repository_outputs_folder():
+    default = inspect.signature(run_scoring).parameters["outputs_dir"].default
+
+    assert default == REPO_ROOT / "outputs"
+
+
+def test_run_scoring_writes_to_the_given_folder_and_returns_the_paths(
+    tmp_path, conn, command_model
+):
+    env = make_command_env(tmp_path, command_model)
+
+    result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert isinstance(result, ScoringResult)
+    assert result.run_id == COMMAND_RUN_ID
+    assert result.model_run_id == env.model_ids[0]
+    assert (result.customers_scored, result.customers_flagged) == (1408, 141)
+    assert result.outreach_path == env.outputs_dir / OUTREACH_FILE
+    assert result.summary_path == env.outputs_dir / SUMMARY_FILE
+    assert not env.config["paths"]["outputs_dir"].exists()
+
+
+def test_the_scoring_population_is_the_test_split_with_nullable_columns_kept_as_none(
+    conn, command_model
+):
+    population = select_scoring_population(conn, command_model.schema)
+    test_split = split_feat_churn(conn).test
+
+    assert len(population) == 1408
+    assert set(population["customer_id"]) == set(test_split["customer_id"])
+    assert TARGET_COLUMN not in population.columns
+    assert any(value is None for value in population["offer"].tolist())
+
+
+# Model selection with --run-id
+
+
+def test_an_explicit_run_id_selects_that_model_and_the_default_selects_the_newest(
+    tmp_path, conn, command_model
+):
+    env = make_command_env(tmp_path, command_model, (FIRST_MODEL_INSTANT, SECOND_MODEL_INSTANT))
+    older, newer = env.model_ids
+
+    default_result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+    explicit_result = run_scoring(
+        env.config,
+        conn,
+        SCORING_INSTANT.replace(minute=40),
+        run_id=older,
+        outputs_dir=env.outputs_dir,
+    )
+
+    assert default_result.model_run_id == newer
+    assert explicit_result.model_run_id == older
+    summary = json.loads((env.outputs_dir / SUMMARY_FILE).read_text(encoding="utf-8"))
+    assert summary["model_run_id"] == older
+
+
+# Retention
+
+
+def test_a_successful_run_replaces_the_previous_pair(tmp_path, monkeypatch, conn, command_model):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    score.main([])
+
+    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
+    assert (env.outputs_dir / OUTREACH_FILE).read_bytes() != OLD_CSV
+    assert (env.outputs_dir / SUMMARY_FILE).read_bytes() != OLD_SUMMARY
+    assert sorted(path.name for path in env.run_dir.iterdir()) == ["config.json", "metrics.json", "run.log"]
+
+
+# Class 1
+
+
+def test_class_1_a_damaged_population_publishes_nothing(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+    real_select = score.select_scoring_population
+
+    def damaged(connection, schema):
+        population = real_select(connection, schema)
+        column = population.columns.get_loc("customer_id")
+        population.iloc[1, column] = population.iloc[0, column]
+        return population
+
+    monkeypatch.setattr(score, "select_scoring_population", damaged)
+
+    with caplog.at_level(logging.ERROR):
+        run_command()
+
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+    assert "class 1" in caplog.text
+    assert "duplicate customer_id" in caplog.text
+
+
+# Class 2a
+
+
+def run_2a(caplog):
+    with caplog.at_level(logging.ERROR):
+        run_command()
+    assert "class 2a" in caplog.text
+    assert "before anything was published" in caplog.text
+
+
+def test_class_2a_no_valid_model(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model, model_instants=())
+
+    run_2a(caplog)
+
+    assert "make train" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+@pytest.mark.parametrize("requested", ["20260101T000000Z", "../20261011T120000Z", ""], ids=["missing", "bad-format", "empty"])
+def test_class_2a_an_explicit_run_id_that_is_missing_or_invalid_has_no_fallback(
+    tmp_path, monkeypatch, conn, command_model, caplog, requested
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    with caplog.at_level(logging.ERROR):
+        run_command(["--run-id", requested])
+
+    assert "class 2a" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+def test_class_2a_an_existing_tracking_folder_stops_the_run_at_the_start(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+    env.run_dir.mkdir(parents=True)
+    (env.run_dir / "keep.txt").write_text("keep", encoding="utf-8")
+
+    run_2a(caplog)
+
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert sorted(path.name for path in env.run_dir.iterdir()) == ["keep.txt"]
+
+
+def test_class_2a_a_scoring_error_from_a_scripted_model(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+    real_load = score.load_run
+
+    def scripted_load(models_dir, run_id=None):
+        loaded = real_load(models_dir, run_id)
+        return dataclasses.replace(
+            loaded, preprocessor=ScriptedPreprocessor(), model=ScriptedModel([np.nan] * 1408)
+        )
+
+    monkeypatch.setattr(score, "load_run", scripted_load)
+
+    run_2a(caplog)
+
+    assert "ScoringError" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+def test_class_2a_a_temporary_file_write_failure(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    def failing_write(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outputs, "_write_file", failing_write)
+
+    run_2a(caplog)
+
+    assert "OutputGenerationError" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+def test_class_2a_an_unexpected_error_while_scoring(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    def broken_score_batch(frame, loaded_run, k_frac):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(score, "score_batch", broken_score_batch)
+
+    run_2a(caplog)
+
+    assert "RuntimeError" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+def test_class_2a_a_database_error(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    def broken_connect(*args, **kwargs):
+        raise duckdb.IOException("cannot open the database")
+
+    monkeypatch.setattr(
+        score, "duckdb", SimpleNamespace(connect=broken_connect, Error=duckdb.Error)
+    )
+
+    run_2a(caplog)
+
+    assert_previous_pair_unchanged(env.outputs_dir)
+    assert not env.run_dir.exists()
+
+
+def test_class_2a_a_configuration_error(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    def broken_config():
+        raise ConfigValidationError("the configuration is broken")
+
+    monkeypatch.setattr(score, "load_config", broken_config)
+
+    run_2a(caplog)
+
+    assert "the configuration is broken" in caplog.text
+    assert_previous_pair_unchanged(env.outputs_dir)
+
+
+# Class 2b
+
+
+def test_class_2b_a_failed_summary_replacement(tmp_path, monkeypatch, conn, command_model, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+    fail_summary_replace(monkeypatch)
+
+    with caplog.at_level(logging.ERROR):
+        run_command()
+
+    assert "class 2b" in caplog.text
+    assert f"{OUTREACH_FILE} was replaced" in caplog.text
+    assert f"{SUMMARY_FILE} was not replaced" in caplog.text
+    assert "may be inconsistent" in caplog.text
+    new_csv = (env.outputs_dir / OUTREACH_FILE).read_bytes()
+    assert new_csv != OLD_CSV
+    assert len(parse_csv(new_csv)) == 1409
+    assert (env.outputs_dir / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
+    assert_no_metrics(env)
+
+
+# Class 3
+
+
+def test_class_3_a_tracking_failure_after_publication_keeps_both_files(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    def broken_write_metrics(self, metrics):
+        raise TrackingError("disk full")
+
+    monkeypatch.setattr(tracking.TrackedRun, "write_metrics", broken_write_metrics)
+
+    with caplog.at_level(logging.ERROR):
+        run_command()
+
+    assert "class 3" in caplog.text
+    assert "outputs were generated" in caplog.text
+    assert "tracking failed" in caplog.text
+    assert COMMAND_RUN_ID in caplog.text
+    assert "disk full" in caplog.text
+    assert len(parse_csv((env.outputs_dir / OUTREACH_FILE).read_bytes())) == 1409
+    assert (env.outputs_dir / SUMMARY_FILE).read_bytes() != OLD_SUMMARY
+    assert json.loads((env.outputs_dir / SUMMARY_FILE).read_text(encoding="utf-8"))["scoring_run_id"] == COMMAND_RUN_ID
+    assert_no_metrics(env)
+
+
+def test_run_scoring_raises_the_class_3_error_with_the_scoring_run_id(
+    tmp_path, conn, command_model, monkeypatch
+):
+    env = make_command_env(tmp_path, command_model)
+
+    def broken_write_metrics(self, metrics):
+        raise TrackingError("disk full")
+
+    monkeypatch.setattr(tracking.TrackedRun, "write_metrics", broken_write_metrics)
+
+    with pytest.raises(PostPublicationTrackingError) as exc_info:
+        run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert exc_info.value.scoring_run_id == COMMAND_RUN_ID
+    assert isinstance(exc_info.value.__cause__, TrackingError)
+
+
+# main: exit codes and messages for each error type
+
+
+@pytest.mark.parametrize(
+    "error,keywords",
+    [
+        (InputValidationError("column x is broken"), ["class 1", "column x is broken"]),
+        (
+            OutputPublicationError(
+                "Publication failed part way: a.csv was replaced, b.json was not replaced",
+                csv_replaced=True,
+                summary_replaced=False,
+            ),
+            ["class 2b", "a.csv was replaced", "b.json was not replaced"],
+        ),
+        (
+            PostPublicationTrackingError(
+                COMMAND_RUN_ID,
+                f"The outputs were generated and published, but tracking failed for scoring run {COMMAND_RUN_ID}: disk full",
+            ),
+            ["class 3", "outputs were generated", "tracking failed", COMMAND_RUN_ID],
+        ),
+        (TrackingError("cannot create the run folder"), ["class 2a", "before anything was published"]),
+        (ModelLoadError("no valid model"), ["class 2a", "before anything was published"]),
+        (ScoringError("bad probabilities"), ["class 2a", "before anything was published"]),
+        (OutputGenerationError("cannot build"), ["class 2a", "before anything was published"]),
+        (duckdb.IOException("db broken"), ["class 2a", "before anything was published"]),
+        (RuntimeError("boom"), ["class 2a", "before anything was published", "RuntimeError"]),
+    ],
+    ids=[
+        "class-1",
+        "class-2b",
+        "class-3",
+        "tracking-start",
+        "model-load",
+        "scoring",
+        "output-generation",
+        "database",
+        "unexpected",
+    ],
+)
+def test_main_maps_each_error_to_its_class_and_exits_non_zero(
+    tmp_path, monkeypatch, conn, command_model, caplog, error, keywords
+):
+    env = make_command_env(tmp_path, command_model)
+    shared = patch_main(monkeypatch, env, conn)
+
+    def raising_run_scoring(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(score, "run_scoring", raising_run_scoring)
+
+    with caplog.at_level(logging.ERROR):
+        run_command()
+
+    for keyword in keywords:
+        assert keyword in caplog.text, keyword
+    assert shared.closed is True
+
+
+def test_main_succeeds_without_exiting_and_logs_the_result(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = make_command_env(tmp_path, command_model)
+    shared = patch_main(monkeypatch, env, conn)
+    result = ScoringResult(
+        run_id=COMMAND_RUN_ID,
+        model_run_id=env.model_ids[0],
+        customers_scored=1408,
+        customers_flagged=141,
+        outreach_path=env.outputs_dir / OUTREACH_FILE,
+        summary_path=env.outputs_dir / SUMMARY_FILE,
+    )
+    monkeypatch.setattr(score, "run_scoring", lambda *args, **kwargs: result)
+
+    with caplog.at_level(logging.INFO):
+        score.main([])
+
+    assert shared.closed is True
+    assert "Scoring complete" in caplog.text
+    assert COMMAND_RUN_ID in caplog.text
+    assert env.model_ids[0] in caplog.text
+    assert "1408" in caplog.text and "141" in caplog.text
+
+
+def test_main_passes_the_run_id_option_to_run_scoring(tmp_path, monkeypatch, conn, command_model):
+    env = make_command_env(tmp_path, command_model)
+    patch_main(monkeypatch, env, conn)
+    seen = {}
+
+    def spy_run_scoring(config, connection, instant, *, run_id=None, outputs_dir=None):
+        seen.update(run_id=run_id, outputs_dir=outputs_dir, instant=instant)
+        return ScoringResult(COMMAND_RUN_ID, "x", 1, 1, Path("a"), Path("b"))
+
+    monkeypatch.setattr(score, "run_scoring", spy_run_scoring)
+
+    score.main(["--run-id", "20261011T120000Z"])
+    assert seen == {
+        "run_id": "20261011T120000Z",
+        "outputs_dir": env.outputs_dir,
+        "instant": SCORING_INSTANT,
+    }
+    seen.clear()
+    score.main([])
+    assert seen["run_id"] is None
+
+
+@pytest.mark.parametrize("argv", [["--bogus"], ["--run-id"]], ids=["unknown-option", "missing-value"])
+def test_a_usage_error_exits_with_argparses_own_code(argv):
+    with pytest.raises(SystemExit) as exc_info:
+        score.main(argv)
+
+    assert exc_info.value.code == SCORING_USAGE_ERROR_EXIT
