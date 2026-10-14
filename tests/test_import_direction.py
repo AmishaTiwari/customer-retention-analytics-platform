@@ -3,9 +3,10 @@
 Every module gets a row in IMPORT_RULES listing which parts of the package
 it may import. Stage order is data -> features -> pipeline -> models ->
 evaluation -> inference; config and logging_setup are the shared root
-modules, and metrics is a shared module used by models, evaluation and
-inference. A module may import the root modules, earlier stages and its
-own stage, never later stages.
+modules. metrics is a shared module used by models, evaluation and
+inference, and tracking is a shared module used by models and inference.
+A module may import the root modules, earlier stages and its own stage,
+never later stages.
 
 The checks only read source text with ast. No package code is imported or
 run; importlib.util.find_spec is used just to locate the package folder.
@@ -32,12 +33,13 @@ IMPORT_RULES: dict[str, set[str]] = {
     "logging_setup.py": set(),
     "metrics.py": set(),
     "models/calibrate.py": set(),
-    "models/*": {"config", "logging_setup", "pipeline", "metrics", "models"},
+    "tracking.py": {"config", "logging_setup"},
+    "models/*": {"config", "logging_setup", "pipeline", "metrics", "tracking", "models"},
     "data/*": {"config", "logging_setup", "data"},
     "features/*": {"config", "logging_setup", "data", "features"},
     "pipeline/*": {"config", "logging_setup", "data", "features", "pipeline"},
     "evaluation/*": {"config", "metrics", "models", "pipeline", "evaluation"},
-    "inference/*": {"config", "metrics", "models.persist", "inference"},
+    "inference/*": {"config", "metrics", "tracking", "models.persist", "inference"},
 }
 
 
