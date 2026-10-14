@@ -13,9 +13,11 @@ import copy
 import hashlib
 import importlib.metadata
 import json
+import logging
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,8 +25,14 @@ import joblib
 import numpy as np
 
 from retention_platform.config import REPO_ROOT
+from retention_platform.pipeline.schema import (
+    SQL_TYPE_TO_KIND,
+    check_schema_matches_preprocessor,
+)
 from retention_platform.pipeline.schema import schema_hash as compute_schema_hash
 from retention_platform.tracking import RUN_ID_FORMAT, config_snapshot, format_run_id
+
+logger = logging.getLogger(__name__)
 
 HASH_NORMALIZATION = "CRLF to LF before hashing"
 
@@ -329,3 +337,182 @@ def publish_run(
         raise
 
     return final_path
+
+
+class ModelLoadError(Exception):
+    """Raised when no model run can be selected, or a selected run cannot be
+    loaded or fails a load-time check. The message says what failed and
+    names the run id when a run is involved."""
+
+
+@dataclass(frozen=True)
+class LoadedRun:
+    """A loaded model run: its manifest and schema, and the fitted
+    preprocessor and model from its bundle."""
+
+    run_id: str
+    run_dir: Path
+    manifest: dict
+    schema: dict
+    schema_hash: str
+    preprocessor: object
+    model: object
+
+
+def _run_problem(run_dir: Path, name: str) -> str | None:
+    """Return why a directory is not a valid model run, or None if it is.
+    Never opens bundle.joblib."""
+    if name.startswith(TEMP_DIR_PREFIX):
+        return "temporary folder left by an unfinished publication"
+    if not is_valid_run_id(name):
+        return "the folder name is not a run id"
+    if not (run_dir / BUNDLE_FILE).is_file():
+        return f"{BUNDLE_FILE} is missing"
+    manifest_path = run_dir / MANIFEST_FILE
+    if not manifest_path.is_file():
+        return f"{MANIFEST_FILE} is missing"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"{MANIFEST_FILE} cannot be read: {exc}"
+    if not isinstance(manifest, dict):
+        return f"{MANIFEST_FILE} is not a JSON object"
+    if manifest.get("run_id") != name:
+        return f"manifest run_id {manifest.get('run_id')!r} differs from the folder name"
+    return None
+
+
+def find_valid_run_ids(models_dir: str | Path) -> list[str]:
+    """Return the valid run ids in models_dir in ascending order.
+
+    Only directories are looked at; plain files are ignored. Every skipped
+    directory is reported with one warning naming it and the reason. A
+    missing models_dir gives an empty list.
+    """
+    root = Path(models_dir)
+    if not root.is_dir():
+        return []
+    try:
+        entries = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise ModelLoadError(f"Cannot list the models folder {root}: {exc}") from exc
+
+    valid = []
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        problem = _run_problem(entry, entry.name)
+        if problem is None:
+            valid.append(entry.name)
+        else:
+            logger.warning("Skipping model folder %s: %s", entry.name, problem)
+    return valid
+
+
+def select_run_id(models_dir: str | Path, run_id: str | None = None) -> str:
+    """Return the run id to use.
+
+    With run_id given, that exact run is used or ModelLoadError is raised,
+    never another run; the id is checked against the run id format before
+    any path is built. Without it, the highest valid run id is chosen by
+    name, not by modification time.
+    """
+    if run_id is not None:
+        if not is_valid_run_id(run_id):
+            raise ModelLoadError(f"The requested run id is not in the run id format: {run_id!r}")
+        run_dir = Path(models_dir) / run_id
+        if not run_dir.exists():
+            raise ModelLoadError(f"Requested model run {run_id} was not found in {models_dir}")
+        if not run_dir.is_dir():
+            raise ModelLoadError(f"Requested model run {run_id} is not a folder")
+        problem = _run_problem(run_dir, run_id)
+        if problem is not None:
+            raise ModelLoadError(f"Requested model run {run_id} is not valid: {problem}")
+        selected = run_id
+    else:
+        valid = find_valid_run_ids(models_dir)
+        if not valid:
+            raise ModelLoadError(
+                f"No valid model run found in {models_dir}. Run `make train` first."
+            )
+        selected = valid[-1]
+
+    logger.info("Selected model run %s", selected)
+    return selected
+
+
+def _load_error(run_id: str, text: str) -> ModelLoadError:
+    return ModelLoadError(f"Model run {run_id}: {text}")
+
+
+def load_run(models_dir: str | Path, run_id: str | None = None) -> LoadedRun:
+    """Select a run and load its manifest and bundle.
+
+    Loading a joblib file runs code from the file, so a bundle must only be
+    loaded if this repository produced it on a trusted machine.
+
+    Only these checks are enforced: the bundle holds exactly a
+    preprocessor, a model and a schema hash; the bundle's schema hash equals
+    the manifest's; the manifest's schema hashes to the stored value; every
+    column kind is a known kind; and the schema matches the fitted
+    preprocessor. Fingerprints and library versions are never checked. A
+    manifest that fails its own checks is refused before the bundle is
+    opened.
+    """
+    selected = select_run_id(models_dir, run_id)
+    run_dir = Path(models_dir) / selected
+
+    try:
+        manifest = json.loads((run_dir / MANIFEST_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _load_error(selected, f"{MANIFEST_FILE} cannot be read: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise _load_error(selected, f"{MANIFEST_FILE} is not a JSON object")
+
+    for key in ("input_schema", "input_schema_hash"):
+        if key not in manifest:
+            raise _load_error(selected, f"{MANIFEST_FILE} has no {key}")
+    schema = manifest["input_schema"]
+    stored_hash = manifest["input_schema_hash"]
+
+    if not isinstance(schema, dict) or not isinstance(schema.get("columns"), list):
+        raise _load_error(selected, "the manifest's input schema has no column list")
+    if compute_schema_hash(schema) != stored_hash:
+        raise _load_error(selected, "the manifest's input schema does not match its schema hash")
+
+    known_kinds = set(SQL_TYPE_TO_KIND.values())
+    for column in schema["columns"]:
+        if not isinstance(column, dict) or column.get("kind") not in known_kinds:
+            name = column.get("name") if isinstance(column, dict) else column
+            kind = column.get("kind") if isinstance(column, dict) else None
+            raise _load_error(
+                selected,
+                f"schema column {name!r} has kind {kind!r}, expected one of {sorted(known_kinds)}",
+            )
+
+    try:
+        bundle = joblib.load(run_dir / BUNDLE_FILE)
+    except Exception as exc:
+        raise _load_error(selected, f"{BUNDLE_FILE} cannot be read: {exc}") from exc
+
+    if not isinstance(bundle, dict) or set(bundle) != {"preprocessor", "model", "schema_hash"}:
+        raise _load_error(
+            selected, "the bundle must be a dict with exactly preprocessor, model and schema_hash"
+        )
+    if bundle["schema_hash"] != stored_hash:
+        raise _load_error(selected, "the bundle's schema hash differs from the manifest's")
+
+    try:
+        check_schema_matches_preprocessor(schema, bundle["preprocessor"])
+    except (ValueError, AttributeError, TypeError, KeyError) as exc:
+        raise _load_error(selected, f"the schema does not match the preprocessor: {exc}") from exc
+
+    return LoadedRun(
+        run_id=selected,
+        run_dir=run_dir,
+        manifest=manifest,
+        schema=schema,
+        schema_hash=stored_hash,
+        preprocessor=bundle["preprocessor"],
+        model=bundle["model"],
+    )

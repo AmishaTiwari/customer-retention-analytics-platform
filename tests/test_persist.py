@@ -1,5 +1,6 @@
 """Tests for models/persist.py: the fingerprints, the manifest, the
-existence check and the publication of a model run.
+existence check, the publication of a model run, and run selection and
+loading.
 
 Synthetic files live under tmp_path; the real repository folders are only
 read, never written.
@@ -7,15 +8,20 @@ read, never written.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.metadata
 import json
+import logging
+import os
 import re
 import tomllib
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import joblib
 import numpy as np
+import pandas as pd
 import pytest
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -42,21 +48,27 @@ from retention_platform.models.persist import (
     SQL_FOLDERS,
     TEMP_DIR_PREFIX,
     TRAINING_CV_ESTIMATE_TYPE,
+    LoadedRun,
+    ModelLoadError,
     PublicationError,
     build_fingerprints,
     build_manifest,
     config_hash,
     data_fingerprint,
     ensure_run_path_free,
+    find_valid_run_ids,
     is_valid_run_id,
     library_versions,
+    load_run,
     package_version,
     publish_run,
+    select_run_id,
     sha256_normalized,
     sql_hash,
 )
-from retention_platform.pipeline.schema import schema_hash
-from retention_platform.tracking import RUN_ID_FORMAT, config_snapshot
+from retention_platform.pipeline.preprocess import build_preprocessing_pipeline
+from retention_platform.pipeline.schema import build_input_schema, schema_hash
+from retention_platform.tracking import RUN_ID_FORMAT, config_snapshot, format_run_id
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -887,3 +899,459 @@ def test_mismatches_raise_value_error_and_write_nothing(tmp_path, parts, overrid
 
     assert not models_dir.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+# --- Run selection and loading ----------------------------------------------
+
+LOGGER_NAME = "retention_platform.models.persist"
+
+SMALL_COLUMN_TYPES = {
+    "customer_id": "VARCHAR",
+    "is_voluntary_churn": "BOOLEAN",
+    "gender": "VARCHAR",
+    "age": "INTEGER",
+    "offer": "VARCHAR",
+    "internet_type": "VARCHAR",
+    "contract": "VARCHAR",
+    "payment_method": "VARCHAR",
+    "tenure_in_months": "INTEGER",
+    "married": "BOOLEAN",
+}
+
+
+@pytest.fixture(scope="module")
+def artifacts():
+    """A small fitted preprocessor and model, and the schema built from them."""
+    frame = pd.DataFrame(
+        {
+            "gender": ["Female", "Male"] * 6,
+            "age": [20 + i for i in range(12)],
+            "offer": ["Offer A", None, "Offer B", None] * 3,
+            "internet_type": ["DSL", "Cable", None, "Fiber Optic"] * 3,
+            "contract": ["Month-to-Month", "One Year", "Two Year"] * 4,
+            "payment_method": ["Credit Card", "Mailed Check", "Bank Withdrawal"] * 4,
+            "tenure_in_months": [1 + 3 * i for i in range(12)],
+            "married": [True, False] * 6,
+        }
+    )
+    preprocessor = build_preprocessing_pipeline().fit(frame)
+    matrix = preprocessor.transform(frame)
+    model = LogisticRegression().fit(matrix, [0, 1] * 6)
+    return SimpleNamespace(
+        frame=frame,
+        preprocessor=preprocessor,
+        model=model,
+        matrix=matrix,
+        schema=build_input_schema(SMALL_COLUMN_TYPES, preprocessor),
+    )
+
+
+def at(day: int) -> datetime:
+    return datetime(2026, 10, day, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def publish_real_run(models_dir, artifacts, instant) -> str:
+    run_id = format_run_id(instant)
+    manifest = build_manifest(
+        run_id=run_id,
+        instant=instant,
+        schema=artifacts.schema,
+        hyperparameters={},
+        training_cv_metrics=dict(METRICS),
+        fingerprints=FINGERPRINTS,
+    )
+    publish_run(
+        models_dir,
+        run_id,
+        manifest,
+        artifacts.preprocessor,
+        artifacts.model,
+        manifest["input_schema_hash"],
+    )
+    return run_id
+
+
+@pytest.fixture
+def published(tmp_path, artifacts):
+    models_dir = tmp_path / "models"
+    run_id = publish_real_run(models_dir, artifacts, at(11))
+    return SimpleNamespace(models_dir=models_dir, run_id=run_id, run_dir=models_dir / run_id)
+
+
+def read_manifest(run_dir):
+    return json.loads((run_dir / MANIFEST_FILE).read_text(encoding="utf-8"))
+
+
+def write_manifest(run_dir, manifest):
+    (run_dir / MANIFEST_FILE).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def edit_manifest(run_dir, mutate):
+    manifest = read_manifest(run_dir)
+    mutate(manifest)
+    write_manifest(run_dir, manifest)
+
+
+def edit_bundle(run_dir, mutate):
+    bundle = joblib.load(run_dir / BUNDLE_FILE)
+    mutate(bundle)
+    joblib.dump(bundle, run_dir / BUNDLE_FILE)
+
+
+def edit_schema_consistently(run_dir, mutate_schema):
+    """Edit the manifest's schema and update both stored hashes to match, so
+    only the checks after the hash checks can catch the edit."""
+    manifest = read_manifest(run_dir)
+    mutate_schema(manifest["input_schema"])
+    new_hash = schema_hash(manifest["input_schema"])
+    manifest["input_schema_hash"] = new_hash
+    write_manifest(run_dir, manifest)
+    edit_bundle(run_dir, lambda bundle: bundle.update(schema_hash=new_hash))
+
+
+def tree_state(root):
+    return {
+        str(path.relative_to(root)): (
+            hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        )
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def warnings_from_persist(caplog):
+    return [
+        record
+        for record in caplog.records
+        if record.name == LOGGER_NAME and record.levelno == logging.WARNING
+    ]
+
+
+# Selection
+
+
+def test_highest_name_is_selected_even_when_modification_times_are_reversed(tmp_path, artifacts):
+    models_dir = tmp_path / "models"
+    ids = [publish_real_run(models_dir, artifacts, at(day)) for day in (1, 2, 3)]
+    for offset, run_id in enumerate(ids):
+        timestamp = 2_000_000_000 - offset * 1000
+        os.utime(models_dir / run_id, (timestamp, timestamp))
+
+    assert (models_dir / ids[-1]).stat().st_mtime < (models_dir / ids[0]).stat().st_mtime
+    assert select_run_id(models_dir) == ids[-1]
+    assert find_valid_run_ids(models_dir) == sorted(ids)
+
+
+def _only_bundle(path):
+    path.mkdir()
+    (path / BUNDLE_FILE).write_bytes(b"x")
+
+
+def _only_manifest(path):
+    path.mkdir()
+    (path / MANIFEST_FILE).write_text(json.dumps({"run_id": path.name}), encoding="utf-8")
+
+
+def _manifest_with_other_run_id(path):
+    path.mkdir()
+    (path / BUNDLE_FILE).write_bytes(b"x")
+    (path / MANIFEST_FILE).write_text(json.dumps({"run_id": "20261231T000000Z"}), encoding="utf-8")
+
+
+def _unreadable_manifest(path):
+    path.mkdir()
+    (path / BUNDLE_FILE).write_bytes(b"x")
+    (path / MANIFEST_FILE).write_text("{not json", encoding="utf-8")
+
+
+SKIPPED_FOLDERS = {
+    ".tmp-abc123": (_empty_folder, "temporary"),
+    "20271001T000000Z": (_empty_folder, "bundle.joblib is missing"),
+    "20271002T000000Z": (_only_bundle, "manifest.json is missing"),
+    "20271003T000000Z": (_only_manifest, "bundle.joblib is missing"),
+    "20271004T000000Z": (_manifest_with_other_run_id, "differs from the folder name"),
+    "20271005T000000Z": (_unreadable_manifest, "cannot be read"),
+    "not-a-run": (_empty_folder, "not a run id"),
+}
+
+
+def test_invalid_folders_are_skipped_with_one_warning_each(tmp_path, artifacts, caplog):
+    models_dir = tmp_path / "models"
+    valid_id = publish_real_run(models_dir, artifacts, at(11))
+    for name, (create, _) in SKIPPED_FOLDERS.items():
+        create(models_dir / name)
+    (models_dir / ".gitkeep").write_bytes(b"")
+    (models_dir / "notes.txt").write_text("plain file", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+        found = find_valid_run_ids(models_dir)
+
+    assert found == [valid_id]
+    warned = warnings_from_persist(caplog)
+    assert len(warned) == len(SKIPPED_FOLDERS)
+    for name, (_, reason) in SKIPPED_FOLDERS.items():
+        matching = [record.getMessage() for record in warned if name in record.getMessage()]
+        assert len(matching) == 1, name
+        assert reason in matching[0], matching[0]
+    assert not any(".gitkeep" in record.getMessage() for record in warned)
+    assert not any("notes.txt" in record.getMessage() for record in warned)
+
+
+def test_a_valid_run_is_still_selected_when_higher_folders_are_invalid(tmp_path, artifacts):
+    models_dir = tmp_path / "models"
+    valid_id = publish_real_run(models_dir, artifacts, at(11))
+    for name, (create, _) in SKIPPED_FOLDERS.items():
+        create(models_dir / name)
+
+    assert select_run_id(models_dir) == valid_id
+
+
+def test_a_missing_models_dir_has_no_valid_runs(tmp_path):
+    assert find_valid_run_ids(tmp_path / "missing") == []
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ["../20261011T120000Z", "", "20261011T120000z", "20261011T120000Z\n"],
+    ids=["path-traversal", "empty", "lowercase-z", "trailing-newline"],
+)
+def test_a_badly_formatted_requested_run_id_is_refused(published, requested):
+    with pytest.raises(ModelLoadError, match="run id format"):
+        select_run_id(published.models_dir, requested)
+
+
+def test_the_format_is_checked_before_any_path_is_built(tmp_path):
+    models_dir = tmp_path / "does_not_exist"
+
+    with pytest.raises(ModelLoadError, match="run id format"):
+        select_run_id(models_dir, "../x")
+
+    assert not models_dir.exists()
+
+
+def test_a_requested_run_that_does_not_exist_is_refused(published):
+    with pytest.raises(ModelLoadError, match="not found"):
+        select_run_id(published.models_dir, "20260101T000000Z")
+
+
+@pytest.mark.parametrize(
+    "create",
+    [_empty_folder, _only_bundle, _manifest_with_other_run_id],
+    ids=["empty", "one-file", "mismatched-manifest"],
+)
+def test_an_invalid_requested_run_is_refused_without_fallback(published, create):
+    invalid_id = "20271001T000000Z"
+    create(published.models_dir / invalid_id)
+
+    with pytest.raises(ModelLoadError, match=f"{invalid_id} is not valid"):
+        select_run_id(published.models_dir, invalid_id)
+    with pytest.raises(ModelLoadError, match=invalid_id):
+        load_run(published.models_dir, invalid_id)
+
+
+def test_a_requested_plain_file_is_refused(published):
+    (published.models_dir / "20271001T000000Z").write_bytes(b"a file")
+
+    with pytest.raises(ModelLoadError, match="not a folder"):
+        select_run_id(published.models_dir, "20271001T000000Z")
+
+
+def test_a_valid_requested_run_is_selected(tmp_path, artifacts):
+    models_dir = tmp_path / "models"
+    older = publish_real_run(models_dir, artifacts, at(1))
+    publish_real_run(models_dir, artifacts, at(2))
+
+    assert select_run_id(models_dir, older) == older
+
+
+@pytest.mark.parametrize("prepare", ["missing", "empty", "only-invalid"])
+def test_no_valid_run_tells_the_person_to_run_make_train(tmp_path, prepare):
+    models_dir = tmp_path / "models"
+    if prepare != "missing":
+        models_dir.mkdir()
+    if prepare == "only-invalid":
+        _only_bundle(models_dir / "20271002T000000Z")
+        _empty_folder(models_dir / ".tmp-abc")
+
+    with pytest.raises(ModelLoadError, match="make train"):
+        select_run_id(models_dir)
+    with pytest.raises(ModelLoadError, match="make train"):
+        load_run(models_dir)
+
+
+def test_the_selected_run_id_is_logged_at_info_level(published, caplog):
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        select_run_id(published.models_dir)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == LOGGER_NAME and record.levelno == logging.INFO
+    ]
+    assert any(published.run_id in message for message in messages)
+
+
+# Loading
+
+
+def _to_array(matrix):
+    return matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+
+
+def test_round_trip_returns_the_published_run(published, artifacts):
+    loaded = load_run(published.models_dir)
+
+    assert isinstance(loaded, LoadedRun)
+    assert loaded.run_id == published.run_id
+    assert loaded.run_dir == published.run_dir
+    assert loaded.manifest == read_manifest(published.run_dir)
+    assert loaded.schema == artifacts.schema
+    assert loaded.schema == loaded.manifest["input_schema"]
+    assert loaded.schema_hash == loaded.manifest["input_schema_hash"] == schema_hash(artifacts.schema)
+    assert np.allclose(
+        loaded.model.predict_proba(artifacts.matrix), artifacts.model.predict_proba(artifacts.matrix)
+    )
+    assert np.allclose(
+        _to_array(loaded.preprocessor.transform(artifacts.frame)), _to_array(artifacts.matrix)
+    )
+
+
+def test_loaded_run_is_frozen(published):
+    loaded = load_run(published.models_dir)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        loaded.run_id = "other"
+
+
+def test_load_run_uses_the_highest_run_or_the_requested_one(tmp_path, artifacts):
+    models_dir = tmp_path / "models"
+    older = publish_real_run(models_dir, artifacts, at(1))
+    newer = publish_real_run(models_dir, artifacts, at(2))
+
+    assert load_run(models_dir).run_id == newer
+    assert load_run(models_dir, older).run_id == older
+
+
+def _break_manifest_unreadable(run_dir):
+    (run_dir / MANIFEST_FILE).write_text("{not json", encoding="utf-8")
+
+
+LOAD_BREAKS = {
+    "bundle-schema-hash-differs": (
+        lambda d: edit_bundle(d, lambda b: b.update(schema_hash="0" * 64)),
+        "differs from the manifest",
+    ),
+    "schema-edited-after-publication": (
+        lambda d: edit_manifest(
+            d, lambda m: m["input_schema"]["columns"][0]["allowed_values"].append("Other")
+        ),
+        "does not match its schema hash",
+    ),
+    "unknown-kind": (
+        lambda d: edit_schema_consistently(d, lambda s: s["columns"][1].update(kind="weird")),
+        "expected one of",
+    ),
+    "schema-disagrees-with-preprocessor": (
+        lambda d: edit_schema_consistently(
+            d, lambda s: s["columns"][0]["allowed_values"].append("Other")
+        ),
+        "does not match the preprocessor",
+    ),
+    "bundle-not-a-dict": (
+        lambda d: joblib.dump(["not", "a", "dict"], d / BUNDLE_FILE),
+        "must be a dict",
+    ),
+    "bundle-missing-a-key": (
+        lambda d: edit_bundle(d, lambda b: b.pop("model")),
+        "exactly preprocessor, model and schema_hash",
+    ),
+    "bundle-with-an-extra-key": (
+        lambda d: edit_bundle(d, lambda b: b.update(extra=1)),
+        "exactly preprocessor, model and schema_hash",
+    ),
+    "bundle-file-corrupt": (
+        lambda d: (d / BUNDLE_FILE).write_bytes(b"this is not a joblib file"),
+        "cannot be read",
+    ),
+    "manifest-lacks-schema-hash": (
+        lambda d: edit_manifest(d, lambda m: m.pop("input_schema_hash")),
+        "no input_schema_hash",
+    ),
+    "manifest-lacks-schema": (
+        lambda d: edit_manifest(d, lambda m: m.pop("input_schema")),
+        "no input_schema",
+    ),
+    "schema-without-a-column-list": (
+        lambda d: edit_manifest(d, lambda m: m.update(input_schema={"columns": "none"})),
+        "no column list",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "damage,fragment",
+    list(LOAD_BREAKS.values()),
+    ids=list(LOAD_BREAKS),
+)
+def test_a_damaged_run_raises_model_load_error_naming_the_run(published, damage, fragment):
+    damage(published.run_dir)
+
+    with pytest.raises(ModelLoadError) as exc_info:
+        load_run(published.models_dir)
+
+    assert published.run_id in str(exc_info.value)
+    assert fragment in str(exc_info.value)
+
+
+def test_an_unreadable_manifest_is_refused_naming_the_run(published):
+    _break_manifest_unreadable(published.run_dir)
+
+    with pytest.raises(ModelLoadError, match=published.run_id):
+        load_run(published.models_dir, published.run_id)
+
+
+@pytest.mark.parametrize("damage", [value[0] for value in LOAD_BREAKS.values()], ids=list(LOAD_BREAKS))
+def test_a_failed_load_changes_nothing_under_models_dir(published, damage):
+    damage(published.run_dir)
+    before = tree_state(published.models_dir)
+
+    with pytest.raises(ModelLoadError):
+        load_run(published.models_dir)
+
+    assert tree_state(published.models_dir) == before
+
+
+def test_changed_fingerprints_and_library_versions_still_load(published):
+    def change_provenance(manifest):
+        manifest["fingerprints"]["config_hash"] = "f" * 64
+        manifest["fingerprints"]["sql_hash"] = "e" * 64
+        manifest["library_versions"]["scikit-learn"] = "0.0.0"
+
+    edit_manifest(published.run_dir, change_provenance)
+
+    loaded = load_run(published.models_dir)
+
+    assert loaded.manifest["fingerprints"]["config_hash"] == "f" * 64
+    assert loaded.manifest["library_versions"]["scikit-learn"] == "0.0.0"
+
+
+MANIFEST_ONLY_DAMAGE = {
+    "input_schema_hash-missing": LOAD_BREAKS["manifest-lacks-schema-hash"][0],
+    "input_schema-edited-after-publication": LOAD_BREAKS["schema-edited-after-publication"][0],
+    "unknown-kind": LOAD_BREAKS["unknown-kind"][0],
+}
+
+
+@pytest.mark.parametrize(
+    "damage", list(MANIFEST_ONLY_DAMAGE.values()), ids=list(MANIFEST_ONLY_DAMAGE)
+)
+def test_a_broken_manifest_is_refused_before_the_bundle_is_opened(
+    published, damage, monkeypatch
+):
+    def bundle_must_not_be_opened(*args, **kwargs):
+        pytest.fail("the bundle was opened although the manifest is broken")
+
+    damage(published.run_dir)
+    monkeypatch.setattr(persist.joblib, "load", bundle_must_not_be_opened)
+
+    with pytest.raises(ModelLoadError, match=published.run_id):
+        load_run(published.models_dir)
