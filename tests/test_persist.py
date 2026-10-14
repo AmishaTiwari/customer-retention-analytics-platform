@@ -1,4 +1,5 @@
-"""Tests for models/persist.py: the provenance fingerprints.
+"""Tests for models/persist.py: the fingerprints, the manifest, the
+existence check and the publication of a model run.
 
 Synthetic files live under tmp_path; the real repository folders are only
 read, never written.
@@ -7,10 +8,17 @@ read, never written.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import re
+import tomllib
+from datetime import datetime, timedelta, timezone
 
+import joblib
+import numpy as np
 import pytest
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 from retention_platform.config import REPO_ROOT, load_config
 from retention_platform.data import ingest
@@ -25,16 +33,30 @@ from retention_platform.data.prepare import (
     run_target,
 )
 from retention_platform.features.build import FEATURES_SQL_DIR, run_features
+from retention_platform.models import persist
 from retention_platform.models.persist import (
+    BUNDLE_FILE,
     HASH_NORMALIZATION,
+    HELD_OUT_RESULTS_REFERENCE,
+    MANIFEST_FILE,
     SQL_FOLDERS,
+    TEMP_DIR_PREFIX,
+    TRAINING_CV_ESTIMATE_TYPE,
+    PublicationError,
     build_fingerprints,
+    build_manifest,
     config_hash,
     data_fingerprint,
+    ensure_run_path_free,
+    is_valid_run_id,
+    library_versions,
+    package_version,
+    publish_run,
     sha256_normalized,
     sql_hash,
 )
-from retention_platform.tracking import config_snapshot
+from retention_platform.pipeline.schema import schema_hash
+from retention_platform.tracking import RUN_ID_FORMAT, config_snapshot
 
 HEX64 = re.compile(r"[0-9a-f]{64}")
 
@@ -422,3 +444,446 @@ def test_build_fingerprints_survives_a_json_round_trip():
     result = build_fingerprints(load_config(), 5629, 1408)
 
     assert json.loads(json.dumps(result)) == result
+
+
+# --- Run id and package metadata --------------------------------------------
+
+RUN_ID = "20261011T120000Z"
+INSTANT = datetime(2026, 10, 11, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_a_valid_run_id_is_accepted():
+    assert is_valid_run_id(RUN_ID)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "20261011T120000z",
+        "20261011T120000",
+        "202610110T120000Z",
+        "2026101T120000Z",
+        " 20261011T120000Z",
+        "20261011T120000Z ",
+        "20261011T120000Z\n",
+        "../20261011T120000Z",
+        "",
+        "20261340T250000Z",
+        "20261011t120000Z",
+        None,
+        20261011,
+    ],
+    ids=[
+        "lowercase-z",
+        "missing-Z",
+        "extra-digit",
+        "short-date",
+        "leading-space",
+        "trailing-space",
+        "trailing-newline",
+        "path-traversal",
+        "empty",
+        "impossible-date-time",
+        "lowercase-t",
+        "none",
+        "integer",
+    ],
+)
+def test_invalid_run_ids_are_rejected(text):
+    assert not is_valid_run_id(text)
+
+
+def test_package_version_comes_from_the_installed_metadata():
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    name = pyproject["project"]["name"]
+
+    assert package_version() == importlib.metadata.version(name)
+    assert package_version()
+
+
+def test_library_versions_has_the_five_libraries():
+    versions = library_versions()
+
+    assert set(versions) == {"scikit-learn", "xgboost", "numpy", "pandas", "joblib"}
+    for name, version in versions.items():
+        assert isinstance(version, str) and version
+        assert version == importlib.metadata.version(name)
+
+
+# --- Manifest ---------------------------------------------------------------
+
+SMALL_SCHEMA = {
+    "identifier_column": "customer_id",
+    "columns": [
+        {"name": "age", "kind": "integer-like", "nullable": False},
+        {"name": "plan", "kind": "categorical", "nullable": False, "allowed_values": ["A", "B"]},
+    ],
+}
+
+METRICS = {
+    "k": 0.1,
+    "training_rows": 5629,
+    "estimate_type": TRAINING_CV_ESTIMATE_TYPE,
+    "precision_at_k": 0.9,
+    "lift_at_k": 3.4,
+    "pr_auc": 0.8,
+    "brier_score": 0.1,
+}
+
+FINGERPRINTS = {"config_hash": "a" * 64, "hash_normalization": HASH_NORMALIZATION}
+
+MANIFEST_KEYS = {
+    "run_id",
+    "input_schema",
+    "input_schema_hash",
+    "hyperparameters",
+    "library_versions",
+    "trained_at_utc",
+    "package_version",
+    "training_cv_metrics",
+    "held_out_results_reference",
+    "fingerprints",
+}
+
+
+def make_manifest(**overrides):
+    arguments = {
+        "run_id": RUN_ID,
+        "instant": INSTANT,
+        "schema": SMALL_SCHEMA,
+        "hyperparameters": {"n_estimators": 215, "learning_rate": 0.02},
+        "training_cv_metrics": dict(METRICS),
+        "fingerprints": FINGERPRINTS,
+    }
+    arguments.update(overrides)
+    return build_manifest(**arguments)
+
+
+def test_estimate_type_wording_is_the_one_in_the_contract():
+    contract = (REPO_ROOT / "docs" / "platform_output_contract.md").read_text(encoding="utf-8")
+
+    assert f"`{TRAINING_CV_ESTIMATE_TYPE}`" in contract
+
+
+def test_manifest_has_exactly_the_ten_keys_and_the_given_values():
+    manifest = make_manifest()
+
+    assert set(manifest) == MANIFEST_KEYS
+    assert manifest["run_id"] == RUN_ID
+    assert manifest["input_schema_hash"] == schema_hash(SMALL_SCHEMA)
+    assert manifest["input_schema"] == SMALL_SCHEMA
+    assert manifest["training_cv_metrics"] == METRICS
+    assert manifest["fingerprints"] == FINGERPRINTS
+    assert manifest["package_version"] == package_version()
+    assert manifest["library_versions"] == library_versions()
+    assert manifest["held_out_results_reference"] == "ADR-0014" == HELD_OUT_RESULTS_REFERENCE
+
+
+def test_trained_at_and_run_id_come_from_the_same_instant():
+    plus_two = timezone(timedelta(hours=2))
+    instant = datetime(2026, 10, 11, 14, 0, 0, 999999, tzinfo=plus_two)
+
+    manifest = make_manifest(instant=instant)
+
+    assert manifest["trained_at_utc"] == "2026-10-11T12:00:00Z"
+    parsed_run_id = datetime.strptime(manifest["run_id"], RUN_ID_FORMAT)
+    parsed_trained_at = datetime.strptime(manifest["trained_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    assert parsed_run_id == parsed_trained_at
+
+
+def test_manifest_rejects_a_naive_instant():
+    with pytest.raises(ValueError):
+        make_manifest(instant=datetime(2026, 10, 11, 12, 0, 0))
+
+
+@pytest.mark.parametrize("run_id", ["20261011T120001Z", "../x", "", "20261011T120000z"])
+def test_manifest_rejects_a_run_id_that_is_invalid_or_does_not_match_the_instant(run_id):
+    with pytest.raises(ValueError):
+        make_manifest(run_id=run_id)
+
+
+def test_manifest_rejects_metrics_with_a_missing_key():
+    metrics = dict(METRICS)
+    del metrics["pr_auc"]
+
+    with pytest.raises(ValueError, match="pr_auc"):
+        make_manifest(training_cv_metrics=metrics)
+
+
+def test_manifest_rejects_metrics_with_an_extra_key():
+    with pytest.raises(ValueError, match="roc_auc"):
+        make_manifest(training_cv_metrics={**METRICS, "roc_auc": 0.9})
+
+
+def test_manifest_rejects_a_wrong_estimate_type():
+    with pytest.raises(ValueError, match="estimate_type"):
+        make_manifest(training_cv_metrics={**METRICS, "estimate_type": "Some other text"})
+
+
+def test_manifest_has_a_held_out_reference_but_no_held_out_results():
+    manifest = make_manifest()
+
+    assert [key for key in manifest if "held" in key] == ["held_out_results_reference"]
+    assert manifest["held_out_results_reference"] == "ADR-0014"
+
+
+def test_numpy_scalars_in_hyperparameters_become_plain_values():
+    hyperparameters = {
+        "n_estimators": np.int64(215),
+        "learning_rate": np.float64(0.0217),
+        "scale_pos_weight": np.int32(1),
+        "nested": {"values": [np.int64(1), np.float32(0.5)]},
+    }
+
+    manifest = make_manifest(hyperparameters=hyperparameters)
+
+    assert type(manifest["hyperparameters"]["n_estimators"]) is int
+    assert type(manifest["hyperparameters"]["learning_rate"]) is float
+    assert type(manifest["hyperparameters"]["scale_pos_weight"]) is int
+    assert type(manifest["hyperparameters"]["nested"]["values"][0]) is int
+    assert json.loads(json.dumps(manifest)) == manifest
+
+
+def test_unserialisable_hyperparameters_raise_value_error():
+    with pytest.raises(ValueError):
+        make_manifest(hyperparameters={"estimator": object()})
+
+
+def test_nan_in_the_manifest_raises_value_error():
+    with pytest.raises(ValueError):
+        make_manifest(training_cv_metrics={**METRICS, "pr_auc": float("nan")})
+
+
+def test_manifest_does_not_share_state_with_its_inputs():
+    schema = json.loads(json.dumps(SMALL_SCHEMA))
+
+    manifest = make_manifest(schema=schema)
+    manifest["input_schema"]["columns"].append({"name": "extra"})
+
+    assert schema == SMALL_SCHEMA
+
+
+# --- Existence check --------------------------------------------------------
+
+
+def test_free_path_passes_and_creates_nothing(tmp_path):
+    models_dir = tmp_path / "models"
+
+    ensure_run_path_free(models_dir, RUN_ID)
+
+    assert not models_dir.exists()
+
+
+def test_existing_free_path_inside_an_existing_models_dir_passes(tmp_path):
+    (tmp_path / "20260101T000000Z").mkdir()
+
+    ensure_run_path_free(tmp_path, RUN_ID)
+
+    assert [path.name for path in tmp_path.iterdir()] == ["20260101T000000Z"]
+
+
+def _empty_folder(path):
+    path.mkdir()
+
+
+def _half_filled_folder(path):
+    path.mkdir()
+    (path / BUNDLE_FILE).write_bytes(b"partial")
+
+
+def _complete_run(path):
+    path.mkdir()
+    (path / BUNDLE_FILE).write_bytes(b"bundle")
+    (path / MANIFEST_FILE).write_text("{}", encoding="utf-8")
+
+
+def _plain_file(path):
+    path.write_bytes(b"a file")
+
+
+@pytest.mark.parametrize(
+    "create",
+    [_empty_folder, _half_filled_folder, _complete_run, _plain_file],
+    ids=["empty-folder", "half-filled-folder", "complete-run", "plain-file"],
+)
+def test_existing_path_in_any_form_is_refused_and_left_unchanged(tmp_path, create):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    target = models_dir / RUN_ID
+    create(target)
+    before = sorted(str(p.relative_to(models_dir)) for p in models_dir.rglob("*"))
+
+    with pytest.raises(PublicationError):
+        ensure_run_path_free(models_dir, RUN_ID)
+
+    assert sorted(str(p.relative_to(models_dir)) for p in models_dir.rglob("*")) == before
+
+
+def test_existence_check_refuses_an_invalid_run_id(tmp_path):
+    with pytest.raises(ValueError):
+        ensure_run_path_free(tmp_path, "../elsewhere")
+
+
+# --- Publication ------------------------------------------------------------
+
+
+@pytest.fixture
+def parts():
+    return StandardScaler(), LogisticRegression()
+
+
+def publish(models_dir, parts, **overrides):
+    manifest = overrides.pop("manifest", None) or make_manifest()
+    arguments = {
+        "models_dir": models_dir,
+        "run_id": RUN_ID,
+        "manifest": manifest,
+        "preprocessor": parts[0],
+        "model": parts[1],
+        "schema_hash": manifest["input_schema_hash"],
+    }
+    arguments.update(overrides)
+    return publish_run(**arguments)
+
+
+def names_in(folder):
+    return sorted(path.name for path in folder.iterdir())
+
+
+def test_publishing_creates_exactly_the_two_files(tmp_path, parts):
+    models_dir = tmp_path / "models"
+
+    final = publish(models_dir, parts)
+
+    assert final == models_dir / RUN_ID
+    assert names_in(final) == [BUNDLE_FILE, MANIFEST_FILE]
+    assert names_in(models_dir) == [RUN_ID]
+
+    manifest = json.loads((final / MANIFEST_FILE).read_text(encoding="utf-8"))
+    assert manifest["run_id"] == final.name
+    bundle = joblib.load(final / BUNDLE_FILE)
+    assert isinstance(bundle, dict)
+    assert set(bundle) == {"preprocessor", "model", "schema_hash"}
+    assert bundle["schema_hash"] == manifest["input_schema_hash"]
+    assert isinstance(bundle["preprocessor"], StandardScaler)
+    assert isinstance(bundle["model"], LogisticRegression)
+
+
+def test_manifest_file_is_indented_utf8_json_with_a_trailing_newline(tmp_path, parts):
+    manifest = make_manifest(hyperparameters={"label": "café ✓"})
+
+    final = publish(tmp_path / "models", parts, manifest=manifest)
+
+    raw = (final / MANIFEST_FILE).read_bytes()
+    text = raw.decode("utf-8")
+    assert b"\r" not in raw
+    assert text.endswith("\n")
+    assert "café ✓" in text
+    assert "\n  " in text
+    assert json.loads(text) == manifest
+
+
+def test_models_dir_is_created_when_missing(tmp_path, parts):
+    models_dir = tmp_path / "deep" / "models"
+
+    publish(models_dir, parts)
+
+    assert (models_dir / RUN_ID).is_dir()
+
+
+def test_a_non_empty_folder_at_the_final_path_is_refused(tmp_path, parts):
+    models_dir = tmp_path / "models"
+    existing = models_dir / RUN_ID
+    existing.mkdir(parents=True)
+    (existing / "keep.txt").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match=r"collided.*nothing was replaced"):
+        publish(models_dir, parts)
+
+    assert names_in(existing) == ["keep.txt"]
+    assert (existing / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert names_in(models_dir) == [RUN_ID]
+
+
+def test_a_race_after_the_existence_check_is_still_refused(tmp_path, parts):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    ensure_run_path_free(models_dir, RUN_ID)
+
+    existing = models_dir / RUN_ID
+    existing.mkdir()
+    (existing / "appeared.txt").write_text("late", encoding="utf-8")
+
+    with pytest.raises(PublicationError, match=r"collided.*nothing was replaced"):
+        publish(models_dir, parts)
+
+    assert names_in(existing) == ["appeared.txt"]
+    assert names_in(models_dir) == [RUN_ID]
+
+
+def test_a_failed_write_leaves_no_temporary_directory(tmp_path, parts, monkeypatch):
+    def broken_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(persist.joblib, "dump", broken_dump)
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(OSError, match="disk full"):
+        publish(models_dir, parts)
+
+    assert names_in(models_dir) == []
+
+
+def test_a_failed_publication_reraises_the_original_error_and_cleans_up(
+    tmp_path, parts, monkeypatch
+):
+    failure = OSError("rename failed for another reason")
+
+    def broken_rename(source, target):
+        raise failure
+
+    monkeypatch.setattr(persist.os, "rename", broken_rename)
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(OSError) as exc_info:
+        publish(models_dir, parts)
+
+    assert exc_info.value is failure
+    assert names_in(models_dir) == []
+
+
+def test_a_failing_cleanup_never_hides_the_original_error(tmp_path, parts, monkeypatch):
+    def broken_dump(*args, **kwargs):
+        raise OSError("disk full")
+
+    def broken_rmtree(*args, **kwargs):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(persist.joblib, "dump", broken_dump)
+    monkeypatch.setattr(persist.shutil, "rmtree", broken_rmtree)
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(OSError, match="disk full"):
+        publish(models_dir, parts)
+
+    assert all(name.startswith(TEMP_DIR_PREFIX) for name in names_in(models_dir))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"run_id": "20261011T120001Z"},
+        {"schema_hash": "0" * 64},
+        {"run_id": "../x"},
+        {"run_id": ""},
+    ],
+    ids=["manifest-run-id-differs", "schema-hash-differs", "invalid-run-id", "empty-run-id"],
+)
+def test_mismatches_raise_value_error_and_write_nothing(tmp_path, parts, overrides):
+    models_dir = tmp_path / "models"
+
+    with pytest.raises(ValueError):
+        publish(models_dir, parts, **overrides)
+
+    assert not models_dir.exists()
+    assert list(tmp_path.iterdir()) == []
