@@ -40,6 +40,4 @@ tuning:
   budget_per_model: 30
   objective_metric: pr_auc
 
-inference:
-  input_schema: null # TODO (Commit 10)
-  output_path: null # TODO (Commit 10)
+inference: {}

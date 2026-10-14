@@ -1,32 +1,38 @@
-# These entry points mirror the staged data flow from the ML System Design:
-# raw data -> SQL prep -> modeling dataset -> features -> training -> evaluation -> inference.
+# Entry points for the staged pipeline:
+# ingest -> prepare -> features -> train -> evaluate -> score.
 #
-# As of this commit, the modules they call are documentation-only stubs, so
-# each target is currently non-functional — it will become real once the
-# commit that implements that stage is done.
+# Every stage through scoring is implemented. `evaluate` is a placeholder that
+# only prints a notice. `train` really trains, and `make reproduce` stops at
+# train if the selected XGBoost hyperparameters differ from the approved
+# reference values; that stop is intended.
+#
+# `make score` uses the newest valid model run; pass RUN_ID=<run_id> to pick one.
 
-.PHONY: install ingest prepare train evaluate score test reproduce
+.PHONY: install ingest prepare features train evaluate score test reproduce
 
 install:
 	uv sync --extra dev
 
 ingest:
-	python -m retention_platform.data.ingest
+	uv run python -m retention_platform.data.ingest
 
 prepare:
-	python -m retention_platform.data.prepare
+	uv run python -m retention_platform.data.prepare
+
+features:
+	uv run python -m retention_platform.features.build
 
 train:
-	python -m retention_platform.models.train
+	uv run python -m retention_platform.models.train
 
 evaluate:
-	python -m retention_platform.evaluation.compare
+	@echo "The evaluation stage is not implemented yet and is planned for Commit 12."
 
 score:
-	python -m retention_platform.inference.score
+	uv run python -m retention_platform.inference.score $(if $(RUN_ID),--run-id $(RUN_ID))
 
 test:
-	pytest tests/ -v
+	uv run pytest tests/ -v
 
-reproduce: ingest prepare train evaluate
+reproduce: ingest prepare features train evaluate score
 	@echo "Reproduction pipeline complete."
