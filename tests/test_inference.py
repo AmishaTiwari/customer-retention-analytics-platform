@@ -3,10 +3,11 @@
 Section A: input validation rules, on a small hand-made schema and small
 synthetic frames (fast, no database).
 Section B: input validation on the real data and the real generated schema.
-Section C: scoring core (score_batch and top_k_count).
+Section C: scoring core (score_batch).
 Section D: outputs (the CSV, the run summary and their publication).
 Section E: the scoring command (population selection, run_scoring, main and
 its failure classes).
+Section F: ranking: top_k_count and risk tiers.
 """
 
 from __future__ import annotations
@@ -59,8 +60,8 @@ from retention_platform.inference.score import (
     run_scoring,
     score_batch,
     select_scoring_population,
-    top_k_count,
 )
+from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
 from retention_platform.inference.validate import (
     InputValidationError,
     validate_scoring_table,
@@ -550,7 +551,7 @@ def test_sentinel_written_into_a_real_row_is_rejected(
 
 
 # =============================================================================
-# Section C: scoring core (score_batch and top_k_count)
+# Section C: scoring core (score_batch)
 # =============================================================================
 
 SCORING_COLUMN_TYPES = {
@@ -653,42 +654,6 @@ def scripted_run(artifacts, values):
 
 def real_run(artifacts) -> LoadedRun:
     return make_run(artifacts.schema, artifacts.preprocessor, artifacts.model)
-
-
-# top_k_count
-
-
-@pytest.mark.parametrize(
-    "n_rows,k_frac,expected",
-    [(1408, 0.10, 141), (5629, 0.10, 563), (25, 0.10, 2), (1, 0.10, 1), (3, 0.10, 1), (10, 1.0, 10)],
-)
-def test_top_k_count_values(n_rows, k_frac, expected):
-    assert top_k_count(n_rows, k_frac) == expected
-
-
-@pytest.mark.parametrize("bad", [0, -5, 2.5, True, None, "10"], ids=repr)
-def test_top_k_count_rejects_a_bad_row_count(bad):
-    with pytest.raises(ValueError):
-        top_k_count(bad, 0.10)
-
-
-@pytest.mark.parametrize("bad", [0, -0.1, 1.5, 1.0000001, True, None, "0.1"], ids=repr)
-def test_top_k_count_rejects_a_bad_k(bad):
-    with pytest.raises(ValueError):
-        top_k_count(10, bad)
-
-
-@pytest.mark.parametrize(
-    "n_rows,k_frac", [(50, 0.10), (25, 0.10), (1408, 0.10), (7, 0.30), (1, 0.05), (40, 1.0)]
-)
-def test_top_k_count_agrees_with_the_count_metrics_py_uses(n_rows, k_frac):
-    rng = np.random.default_rng(0)
-    y_true = rng.integers(0, 2, n_rows)
-    y_score = rng.random(n_rows)
-
-    matrix = confusion_matrix_at_k(y_true, y_score, k_frac)
-
-    assert top_k_count(n_rows, k_frac) == matrix["tp"] + matrix["fp"]
 
 
 # Table shape
@@ -2241,3 +2206,175 @@ def test_a_usage_error_exits_with_argparses_own_code(argv):
         score.main(argv)
 
     assert exc_info.value.code == SCORING_USAGE_ERROR_EXIT
+
+
+# =============================================================================
+# Section F: ranking: top_k_count and risk tiers
+# =============================================================================
+
+# top_k_count
+
+
+@pytest.mark.parametrize(
+    "n_rows,k_frac,expected",
+    [(1408, 0.10, 141), (5629, 0.10, 563), (25, 0.10, 2), (1, 0.10, 1), (3, 0.10, 1), (10, 1.0, 10)],
+)
+def test_top_k_count_values(n_rows, k_frac, expected):
+    assert top_k_count(n_rows, k_frac) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -5, 2.5, True, None, "10"], ids=repr)
+def test_top_k_count_rejects_a_bad_row_count(bad):
+    with pytest.raises(ValueError):
+        top_k_count(bad, 0.10)
+
+
+@pytest.mark.parametrize("bad", [0, -0.1, 1.5, 1.0000001, True, None, "0.1"], ids=repr)
+def test_top_k_count_rejects_a_bad_k(bad):
+    with pytest.raises(ValueError):
+        top_k_count(10, bad)
+
+
+@pytest.mark.parametrize(
+    "n_rows,k_frac", [(50, 0.10), (25, 0.10), (1408, 0.10), (7, 0.30), (1, 0.05), (40, 1.0)]
+)
+def test_top_k_count_agrees_with_the_count_metrics_py_uses(n_rows, k_frac):
+    rng = np.random.default_rng(0)
+    y_true = rng.integers(0, 2, n_rows)
+    y_score = rng.random(n_rows)
+
+    matrix = confusion_matrix_at_k(y_true, y_score, k_frac)
+
+    assert top_k_count(n_rows, k_frac) == matrix["tp"] + matrix["fp"]
+
+
+# Risk tiers
+
+
+def tier_counts(n_rows, k_frac, medium_edge):
+    tiers = assign_risk_tiers(pd.Series(np.arange(1, n_rows + 1)), k_frac, medium_edge)
+    return (
+        int((tiers == "High").sum()),
+        int((tiers == "Medium").sum()),
+        int((tiers == "Low").sum()),
+    )
+
+
+def test_reference_population_tier_counts_and_boundaries():
+    tiers = assign_risk_tiers(pd.Series(np.arange(1, 1409)), 0.10, 0.25)
+
+    assert tiers.value_counts().to_dict() == {"Low": 1056, "Medium": 211, "High": 141}
+    assert tiers[141 - 1] == "High"
+    assert tiers[142 - 1] == "Medium"
+    assert tiers[352 - 1] == "Medium"
+    assert tiers[353 - 1] == "Low"
+
+
+@pytest.mark.parametrize(
+    "n_rows,expected",
+    [(1, (1, 0, 0)), (2, (1, 0, 1)), (6, (1, 1, 4)), (25, (2, 4, 19))],
+)
+def test_small_populations_follow_the_rule_by_hand(n_rows, expected):
+    assert tier_counts(n_rows, 0.10, 0.25) == expected
+
+
+def test_an_edge_of_one_leaves_no_low_tier():
+    assert tier_counts(10, 0.10, 1.0) == (1, 9, 0)
+
+
+@pytest.mark.parametrize("k_frac,medium_edge", [(0.10, 0.25), (0.05, 0.30), (0.20, 0.21), (0.50, 1.0), (0.01, 0.02)])
+@pytest.mark.parametrize("n_rows", [*range(1, 201), 1408, 5629, 10000])
+def test_tier_grid_counts_add_up_and_tiers_are_contiguous(n_rows, k_frac, medium_edge):
+    ranks = pd.Series(np.arange(1, n_rows + 1))
+
+    tiers = assign_risk_tiers(ranks, k_frac, medium_edge)
+
+    high = int((tiers == "High").sum())
+    medium = int((tiers == "Medium").sum())
+    low = int((tiers == "Low").sum())
+    assert high + medium + low == n_rows
+    assert high == int((ranks <= top_k_count(n_rows, k_frac)).sum())
+    assert high <= high + medium == top_k_count(n_rows, medium_edge)
+    assert list(tiers) == ["High"] * high + ["Medium"] * medium + ["Low"] * low
+
+
+def test_tiers_do_not_depend_on_row_order_and_keep_the_index():
+    ordered = assign_risk_tiers(pd.Series(np.arange(1, 41)), 0.10, 0.25)
+    shuffled_values = np.random.default_rng(3).permutation(np.arange(1, 41))
+    shuffled = pd.Series(shuffled_values, index=[f"row{i}" for i in range(40)])
+    original = shuffled.copy(deep=True)
+
+    tiers = assign_risk_tiers(shuffled, 0.10, 0.25)
+
+    assert list(tiers.index) == list(shuffled.index)
+    assert [tiers.iloc[i] for i in range(40)] == [ordered[value - 1] for value in shuffled_values]
+    pd.testing.assert_series_equal(shuffled, original)
+
+
+def test_tiers_are_object_dtype_with_only_the_three_labels():
+    tiers = assign_risk_tiers(pd.Series(np.arange(1, 101)), 0.10, 0.25)
+
+    assert tiers.dtype == object
+    assert set(tiers) == {"High", "Medium", "Low"}
+
+
+@pytest.mark.parametrize(
+    "k_frac,medium_edge",
+    [
+        (0.25, 0.25),
+        (0.30, 0.25),
+        (0.10, 1.5),
+        (0, 0.25),
+        (-0.1, 0.25),
+        (True, 0.25),
+        (0.10, True),
+        (None, 0.25),
+        (0.10, None),
+        ("0.1", 0.25),
+        (0.10, "0.25"),
+        (float("nan"), 0.25),
+        (0.10, float("nan")),
+        (float("inf"), 0.25),
+        (0.10, float("inf")),
+    ],
+    ids=repr,
+)
+def test_an_invalid_pair_is_rejected_and_the_message_names_both_values(k_frac, medium_edge):
+    with pytest.raises(ValueError) as exc_info:
+        assign_risk_tiers(pd.Series([1, 2, 3]), k_frac, medium_edge)
+
+    message = str(exc_info.value)
+    assert repr(k_frac) in message
+    assert repr(medium_edge) in message
+
+
+@pytest.mark.parametrize(
+    "ranks,problem",
+    [
+        (pd.Series([], dtype="int64"), "empty"),
+        (pd.Series([1, 2, 2, 4]), "duplicate"),
+        (pd.Series([0, 1, 2, 3]), "start at 1"),
+        (pd.Series([1, 2, 4, 5]), "gap"),
+        (pd.Series([1.0, 2.0, 3.0]), "integer dtype"),
+        (pd.Series([True, False]), "integer dtype"),
+        (pd.Series(["1", "2", "3"]), "integer dtype"),
+        ([1, 2, 3], "Series"),
+        (np.arange(1, 4), "Series"),
+        (pd.Series([1, 2, None], dtype="Int64"), "missing"),
+    ],
+    ids=[
+        "empty",
+        "duplicate",
+        "zero_based",
+        "gap",
+        "float",
+        "bool",
+        "text",
+        "list",
+        "numpy_array",
+        "missing_values",
+    ],
+)
+def test_invalid_ranks_are_rejected(ranks, problem):
+    with pytest.raises(ValueError, match=problem):
+        assign_risk_tiers(ranks, 0.10, 0.25)

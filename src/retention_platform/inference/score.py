@@ -30,6 +30,7 @@ from retention_platform.inference.outputs import (
     build_run_summary,
     publish_outputs,
 )
+from retention_platform.inference.ranking import top_k_count
 from retention_platform.inference.validate import InputValidationError, validate_scoring_table
 from retention_platform.logging_setup import setup_logging
 from retention_platform.models.persist import LoadedRun, ModelLoadError, load_run
@@ -43,22 +44,6 @@ DEFAULT_OUTPUTS_DIR = REPO_ROOT / "outputs"
 
 class ScoringError(Exception):
     """Raised when the model's output cannot be used to build the ranking."""
-
-
-def top_k_count(n_rows: int, k_frac: float) -> int:
-    """Number of customers flagged for outreach: max(1, round(n_rows * k_frac)).
-
-    Python's round() sends an exact half to the nearest even integer.
-    """
-    if isinstance(n_rows, bool) or not isinstance(n_rows, int) or n_rows < 1:
-        raise ValueError(f"n_rows must be an integer of at least 1, got {n_rows!r}")
-    if (
-        isinstance(k_frac, bool)
-        or not isinstance(k_frac, (int, float))
-        or not 0 < k_frac <= 1
-    ):
-        raise ValueError(f"k_frac must be a number with 0 < k_frac <= 1, got {k_frac!r}")
-    return max(1, round(n_rows * k_frac))
 
 
 def _model_probabilities(loaded_run: LoadedRun, inputs: pd.DataFrame, ids: list[str]) -> np.ndarray:
