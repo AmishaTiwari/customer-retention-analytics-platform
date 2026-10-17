@@ -8,6 +8,7 @@ Section D: outputs (the CSV, the run summary and their publication).
 Section E: the scoring command (population selection, run_scoring, main and
 its failure classes).
 Section F: ranking: top_k_count and risk tiers.
+Section G: drivers (structure check, averaged contributions, top-driver selection).
 """
 
 from __future__ import annotations
@@ -30,7 +31,11 @@ import duckdb
 import numpy as np
 import pandas as pd
 import pytest
+import xgboost as xgb
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
 
 from retention_platform.data.prepare import (
     run_cleaning,
@@ -60,6 +65,17 @@ from retention_platform.inference.score import (
     run_scoring,
     score_batch,
     select_scoring_population,
+)
+from retention_platform.inference.drivers import (
+    DIRECTION_LOWERS,
+    DIRECTION_RAISES,
+    DRIVER_COLUMNS,
+    EXPECTED_FOLD_MODELS,
+    TOP_N_DRIVERS,
+    DriverError,
+    averaged_contributions,
+    encoded_column_owners,
+    select_top_drivers,
 )
 from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
 from retention_platform.inference.validate import (
@@ -2378,3 +2394,589 @@ def test_an_invalid_pair_is_rejected_and_the_message_names_both_values(k_frac, m
 def test_invalid_ranks_are_rejected(ranks, problem):
     with pytest.raises(ValueError, match=problem):
         assign_risk_tiers(ranks, 0.10, 0.25)
+
+
+# =============================================================================
+# Section G: drivers
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def driver_data(conn):
+    """The real preprocessor and schema, a small calibrated XGBoost model
+    fitted on the real training rows, and the real scoring population."""
+    inputs = prepare_model_inputs(conn)
+    schema = build_input_schema(read_feat_churn_types(conn), inputs.preprocessor)
+    model = CalibratedClassifierCV(
+        xgb.XGBClassifier(n_estimators=20, max_depth=3, random_state=0),
+        method="sigmoid",
+        cv=5,
+    ).fit(inputs.X_train, inputs.y_train.astype(int))
+    names = [column["name"] for column in schema["columns"]]
+    population = select_scoring_population(conn, schema)
+    return SimpleNamespace(
+        run=make_run(schema, inputs.preprocessor, model),
+        names=names,
+        inputs=population[names].reset_index(drop=True),
+        ids=[str(value) for value in population[schema["identifier_column"]]],
+    )
+
+
+@pytest.fixture(scope="module")
+def driver_contributions(driver_data):
+    return averaged_contributions(driver_data.run, driver_data.inputs, driver_data.ids)
+
+
+def dense(matrix):
+    return matrix.toarray() if hasattr(matrix, "toarray") else np.asarray(matrix)
+
+
+def run_with_folds(run, folds):
+    model = copy.copy(run.model)
+    model.calibrated_classifiers_ = folds
+    return dataclasses.replace(run, model=model)
+
+
+def run_with_estimator_at(run, position, estimator):
+    folds = list(run.model.calibrated_classifiers_)
+    folds[position] = SimpleNamespace(estimator=estimator)
+    return run_with_folds(run, folds)
+
+
+def run_with_schema_columns(run, columns):
+    return dataclasses.replace(run, schema={**run.schema, "columns": columns})
+
+
+def run_without_owner_for_one_encoded_column(run):
+    preprocessor = copy.deepcopy(run.preprocessor)
+    original_names = list(preprocessor.get_feature_names_out())
+    encoder = {name: step for name, step, _ in preprocessor.transformers_}["categorical"]
+    encoder.categories_[0] = encoder.categories_[0][:-1]
+    preprocessor.get_feature_names_out = lambda *args, **kwargs: original_names
+    return dataclasses.replace(run, preprocessor=preprocessor)
+
+
+def narrow_estimator():
+    rng = np.random.default_rng(0)
+    return xgb.XGBClassifier(n_estimators=2).fit(rng.random((30, 3)), [0, 1] * 15)
+
+
+def run_with_transformers(run, rewrite):
+    """A copy of the run whose preprocessor has its fitted transformer entries
+    rewritten. The reported output names stay those of the original, so only
+    the column mapping is affected."""
+    preprocessor = copy.deepcopy(run.preprocessor)
+    original_names = list(preprocessor.get_feature_names_out())
+    preprocessor.transformers_ = rewrite(list(preprocessor.transformers_))
+    preprocessor.get_feature_names_out = lambda *args, **kwargs: original_names
+    return dataclasses.replace(run, preprocessor=preprocessor)
+
+
+def entry_named(entries, label):
+    return next(entry for entry in entries if entry[0] == label)
+
+
+def with_entry_changed(label, *, transformer=None, columns=None):
+    def rewrite(entries):
+        return [
+            (
+                name,
+                transformer if transformer is not None and name == label else step,
+                columns if columns is not None and name == label else selected,
+            )
+            for name, step, selected in entries
+        ]
+
+    return rewrite
+
+
+def with_encoder_changed(change):
+    def rewrite(entries):
+        change(entry_named(entries, "categorical")[1])
+        return entries
+
+    return rewrite
+
+
+def with_two_encoders(entries):
+    encoder = entry_named(entries, "categorical")[1]
+    pipeline = Pipeline([("first", encoder), ("second", copy.deepcopy(encoder))])
+    return with_entry_changed("categorical", transformer=pipeline)(entries)
+
+
+def with_imputer_indicator(entries):
+    entry_named(entries, "offer")[1].steps[0][1].add_indicator = True
+    return entries
+
+
+def run_without_feature_names(run):
+    damaged = run_with_transformers(run, lambda entries: entries)
+    del damaged.preprocessor.feature_names_in_
+    return damaged
+
+
+def set_attribute(name, value):
+    return with_encoder_changed(lambda encoder: setattr(encoder, name, value))
+
+
+def drop_last_learned_column(encoder):
+    encoder.categories_ = encoder.categories_[:-1]
+
+
+# Structure check
+
+
+def test_the_structure_check_passes_and_maps_every_encoded_column(driver_data):
+    owners = encoded_column_owners(driver_data.run)
+    encoded_names = list(driver_data.run.preprocessor.get_feature_names_out())
+
+    assert len(owners) == len(encoded_names)
+    assert set(owners) == set(driver_data.names)
+    assert all(owner in encoded_name for owner, encoded_name in zip(owners, encoded_names))
+    assert EXPECTED_FOLD_MODELS == 5
+
+
+STRUCTURE_FAILURES = {
+    "not-calibrated": (
+        lambda run: dataclasses.replace(run, model=LogisticRegression()),
+        "not a CalibratedClassifierCV",
+    ),
+    "four-calibrated-classifiers": (
+        lambda run: run_with_folds(run, list(run.model.calibrated_classifiers_)[:4]),
+        "4 calibrated classifiers, expected 5",
+    ),
+    "estimator-not-xgboost": (
+        lambda run: run_with_estimator_at(run, 1, LogisticRegression()),
+        "does not wrap an XGBClassifier",
+    ),
+    "preprocessor-not-a-column-transformer": (
+        lambda run: dataclasses.replace(run, preprocessor=object()),
+        "not a fitted ColumnTransformer",
+    ),
+    "preprocessor-not-fitted": (
+        lambda run: dataclasses.replace(run, preprocessor=build_preprocessing_pipeline()),
+        "not a fitted ColumnTransformer",
+    ),
+    "estimator-width-differs": (
+        lambda run: run_with_estimator_at(run, 2, narrow_estimator()),
+        "takes 3 input features",
+    ),
+    "schema-input-owns-nothing": (
+        lambda run: run_with_schema_columns(
+            run, [*run.schema["columns"], {"name": "ghost", "kind": "decimal", "nullable": False}]
+        ),
+        "own no encoded column",
+    ),
+    "owner-not-in-schema": (
+        lambda run: run_with_schema_columns(run, run.schema["columns"][1:]),
+        "not in the schema",
+    ),
+    "encoded-column-without-owner": (
+        run_without_owner_for_one_encoded_column,
+        "has no owner",
+    ),
+    "model-not-fitted": (
+        lambda run: dataclasses.replace(run, model=CalibratedClassifierCV(xgb.XGBClassifier())),
+        "the model is not fitted",
+    ),
+    "xgboost-estimator-not-fitted": (
+        lambda run: run_with_estimator_at(run, 3, xgb.XGBClassifier()),
+        "XGBClassifier of calibrated classifier 3 is not fitted",
+    ),
+    "preprocessor-without-column-names": (
+        run_without_feature_names,
+        "with column names",
+    ),
+    "transformer-is-an-unknown-string": (
+        lambda run: run_with_transformers(
+            run, with_entry_changed("categorical", transformer="bogus")
+        ),
+        "'categorical' is 'bogus', which cannot be mapped",
+    ),
+    "column-selection-is-a-slice": (
+        lambda run: run_with_transformers(
+            run, with_entry_changed("categorical", columns=slice(0, 2))
+        ),
+        "'categorical' selects columns in an unsupported way",
+    ),
+    "column-selection-has-an-unsupported-element": (
+        lambda run: run_with_transformers(run, with_entry_changed("categorical", columns=[2.5])),
+        "'categorical' selects columns in an unsupported way",
+    ),
+    "column-position-out-of-range": (
+        lambda run: run_with_transformers(run, with_entry_changed("categorical", columns=[999])),
+        "column position 999, out of range",
+    ),
+    "two-one-hot-encoders": (
+        lambda run: run_with_transformers(run, with_two_encoders),
+        "more than one one-hot encoder",
+    ),
+    "encoder-drops-a-category": (
+        lambda run: run_with_transformers(run, set_attribute("drop_idx_", np.array([0, 0, 0]))),
+        "drops a category",
+    ),
+    "encoder-groups-by-min-frequency": (
+        lambda run: run_with_transformers(run, set_attribute("min_frequency", 5)),
+        "groups infrequent categories",
+    ),
+    "encoder-groups-by-max-categories": (
+        lambda run: run_with_transformers(run, set_attribute("max_categories", 4)),
+        "groups infrequent categories",
+    ),
+    "encoder-learned-fewer-columns": (
+        lambda run: run_with_transformers(run, with_encoder_changed(drop_last_learned_column)),
+        "learned 2 column(s) for 3 input column(s)",
+    ),
+    "imputer-adds-indicator-columns": (
+        lambda run: run_with_transformers(run, with_imputer_indicator),
+        "adds indicator columns",
+    ),
+    "step-of-another-kind": (
+        lambda run: run_with_transformers(
+            run,
+            with_entry_changed(
+                "categorical", transformer=Pipeline([("pass", FunctionTransformer())])
+            ),
+        ),
+        "contains FunctionTransformer, which cannot be mapped",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "damage,fragment", list(STRUCTURE_FAILURES.values()), ids=list(STRUCTURE_FAILURES)
+)
+def test_the_structure_check_names_each_broken_condition(driver_data, damage, fragment):
+    with pytest.raises(DriverError) as exc_info:
+        encoded_column_owners(damage(driver_data.run))
+
+    assert fragment in str(exc_info.value)
+
+
+def test_the_damaged_variants_leave_the_shared_run_unchanged(driver_data):
+    for damage, _ in STRUCTURE_FAILURES.values():
+        damage(driver_data.run)
+
+    assert len(driver_data.run.model.calibrated_classifiers_) == 5
+    assert len(encoded_column_owners(driver_data.run)) == len(
+        driver_data.run.preprocessor.get_feature_names_out()
+    )
+
+
+def test_a_drop_entry_contributes_no_owner(driver_data):
+    run = run_with_transformers(
+        driver_data.run, lambda entries: [*entries, ("unused", "drop", ["gender"])]
+    )
+
+    assert encoded_column_owners(run) == encoded_column_owners(driver_data.run)
+
+
+def test_a_passthrough_entry_maps_each_selected_column_to_itself(driver_data):
+    run = run_with_transformers(
+        driver_data.run,
+        lambda entries: [
+            (name, "passthrough" if name == "remainder" else step, selected)
+            for name, step, selected in entries
+        ],
+    )
+
+    assert encoded_column_owners(run) == encoded_column_owners(driver_data.run)
+
+
+def test_moving_one_input_changes_only_the_encoded_columns_it_owns(driver_data):
+    run = driver_data.run
+    owners = np.array(encoded_column_owners(run))
+    base = dense(run.preprocessor.transform(driver_data.inputs))
+
+    for name in driver_data.names:
+        moved = driver_data.inputs.copy()
+        moved[name] = np.roll(driver_data.inputs[name].to_numpy(), 1)
+        changed = np.flatnonzero((dense(run.preprocessor.transform(moved)) != base).any(axis=0))
+
+        assert set(owners[changed]) <= {name}, name
+        if driver_data.inputs[name].nunique(dropna=False) > 1:
+            assert len(changed) > 0, name
+
+
+# Averaged contributions
+
+
+def test_contributions_have_the_expected_shape_index_columns_and_are_finite(
+    driver_data, driver_contributions
+):
+    assert driver_contributions.shape == (len(driver_data.ids), len(driver_data.names))
+    assert list(driver_contributions.index) == driver_data.ids
+    assert list(driver_contributions.columns) == driver_data.names
+    assert (driver_contributions.dtypes == np.float64).all()
+    assert np.isfinite(driver_contributions.to_numpy()).all()
+
+
+def test_owned_sums_plus_baseline_equal_the_margin_and_the_output_is_the_fold_mean(
+    driver_data, driver_contributions
+):
+    run = driver_data.run
+    owners = np.array(encoded_column_owners(run))
+    matrix = dense(run.preprocessor.transform(driver_data.inputs))
+    fold_sums = []
+
+    for fold in run.model.calibrated_classifiers_:
+        booster = fold.estimator.get_booster()
+        dmatrix = xgb.DMatrix(matrix, feature_names=booster.feature_names)
+        contributions = booster.predict(dmatrix, pred_contribs=True).astype("float64")
+        margin = booster.predict(dmatrix, output_margin=True).astype("float64")
+        sums = np.column_stack(
+            [contributions[:, :-1][:, owners == name].sum(axis=1) for name in driver_data.names]
+        )
+        assert np.abs(sums.sum(axis=1) + contributions[:, -1] - margin).max() < 1e-3
+        fold_sums.append(sums)
+
+    np.testing.assert_allclose(
+        driver_contributions.to_numpy(), np.mean(fold_sums, axis=0), rtol=0, atol=1e-6
+    )
+
+
+def test_a_customer_scored_alone_matches_the_same_customer_in_the_batch(
+    driver_data, driver_contributions
+):
+    for position in (0, 7, 500, len(driver_data.ids) - 1):
+        alone = averaged_contributions(
+            driver_data.run,
+            driver_data.inputs.iloc[[position]],
+            [driver_data.ids[position]],
+        )
+
+        np.testing.assert_allclose(
+            alone.to_numpy()[0], driver_contributions.iloc[position].to_numpy(), rtol=0, atol=1e-5
+        )
+
+
+def test_shuffled_rows_give_the_same_values_per_customer(driver_data, driver_contributions):
+    order = np.random.default_rng(2).permutation(len(driver_data.ids))
+    shuffled = averaged_contributions(
+        driver_data.run,
+        driver_data.inputs.iloc[order].reset_index(drop=True),
+        [driver_data.ids[i] for i in order],
+    )
+
+    np.testing.assert_allclose(
+        shuffled.loc[driver_data.ids].to_numpy(),
+        driver_contributions.to_numpy(),
+        rtol=0,
+        atol=1e-5,
+    )
+
+
+def test_repeating_the_call_gives_identical_numbers_and_leaves_the_inputs_unchanged(
+    driver_data, driver_contributions
+):
+    original = driver_data.inputs.copy(deep=True)
+
+    again = averaged_contributions(driver_data.run, driver_data.inputs, driver_data.ids)
+
+    pd.testing.assert_frame_equal(again, driver_contributions, check_exact=True)
+    pd.testing.assert_frame_equal(driver_data.inputs, original)
+
+
+CONTRIBUTION_CALLER_MISTAKES = {
+    "missing-column": lambda d: (d.inputs.drop(columns=[d.names[0]]), d.ids),
+    "extra-column": lambda d: (d.inputs.assign(extra=1), d.ids),
+    "wrong-order": lambda d: (d.inputs[list(reversed(d.names))], d.ids),
+    "too-few-ids": lambda d: (d.inputs, d.ids[:-1]),
+    "too-many-ids": lambda d: (d.inputs, [*d.ids, "extra"]),
+    "duplicate-ids": lambda d: (d.inputs, [d.ids[0], *d.ids[:-1]]),
+}
+
+
+@pytest.mark.parametrize(
+    "build", list(CONTRIBUTION_CALLER_MISTAKES.values()), ids=list(CONTRIBUTION_CALLER_MISTAKES)
+)
+def test_contributions_reject_caller_mistakes(driver_data, build):
+    inputs, ids = build(driver_data)
+
+    with pytest.raises(ValueError):
+        averaged_contributions(driver_data.run, inputs, ids)
+
+
+def test_a_non_finite_contribution_from_a_booster_raises(driver_data):
+    model = copy.deepcopy(driver_data.run.model)
+    booster = model.calibrated_classifiers_[2].estimator.get_booster()
+    real_predict = booster.predict
+
+    def predict_with_a_nan(*args, **kwargs):
+        output = real_predict(*args, **kwargs).copy()
+        output[3, 0] = np.nan
+        return output
+
+    booster.predict = predict_with_a_nan
+    run = dataclasses.replace(driver_data.run, model=model)
+
+    with pytest.raises(DriverError, match="the model produced a contribution that is not finite"):
+        averaged_contributions(run, driver_data.inputs.iloc[:20], driver_data.ids[:20])
+
+
+def test_contributions_refuse_a_run_whose_structure_is_broken(driver_data):
+    broken = run_with_folds(driver_data.run, list(driver_data.run.model.calibrated_classifiers_)[:4])
+
+    with pytest.raises(DriverError, match="calibrated classifiers"):
+        averaged_contributions(broken, driver_data.inputs, driver_data.ids)
+
+
+# Top-driver selection
+
+FEATURES = ["a", "b", "c", "d"]
+
+
+def contribution_frame(rows, index=None, columns=FEATURES):
+    return pd.DataFrame(rows, index=index, columns=columns, dtype="float64")
+
+
+def test_the_top_three_are_by_absolute_size_and_a_large_negative_beats_a_small_positive():
+    result = select_top_drivers(contribution_frame([[0.1, -0.9, 0.3, 0.2]]))
+
+    assert result.iloc[0].tolist() == [
+        "b", DIRECTION_LOWERS, "c", DIRECTION_RAISES, "d", DIRECTION_RAISES,
+    ]
+
+
+def test_drivers_are_strongest_first_with_the_right_direction():
+    result = select_top_drivers(contribution_frame([[0.2, 0.5, -0.4, 0.1], [-0.3, -0.1, 0.6, 0.2]]))
+
+    assert result.iloc[0].tolist() == [
+        "b", DIRECTION_RAISES, "c", DIRECTION_LOWERS, "a", DIRECTION_RAISES,
+    ]
+    assert result.iloc[1].tolist() == [
+        "c", DIRECTION_RAISES, "a", DIRECTION_LOWERS, "d", DIRECTION_RAISES,
+    ]
+
+
+def test_a_tie_in_absolute_size_is_ordered_by_column_and_keeps_each_direction():
+    result = select_top_drivers(contribution_frame([[0.5, -0.5, 0.1, 0.2]]))
+
+    assert result.iloc[0].tolist() == [
+        "a", DIRECTION_RAISES, "b", DIRECTION_LOWERS, "d", DIRECTION_RAISES,
+    ]
+
+
+def test_a_tie_across_the_third_place_keeps_the_earlier_column():
+    result = select_top_drivers(contribution_frame([[0.9, 0.5, -0.5, 0.5]]))
+
+    assert result.iloc[0].tolist() == [
+        "a", DIRECTION_RAISES, "b", DIRECTION_RAISES, "c", DIRECTION_LOWERS,
+    ]
+
+
+def test_a_zero_outside_the_top_three_is_fine():
+    result = select_top_drivers(contribution_frame([[0.4, 0.3, 0.2, 0.0]]))
+
+    assert result.iloc[0].tolist() == [
+        "a", DIRECTION_RAISES, "b", DIRECTION_RAISES, "c", DIRECTION_RAISES,
+    ]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [[0.4, 0.3, 0.0, 0.0], [0.4, 0.0, 0.0, 0.0], [-0.0, 0.0, 0.0, 0.0]],
+    ids=["third-is-zero", "only-one-non-zero", "all-zero"],
+)
+def test_a_selected_zero_raises_and_names_the_customer_and_the_feature(row):
+    frame = contribution_frame([[0.9, 0.8, 0.7, 0.6], row], index=["C1", "C7"])
+
+    with pytest.raises(DriverError) as exc_info:
+        select_top_drivers(frame)
+
+    message = str(exc_info.value)
+    assert "'C7'" in message
+    assert "exactly zero" in message
+    assert any(f"'{name}'" in message for name in FEATURES)
+
+
+def test_a_selected_zero_names_the_feature_that_was_selected():
+    with pytest.raises(DriverError) as exc_info:
+        select_top_drivers(contribution_frame([[0.4, 0.3, 0.0, 0.0]], index=["C7"]))
+
+    assert "'c'" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf], ids=["nan", "inf", "negative-inf"])
+@pytest.mark.parametrize("position", [0, 3], ids=["selected-column", "other-column"])
+def test_a_non_finite_value_anywhere_raises(bad, position):
+    row = [0.9, 0.8, 0.7, 0.6]
+    row[position] = bad
+
+    with pytest.raises(DriverError, match="not finite"):
+        select_top_drivers(contribution_frame([row]))
+
+
+@pytest.mark.parametrize("width", [0, 1, 2])
+def test_fewer_than_three_columns_raises_value_error(width):
+    frame = contribution_frame(np.ones((2, width)), columns=FEATURES[:width])
+
+    with pytest.raises(ValueError):
+        select_top_drivers(frame)
+
+
+def test_a_non_default_index_is_kept():
+    index = ["C9", "C2"]
+    result = select_top_drivers(contribution_frame([[0.4, 0.3, 0.2, 0.1], [0.1, 0.2, 0.3, 0.4]], index=index))
+
+    assert list(result.index) == index
+    assert result.loc["C9", "driver_1"] == "a"
+    assert result.loc["C2", "driver_1"] == "d"
+
+
+def test_the_input_table_is_not_modified():
+    frame = contribution_frame([[0.4, -0.3, 0.2, 0.1]], index=["C1"])
+    original = frame.copy(deep=True)
+
+    select_top_drivers(frame)
+
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_the_result_has_exactly_the_six_columns_object_dtype_and_three_different_features():
+    result = select_top_drivers(contribution_frame([[0.4, -0.3, 0.2, 0.1], [0.1, 0.2, -0.3, 0.4]]))
+
+    assert list(result.columns) == [
+        "driver_1", "driver_1_direction", "driver_2", "driver_2_direction",
+        "driver_3", "driver_3_direction",
+    ]
+    assert list(result.columns) == DRIVER_COLUMNS
+    assert (result.dtypes == object).all()
+    for _, row in result.iterrows():
+        assert len({row["driver_1"], row["driver_2"], row["driver_3"]}) == TOP_N_DRIVERS
+    assert (DIRECTION_RAISES, DIRECTION_LOWERS) == ("raises risk", "lowers risk")
+
+
+def test_the_vectorised_selection_matches_a_plain_python_selection_with_forced_ties():
+    rng = np.random.default_rng(11)
+    columns = [f"f{i:02d}" for i in range(42)]
+    values = np.round(rng.normal(scale=2.0, size=(200, 42)), 1)
+    values[values == 0] = 0.1
+    frame = pd.DataFrame(values, index=[f"C{i:03d}" for i in range(200)], columns=columns)
+
+    result = select_top_drivers(frame)
+
+    for row_number in range(200):
+        row = values[row_number]
+        ranked = sorted(range(42), key=lambda j: (-abs(row[j]), j))[:3]
+        expected = []
+        for j in ranked:
+            expected += [columns[j], DIRECTION_RAISES if row[j] > 0 else DIRECTION_LOWERS]
+        assert result.iloc[row_number].tolist() == expected
+
+
+# End to end
+
+
+def test_real_customers_get_three_different_schema_features_and_allowed_directions(
+    driver_data, driver_contributions
+):
+    result = select_top_drivers(driver_contributions)
+
+    assert len(result) == len(driver_data.ids) >= 300
+    assert list(result.index) == driver_data.ids
+    features = result[["driver_1", "driver_2", "driver_3"]]
+    assert set(features.to_numpy().ravel()) <= set(driver_data.names)
+    assert (features.nunique(axis=1) == TOP_N_DRIVERS).all()
+    directions = result[["driver_1_direction", "driver_2_direction", "driver_3_direction"]]
+    assert set(directions.to_numpy().ravel()) <= {DIRECTION_RAISES, DIRECTION_LOWERS}
