@@ -5,6 +5,8 @@ choice of the three strongest drivers with a direction.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -231,6 +233,16 @@ def encoded_column_owners(loaded_run: LoadedRun) -> list[str]:
     return owners
 
 
+def _owner_matrix(owners: list[str], schema_names: list[str]) -> np.ndarray:
+    """0/1 matrix with one row per encoded column and one column per input
+    feature; a 1 marks the input that owns the encoded column."""
+    matrix = np.zeros((len(owners), len(schema_names)), dtype="float64")
+    position_of = {name: position for position, name in enumerate(schema_names)}
+    for column, owner in enumerate(owners):
+        matrix[column, position_of[owner]] = 1.0
+    return matrix
+
+
 def averaged_contributions(
     loaded_run: LoadedRun, inputs: pd.DataFrame, customer_ids: list[str]
 ) -> pd.DataFrame:
@@ -250,11 +262,7 @@ def averaged_contributions(
     if len(set(customer_ids)) != len(customer_ids):
         raise ValueError("customer_ids contains duplicates")
 
-    owners = encoded_column_owners(loaded_run)
-    owner_matrix = np.zeros((len(owners), len(schema_names)), dtype="float64")
-    position_of = {name: position for position, name in enumerate(schema_names)}
-    for column, owner in enumerate(owners):
-        owner_matrix[column, position_of[owner]] = 1.0
+    owner_matrix = _owner_matrix(encoded_column_owners(loaded_run), schema_names)
 
     matrix = loaded_run.preprocessor.transform(inputs)
     if hasattr(matrix, "toarray"):
@@ -312,3 +320,62 @@ def select_top_drivers(contributions: pd.DataFrame) -> pd.DataFrame:
     result[:, 0::2] = features
     result[:, 1::2] = directions
     return pd.DataFrame(result, index=contributions.index, columns=DRIVER_COLUMNS, dtype=object)
+
+
+def _encoded_position(key: str, feature_names: list[str] | None, width: int) -> int | None:
+    """The encoded column a get_score key refers to, or None if it is not exactly one."""
+    if feature_names is None:
+        match = re.fullmatch(r"f(\d+)", key)
+        position = int(match.group(1)) if match else None
+    else:
+        matches = [index for index, name in enumerate(feature_names) if name == key]
+        position = matches[0] if len(matches) == 1 else None
+    if position is None or not 0 <= position < width:
+        return None
+    return position
+
+
+def _fold_gains(booster: xgb.Booster, width: int, fold: int) -> np.ndarray:
+    """Total gain of each encoded column in one fold booster; a column never
+    used in a split is absent from get_score and counts as zero."""
+    gains = np.zeros(width, dtype="float64")
+    for key, gain in booster.get_score(importance_type="total_gain").items():
+        position = _encoded_position(key, booster.feature_names, width)
+        if position is None:
+            raise DriverError(
+                f"fold {fold}: get_score key {key!r} cannot be mapped to exactly one encoded column"
+            )
+        if not np.isfinite(gain) or gain < 0:
+            raise DriverError(f"fold {fold}: gain for key {key!r} is negative or not finite")
+        gains[position] = gain
+    if gains.sum() == 0:
+        raise DriverError(f"fold {fold}: total gain is zero")
+    return gains
+
+
+def global_importance(loaded_run: LoadedRun) -> pd.DataFrame:
+    """How much the model relies on each input feature overall.
+
+    Each fold's total gain is summed from the encoded columns to their input
+    feature and divided by the fold's total gain, so a fold's shares add up
+    to 1; the five folds' shares are then averaged. The result has one row
+    per input feature, named "feature", with columns share and rank (1 for
+    the largest share, equal shares ranked by schema column order), sorted
+    by rank. The shares are a different measure from the per-customer
+    contributions and are not comparable with them on one scale.
+    """
+    owners = encoded_column_owners(loaded_run)
+    schema_names = [column["name"] for column in loaded_run.schema["columns"]]
+    owner_matrix = _owner_matrix(owners, schema_names)
+
+    fold_shares = []
+    for fold, estimator in enumerate(_fold_estimators(loaded_run.model)):
+        gains = _fold_gains(estimator.get_booster(), len(owners), fold)
+        fold_shares.append((gains @ owner_matrix) / gains.sum())
+
+    shares = np.mean(fold_shares, axis=0)
+    order = np.argsort(-shares, kind="stable")
+    return pd.DataFrame(
+        {"share": shares[order], "rank": np.arange(1, len(order) + 1, dtype="int64")},
+        index=pd.Index(np.asarray(schema_names, dtype=object)[order], name="feature"),
+    )

@@ -76,6 +76,7 @@ from retention_platform.inference.drivers import (
     DriverError,
     averaged_contributions,
     encoded_column_owners,
+    global_importance,
     select_top_drivers,
 )
 from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
@@ -3106,3 +3107,222 @@ def test_related_features_have_different_labels(group):
     labels = [DRIVER_LABELS[name] for name in group]
 
     assert len({label.casefold() for label in labels}) == len(group)
+
+
+# Global importance
+
+
+@pytest.fixture(scope="module")
+def driver_importance(driver_data):
+    return global_importance(driver_data.run)
+
+
+def make_get_score(scores):
+    def get_score(fmap="", importance_type="weight"):
+        assert importance_type == "total_gain"
+        return dict(scores)
+
+    return get_score
+
+
+def run_with_scores(run, scores_by_fold, feature_names=None):
+    """A copy of the run whose chosen fold boosters report the given
+    get_score results (and, if given, carry the given feature names)."""
+    model = copy.deepcopy(run.model)
+    for position, fold in enumerate(model.calibrated_classifiers_):
+        booster = fold.estimator.get_booster()
+        if feature_names is not None:
+            booster.feature_names = feature_names
+        if position in scores_by_fold:
+            booster.get_score = make_get_score(scores_by_fold[position])
+    return dataclasses.replace(run, model=model)
+
+
+def encoded_positions(run, input_name):
+    return [i for i, owner in enumerate(encoded_column_owners(run)) if owner == input_name]
+
+
+def keyed(positions_and_gains):
+    return {f"f{position}": gain for position, gain in positions_and_gains.items()}
+
+
+def test_global_importance_matches_an_independent_computation(driver_data, driver_importance):
+    run = driver_data.run
+    owners = np.array(encoded_column_owners(run))
+    fold_shares = []
+
+    for fold in run.model.calibrated_classifiers_:
+        gains = np.zeros(len(owners))
+        for key, gain in fold.estimator.get_booster().get_score(importance_type="total_gain").items():
+            gains[int(key[1:])] = gain
+        owned = np.array([gains[owners == name].sum() for name in driver_data.names])
+        fold_shares.append(owned / gains.sum())
+    expected = pd.Series(np.mean(fold_shares, axis=0), index=driver_data.names)
+
+    assert abs(driver_importance["share"].sum() - 1) < 1e-9
+    np.testing.assert_allclose(
+        driver_importance["share"].to_numpy(),
+        expected[driver_importance.index].to_numpy(),
+        rtol=0,
+        atol=1e-12,
+    )
+
+
+def test_global_importance_table_shape_and_ordering(driver_data, driver_importance):
+    table = driver_importance
+
+    assert set(table.index) == set(driver_data.names)
+    assert len(table) == len(driver_data.names)
+    assert table.index.name == "feature"
+    assert list(table.columns) == ["share", "rank"]
+    assert table["share"].dtype == np.float64
+    assert table["rank"].dtype == np.int64
+    assert np.isfinite(table["share"].to_numpy()).all()
+    assert (table["share"] >= 0).all()
+    assert list(table["rank"]) == list(range(1, len(table) + 1))
+    assert (np.diff(table["share"].to_numpy()) <= 0).all()
+
+
+def test_gain_on_two_columns_of_one_input_gives_that_input_every_share(driver_data):
+    first, second, *_ = encoded_positions(driver_data.run, "offer")
+    scores = {fold: keyed({first: 3.0 + fold, second: 7.0 - fold}) for fold in range(5)}
+
+    table = global_importance(run_with_scores(driver_data.run, scores))
+
+    assert table.index[0] == "offer"
+    assert table.loc["offer", "share"] == 1.0
+    assert table.loc["offer", "rank"] == 1
+    assert (table.drop(index="offer")["share"] == 0.0).all()
+    assert len(table) == len(driver_data.names)
+
+
+def test_gains_that_differ_by_fold_are_averaged_by_hand(driver_data):
+    contract = encoded_positions(driver_data.run, "contract")
+    gender = encoded_positions(driver_data.run, "gender")
+    scores = {
+        0: keyed({contract[0]: 6.0, gender[0]: 2.0}),
+        1: keyed({contract[0]: 1.0, gender[0]: 3.0}),
+        2: keyed({contract[0]: 2.0, contract[1]: 2.0, gender[0]: 4.0}),
+        3: keyed({contract[0]: 10.0}),
+        4: keyed({contract[0]: 1.0, gender[0]: 1.0}),
+    }
+
+    table = global_importance(run_with_scores(driver_data.run, scores))
+
+    assert table.loc["contract", "share"] == pytest.approx(0.6, abs=1e-12)
+    assert table.loc["gender", "share"] == pytest.approx(0.4, abs=1e-12)
+    assert list(table.index[:2]) == ["contract", "gender"]
+    assert list(table["rank"][:2]) == [1, 2]
+    others = [name for name in driver_data.names if name not in ("contract", "gender")]
+    assert list(table.index[2:]) == others
+    assert (table["share"][2:] == 0.0).all()
+
+
+def test_an_encoded_column_missing_from_get_score_counts_as_zero(driver_data):
+    contract = encoded_positions(driver_data.run, "contract")
+    gender = encoded_positions(driver_data.run, "gender")
+    scores = {fold: keyed({contract[0]: 2.0, gender[0]: 2.0}) for fold in range(5)}
+
+    table = global_importance(run_with_scores(driver_data.run, scores))
+
+    assert table.loc["contract", "share"] == 0.5
+    assert table.loc["gender", "share"] == 0.5
+    assert table["share"].sum() == 1.0
+
+
+def test_equal_shares_are_ranked_by_schema_column_order(driver_data):
+    names = driver_data.names
+    earlier, later = "married", "contract"
+    assert names.index(earlier) < names.index(later)
+    assert encoded_positions(driver_data.run, later)[0] < encoded_positions(driver_data.run, earlier)[0]
+    scores = {
+        fold: keyed(
+            {
+                encoded_positions(driver_data.run, earlier)[0]: 5.0,
+                encoded_positions(driver_data.run, later)[0]: 5.0,
+            }
+        )
+        for fold in range(5)
+    }
+
+    table = global_importance(run_with_scores(driver_data.run, scores))
+
+    assert list(table.index[:2]) == [earlier, later]
+    assert list(table["rank"][:2]) == [1, 2]
+    assert table.loc[earlier, "share"] == table.loc[later, "share"] == 0.5
+
+
+def test_keys_that_are_feature_names_map_to_their_position(driver_data):
+    width = len(encoded_column_owners(driver_data.run))
+    names = [f"col{index}" for index in range(width)]
+    contract = encoded_positions(driver_data.run, "contract")
+    gender = encoded_positions(driver_data.run, "gender")
+    scores = {
+        fold: {names[contract[0]]: 3.0, names[gender[0]]: 1.0} for fold in range(5)
+    }
+
+    table = global_importance(run_with_scores(driver_data.run, scores, feature_names=names))
+
+    assert table.loc["contract", "share"] == 0.75
+    assert table.loc["gender", "share"] == 0.25
+
+
+def test_a_structure_failure_propagates(driver_data):
+    damage, fragment = STRUCTURE_FAILURES["four-calibrated-classifiers"]
+
+    with pytest.raises(DriverError) as exc_info:
+        global_importance(damage(driver_data.run))
+
+    assert fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize("key", ["f999", "weird", "f1.5", "f"], ids=repr)
+def test_a_get_score_key_that_cannot_be_mapped_raises(driver_data, key):
+    scores = {2: {"f0": 1.0, key: 2.0}}
+
+    with pytest.raises(DriverError) as exc_info:
+        global_importance(run_with_scores(driver_data.run, scores))
+
+    message = str(exc_info.value)
+    assert repr(key) in message
+    assert "fold 2" in message
+
+
+def test_a_feature_name_key_that_is_not_a_name_raises(driver_data):
+    width = len(encoded_column_owners(driver_data.run))
+    names = [f"col{index}" for index in range(width)]
+    scores = {1: {"col0": 1.0, "unknown": 2.0}}
+
+    with pytest.raises(DriverError, match="'unknown'"):
+        global_importance(run_with_scores(driver_data.run, scores, feature_names=names))
+
+
+def test_a_fold_with_no_gains_raises(driver_data):
+    with pytest.raises(DriverError, match="fold 3: total gain is zero"):
+        global_importance(run_with_scores(driver_data.run, {3: {}}))
+
+
+def test_a_fold_with_only_zero_gains_raises(driver_data):
+    with pytest.raises(DriverError, match="fold 3: total gain is zero"):
+        global_importance(run_with_scores(driver_data.run, {3: {"f0": 0.0, "f1": 0.0}}))
+
+
+@pytest.mark.parametrize("bad", [-1.0, np.nan, np.inf, -np.inf], ids=["negative", "nan", "inf", "negative-inf"])
+def test_a_negative_or_non_finite_gain_raises(driver_data, bad):
+    scores = {2: {"f0": 1.0, "f1": bad}}
+
+    with pytest.raises(DriverError, match="fold 2: .*negative or not finite"):
+        global_importance(run_with_scores(driver_data.run, scores))
+
+
+def test_the_shared_run_is_unchanged_after_the_damaged_importance_cases(
+    driver_data, driver_importance
+):
+    for fold in driver_data.run.model.calibrated_classifiers_:
+        booster = fold.estimator.get_booster()
+        assert booster.feature_names is None
+        assert len(booster.get_score(importance_type="total_gain")) > 1
+
+    pd.testing.assert_frame_equal(
+        global_importance(driver_data.run), driver_importance, check_exact=True
+    )
