@@ -52,19 +52,24 @@ from retention_platform.inference.economics import (
     ARPU_MULTIPLES,
     MONTHS_KEPT_SWEEP,
     OFFER_COST_SWEEP,
+    BREAK_EVEN_ABOVE_ONE,
     SAVE_RATE_SWEEP,
     EconomicsAssumptions,
     EconomicsError,
     analyze_economics,
     flagged_group,
+    render_economics_document,
 )
 from retention_platform.inference.outputs import (
+    MODEL_RUN_ID_LABEL,
     OUTREACH_FILE,
+    SCORING_RUN_ID_LABEL,
     SNAPSHOT_NOTICE,
     SUMMARY_FILE,
     OutputGenerationError,
     OutputPublicationError,
     build_run_summary,
+    document_header,
     outreach_csv_bytes,
     publish_outputs,
     summary_json_bytes,
@@ -1572,6 +1577,86 @@ def test_outputs_py_never_references_the_target_column_or_other_file_names():
     }
     assert file_names <= {OUTREACH_FILE, SUMMARY_FILE}
     assert file_names == {OUTREACH_FILE, SUMMARY_FILE}
+
+
+# Document header
+
+
+def test_the_header_is_exactly_four_lines():
+    header = document_header("Economics Summary", "20261011T123500Z", "20261011T120000Z")
+
+    assert header == (
+        "# Economics Summary\n"
+        "\n"
+        "Scoring run ID: 20261011T123500Z\n"
+        "Model run ID: 20261011T120000Z\n"
+    )
+    assert header.split("\n")[:4] == [
+        "# Economics Summary",
+        "",
+        "Scoring run ID: 20261011T123500Z",
+        "Model run ID: 20261011T120000Z",
+    ]
+
+
+def test_the_line_labels_are_the_constants_the_header_uses():
+    assert SCORING_RUN_ID_LABEL == "Scoring run ID: "
+    assert MODEL_RUN_ID_LABEL == "Model run ID: "
+    lines = document_header("T", "20261011T123500Z", "20261011T120000Z").split("\n")
+    assert lines[2] == SCORING_RUN_ID_LABEL + "20261011T123500Z"
+    assert lines[3] == MODEL_RUN_ID_LABEL + "20261011T120000Z"
+
+
+BAD_RUN_IDS = [
+    "",
+    "not-an-id",
+    "20261011T123500",
+    "20261011T123500Z\n",
+    " 20261011T123500Z",
+    "../20261011T123500Z",
+    "20261301T123500Z",
+    "20261011T256100Z",
+    "2026-10-11T12:35:00Z",
+    20261011123500,
+    None,
+]
+
+
+@pytest.mark.parametrize("bad", BAD_RUN_IDS, ids=repr)
+def test_a_bad_scoring_run_id_is_refused(bad):
+    with pytest.raises(OutputGenerationError, match="scoring_run_id"):
+        document_header("Title", bad, "20261011T120000Z")
+
+
+@pytest.mark.parametrize("bad", BAD_RUN_IDS, ids=repr)
+def test_a_bad_model_run_id_is_refused(bad):
+    with pytest.raises(OutputGenerationError, match="model_run_id"):
+        document_header("Title", "20261011T123500Z", bad)
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "",
+        "   ",
+        "\t",
+        5,
+        None,
+        ["Title"],
+        "Line one\nLine two",
+        "Line one\rLine two",
+        "Line one\u2028Line two",
+        "Line one\u2029Line two",
+        "Line one\x85Line two",
+        "Line one\x0bLine two",
+        "Line one\x0cLine two",
+        "Title\n",
+    ],
+    ids=repr,
+)
+def test_a_bad_title_is_refused(title):
+    with pytest.raises(OutputGenerationError, match="title"):
+        document_header(title, "20261011T123500Z", "20261011T120000Z")
 
 
 # =============================================================================
@@ -3910,5 +3995,361 @@ def test_economics_py_imports_only_the_allowed_modules_and_never_the_target():
         elif isinstance(node, ast.ImportFrom):
             imported.add(node.module if node.module.startswith("retention_platform") else node.module.split(".")[0])
 
-    assert imported <= {"__future__", "math", "dataclasses", "numpy", "pandas", "retention_platform.inference.ranking"}
+    assert imported <= {
+        "__future__",
+        "math",
+        "dataclasses",
+        "numpy",
+        "pandas",
+        "retention_platform.inference.outputs",
+        "retention_platform.inference.ranking",
+    }
     assert TARGET_COLUMN not in inspect.getsource(economics)
+
+
+# Economics document
+
+DOC_SCORING_RUN_ID = "20261011T123500Z"
+DOC_MODEL_RUN_ID = "20261011T120000Z"
+DOC_HEADINGS = [
+    "What this document is",
+    "Assumptions",
+    "Base case",
+    "One input at a time",
+    "Save rate and months kept",
+    "Break-even save rate",
+    "Outreach group size",
+    "Limitations",
+]
+
+
+def render_document(results, assumptions, scored, k_frac=0.10):
+    return render_economics_document(
+        results, assumptions, k_frac, scored, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
+    )
+
+
+def hand_made_document(assumptions=ECON_ASSUMPTIONS):
+    table, charges = hand_made_inputs()
+    results = analyze_economics(table, charges, 1.0, [1.0], assumptions)
+    return results, render_document(results, assumptions, 3, k_frac=1.0)
+
+
+def seeded_document(assumptions=ECON_ASSUMPTIONS):
+    table, charges = economics_inputs(300, seed=21)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, assumptions)
+    return results, render_document(results, assumptions, 300)
+
+
+def markdown_tables(text):
+    """Every pipe table of the text as a list of rows of cell texts, with
+    the header row first and the separator row removed."""
+    tables, current = [], []
+    for line in text.split("\n"):
+        if line.startswith("|"):
+            current.append([cell.strip() for cell in line.strip("|").split("|")])
+        elif current:
+            tables.append([current[0], *current[2:]])
+            current = []
+    return tables
+
+
+def money_text(value):
+    return "{:,.2f}".format(value)
+
+
+def break_even_text(value):
+    return BREAK_EVEN_ABOVE_ONE if value > 1 else "{:.1f}%".format(value * 100)
+
+
+def whole_percent_text(value):
+    return "{}%".format(int(round(value * 100)))
+
+
+def test_the_document_starts_with_the_fixed_header_and_ends_with_one_line_feed():
+    _, text = seeded_document()
+    lines = text.split("\n")
+
+    assert lines[:4] == [
+        "# Economics Summary",
+        "",
+        f"Scoring run ID: {DOC_SCORING_RUN_ID}",
+        f"Model run ID: {DOC_MODEL_RUN_ID}",
+    ]
+    assert text.startswith(document_header("Economics Summary", DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID))
+    assert text.endswith("\n") and not text.endswith("\n\n")
+    assert "\r" not in text
+    assert not any(line != line.rstrip() for line in lines)
+    assert text.isascii()
+
+
+@pytest.mark.parametrize("builder", [hand_made_document, seeded_document], ids=["hand-made", "seeded"])
+def test_the_eight_headings_appear_once_each_in_order(builder):
+    _, text = builder()
+
+    headings = [line[3:] for line in text.split("\n") if line.startswith("## ")]
+
+    assert headings == DOC_HEADINGS
+    assert [line for line in text.split("\n") if line.startswith("# ")] == ["# Economics Summary"]
+
+
+def test_rendering_twice_gives_identical_text_and_leaves_the_inputs_unchanged():
+    table, charges = economics_inputs(300, seed=21)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    frames_before = {
+        name: getattr(results, name).copy(deep=True)
+        for name in ("one_at_a_time", "save_rate_by_months", "break_even_by_cost_and_months", "k_sweep")
+    }
+    base_before = results.base_case
+
+    first = render_document(results, ECON_ASSUMPTIONS, 300)
+    second = render_document(results, ECON_ASSUMPTIONS, 300)
+
+    assert first == second
+    assert results.base_case == base_before
+    for name, frame in frames_before.items():
+        pd.testing.assert_frame_equal(getattr(results, name), frame)
+
+
+def test_the_required_phrases_appear():
+    _, text = seeded_document()
+
+    assert text.count("Simulated result under stated assumptions") == 5
+    assert "currency units" in text
+    assert "not estimated from the data" in text
+    assert "No ROI is calculated" in text
+    assert "not a recommendation to change K" in text
+    assert "revenue proxy, not profit" in text
+    assert SNAPSHOT_NOTICE in text
+    assert re.search(r"top 10% of the scored customers: 30 of 300 customers", text)
+
+
+def test_the_hand_made_base_case_prints_the_hand_computed_figures():
+    _, text = hand_made_document()
+
+    base = markdown_tables(text)[1]
+
+    assert base[0] == ["Figure", "Value"]
+    assert [row[1] for row in base[1:]] == [
+        "3", "60.00", "2.40", "0.48", "115.20", "55.20", "18.40", "10.4%",
+    ]
+    assert [row[0] for row in base[1:]] == [
+        "Customers contacted",
+        "Total offer cost (currency units)",
+        "Expected would-be churners",
+        "Expected customers saved",
+        "Gross revenue kept (currency units)",
+        "Net expected value (currency units)",
+        "Expected value per contacted customer (currency units)",
+        "Break-even save rate",
+    ]
+
+
+def test_every_table_cell_equals_the_matching_result_formatted_independently():
+    results, text = seeded_document()
+    tables = markdown_tables(text)
+    assert len(tables) == 6
+
+    base = results.base_case
+    assert [row[1] for row in tables[1][1:]] == [
+        "{:,}".format(base.customers_contacted),
+        money_text(base.total_offer_cost),
+        money_text(base.expected_would_be_churners),
+        money_text(base.expected_customers_saved),
+        money_text(base.gross_revenue_kept),
+        money_text(base.net_expected_value),
+        money_text(base.ev_per_contacted_customer),
+        break_even_text(base.break_even_save_rate),
+    ]
+
+    rows = tables[2][1:]
+    assert len(rows) == 16
+    labels = {"save_rate": "Save rate", "months_kept": "Months kept", "offer_cost": "Offer cost", "arpu_multiple": "ARPU multiple"}
+    for shown, (_, result) in zip(rows, results.one_at_a_time.iterrows()):
+        name, value = result["input"], result["value"]
+        expected_value = {
+            "save_rate": whole_percent_text(value),
+            "months_kept": str(int(value)),
+            "offer_cost": str(int(value)),
+            "arpu_multiple": "{:.1f}x".format(value),
+        }[name]
+        assert shown == [
+            labels[name],
+            expected_value,
+            money_text(result["net_expected_value"]),
+            money_text(result["ev_per_contacted_customer"]),
+            break_even_text(result["break_even_save_rate"]),
+        ]
+
+    by_months = tables[3]
+    assert len(by_months) == 1 + 5 and all(len(row) == 5 for row in by_months)
+    assert by_months[0] == ["Save rate", "1 month", "3 months", "6 months", "12 months"]
+    for shown, rate in zip(by_months[1:], results.save_rate_by_months.index):
+        assert shown == [whole_percent_text(rate)] + [
+            money_text(results.save_rate_by_months.loc[rate, m]) for m in MONTHS_KEPT_SWEEP
+        ]
+
+    by_cost = tables[4]
+    assert len(by_cost) == 1 + 4 and all(len(row) == 5 for row in by_cost)
+    assert by_cost[0] == ["Months kept", "Offer cost 10", "Offer cost 20", "Offer cost 40", "Offer cost 60"]
+    for shown, months in zip(by_cost[1:], results.break_even_by_cost_and_months.index):
+        assert shown == [str(months)] + [
+            break_even_text(results.break_even_by_cost_and_months.loc[months, c]) for c in OFFER_COST_SWEEP
+        ]
+
+    sweep = tables[5]
+    assert len(sweep) == 1 + 5
+    for shown, (_, result) in zip(sweep[1:], results.k_sweep.iterrows()):
+        assert shown == [
+            whole_percent_text(result["k"]),
+            "{:,}".format(int(result["customers_contacted"])),
+            money_text(result["arpu_proxy"]),
+            money_text(result["expected_would_be_churners"]),
+            money_text(result["net_expected_value"]),
+            money_text(result["ev_per_contacted_customer"]),
+            break_even_text(result["break_even_save_rate"]),
+        ]
+
+
+def test_the_derived_arpu_wording_appears_only_for_a_derived_arpu():
+    _, derived = seeded_document()
+    _, override = seeded_document(EconomicsAssumptions(0.20, 3, 20.0, arpu_proxy=95.5))
+
+    assert "derived: mean monthly_charge of the 30 flagged customers" in derived
+    assert "not an observed value" not in derived
+    assert "derived: mean monthly_charge" not in override
+    assert "not an observed value" in override
+    assert "user-supplied what-if value" in override
+    assert "95.50" in override
+    assert "the same ARPU override of 95.50 currency units is used for every K" in override
+    assert "derived separately from each K's flagged group" in derived
+
+
+def test_a_break_even_above_one_prints_the_cannot_pay_off_text_and_a_normal_run_never_does():
+    table, charges = hand_made_inputs()
+    table["churn_probability"] = [0.1, 0.1, 0.1]
+    charges = pd.Series([10.0, 10.0, 10.0], index=["A", "B", "C"])
+    assumptions = EconomicsAssumptions(0.20, 1, 20.0)
+    results = analyze_economics(table, charges, 1.0, [1.0], assumptions)
+
+    text = render_document(results, assumptions, 3, k_frac=1.0)
+    tables = markdown_tables(text)
+
+    assert tables[1][-1] == ["Break-even save rate", BREAK_EVEN_ABOVE_ONE]
+    assert any(BREAK_EVEN_ABOVE_ONE in cell for row in tables[4] for cell in row)
+    assert "N/A" not in text
+    assert "20.0" not in text
+    _, normal = seeded_document()
+    assert BREAK_EVEN_ABOVE_ONE not in normal
+
+
+def test_exactly_one_hundred_percent_prints_as_a_number():
+    table, charges = hand_made_inputs()
+    base = analyze_economics(table, charges, 1.0, [1.0], ECON_ASSUMPTIONS)
+    modified = dataclasses.replace(
+        base,
+        base_case=dataclasses.replace(base.base_case, break_even_save_rate=1.0),
+    )
+
+    text = render_document(modified, ECON_ASSUMPTIONS, 3, k_frac=1.0)
+
+    assert markdown_tables(text)[1][-1] == ["Break-even save rate", "100.0%"]
+
+
+@pytest.mark.parametrize("builder", [hand_made_document, seeded_document], ids=["hand-made", "seeded"])
+def test_no_nan_inf_or_na_ever_appears(builder):
+    _, text = builder()
+
+    assert not re.search(r"\b(nan|inf|N/A)\b", text, flags=re.IGNORECASE)
+    assert "None" not in text
+
+
+def test_months_kept_and_offer_cost_print_as_whole_numbers():
+    results, text = seeded_document()
+
+    for row in markdown_tables(text)[2][1:]:
+        if row[0] in ("Months kept", "Offer cost"):
+            assert re.fullmatch(r"\d+", row[1]), row
+    assert results.one_at_a_time["value"].dtype == np.float64
+
+
+def test_a_save_rate_with_float_noise_prints_as_a_whole_percentage():
+    noisy = 0.1 + 0.2
+    assert noisy != 0.3
+    assumptions = EconomicsAssumptions(noisy, 3, 20.0)
+    results, text = seeded_document(assumptions)
+    modified = results.one_at_a_time.copy()
+    modified.loc[modified["input"] == "save_rate", "value"] = [0.05, 0.10, 0.20, noisy, 0.40]
+    text = render_document(dataclasses.replace(results, one_at_a_time=modified), assumptions, 300)
+
+    assert "save rate 30%" in text
+    assert "30000000" not in text
+    assert ["Save rate", "30%"] == markdown_tables(text)[2][4][:2]
+
+
+DOCUMENT_REFUSALS = {
+    "results-not-results": lambda r, a: dict(results={"base_case": 1}),
+    "assumptions-not-assumptions": lambda r, a: dict(assumptions={"save_rate": 0.2}),
+    "k-zero": lambda r, a: dict(k_frac=0),
+    "k-above-one": lambda r, a: dict(k_frac=1.5),
+    "k-bool": lambda r, a: dict(k_frac=True),
+    "scored-below-contacted": lambda r, a: dict(customers_scored=29),
+    "k-disagrees-with-the-results": lambda r, a: dict(k_frac=0.20),
+    "scored-disagrees-with-the-results": lambda r, a: dict(customers_scored=1408),
+    "scored-float": lambda r, a: dict(customers_scored=300.0),
+    "scored-bool": lambda r, a: dict(customers_scored=True),
+    "scored-text": lambda r, a: dict(customers_scored="300"),
+    "scored-none": lambda r, a: dict(customers_scored=None),
+    "override-disagrees-with-results": lambda r, a: dict(
+        assumptions=EconomicsAssumptions(0.20, 3, 20.0, arpu_proxy=95.5)
+    ),
+}
+
+
+@pytest.mark.parametrize("build", list(DOCUMENT_REFUSALS.values()), ids=list(DOCUMENT_REFUSALS))
+def test_bad_document_arguments_raise_value_error(build):
+    table, charges = economics_inputs(300, seed=21)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    arguments = dict(
+        results=results,
+        assumptions=ECON_ASSUMPTIONS,
+        k_frac=0.10,
+        customers_scored=300,
+        scoring_run_id=DOC_SCORING_RUN_ID,
+        model_run_id=DOC_MODEL_RUN_ID,
+    )
+    arguments.update(build(results, ECON_ASSUMPTIONS))
+
+    with pytest.raises(ValueError):
+        render_economics_document(**arguments)
+
+
+@pytest.mark.parametrize("field", ["scoring_run_id", "model_run_id"])
+@pytest.mark.parametrize("bad", ["", "not-an-id", "20261011T123500", "../20261011T123500Z", None], ids=repr)
+def test_a_bad_run_id_is_refused(field, bad):
+    table, charges = economics_inputs(300, seed=21)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    arguments = dict(
+        results=results,
+        assumptions=ECON_ASSUMPTIONS,
+        k_frac=0.10,
+        customers_scored=300,
+        scoring_run_id=DOC_SCORING_RUN_ID,
+        model_run_id=DOC_MODEL_RUN_ID,
+    )
+    arguments[field] = bad
+
+    with pytest.raises(OutputGenerationError):
+        render_economics_document(**arguments)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_a_break_even_that_is_not_finite_in_the_base_case_is_refused(bad):
+    table, charges = hand_made_inputs()
+    base = analyze_economics(table, charges, 1.0, [1.0], ECON_ASSUMPTIONS)
+    damaged = dataclasses.replace(
+        base, base_case=dataclasses.replace(base.base_case, break_even_save_rate=bad)
+    )
+
+    with pytest.raises(ValueError, match="break-even save rate is not finite"):
+        render_document(damaged, ECON_ASSUMPTIONS, 3, k_frac=1.0)

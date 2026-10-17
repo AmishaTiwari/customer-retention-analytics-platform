@@ -39,6 +39,9 @@ SNAPSHOT_NOTICE = (
     "demonstration. It is not a live outreach list."
 )
 
+SCORING_RUN_ID_LABEL = "Scoring run ID: "
+MODEL_RUN_ID_LABEL = "Model run ID: "
+
 _TEMP_PREFIX = ".tmp-"
 _TABLE_COLUMNS = ["customer_id", "churn_probability", "rank", "in_top_k"]
 _MODEL_HEALTH_KEYS = [
@@ -178,6 +181,25 @@ def build_run_summary(
         "snapshot_notice": SNAPSHOT_NOTICE,
         "model_health": model_health,
     }
+
+
+def document_header(title: str, scoring_run_id: str, model_run_id: str) -> str:
+    """The four fixed header lines of a Markdown document, each ending in a
+    line feed: the title, an empty line, the scoring run ID and the model
+    run ID."""
+    if not isinstance(title, str) or not title.strip():
+        raise OutputGenerationError(f"the document title must be non-empty text, got {title!r}")
+    if title.splitlines() != [title]:
+        raise OutputGenerationError(f"the document title must be a single line, got {title!r}")
+    for name, value in (("scoring_run_id", scoring_run_id), ("model_run_id", model_run_id)):
+        if not is_valid_run_id(value):
+            raise OutputGenerationError(f"{name} is not a valid run id: {value!r}")
+    return (
+        f"# {title}\n"
+        "\n"
+        f"{SCORING_RUN_ID_LABEL}{scoring_run_id}\n"
+        f"{MODEL_RUN_ID_LABEL}{model_run_id}\n"
+    )
 
 
 def outreach_csv_bytes(table: pd.DataFrame) -> bytes:
