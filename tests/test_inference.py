@@ -70,6 +70,7 @@ from retention_platform.inference.drivers import (
     DIRECTION_LOWERS,
     DIRECTION_RAISES,
     DRIVER_COLUMNS,
+    DRIVER_LABELS,
     EXPECTED_FOLD_MODELS,
     TOP_N_DRIVERS,
     DriverError,
@@ -2980,3 +2981,128 @@ def test_real_customers_get_three_different_schema_features_and_allowed_directio
     assert (features.nunique(axis=1) == TOP_N_DRIVERS).all()
     directions = result[["driver_1_direction", "driver_2_direction", "driver_3_direction"]]
     assert set(directions.to_numpy().ravel()) <= {DIRECTION_RAISES, DIRECTION_LOWERS}
+
+
+# Label map
+
+FORBIDDEN_LABEL_CHARACTERS = {
+    ",": "a comma",
+    '"': "a double quotation mark",
+    "'": "a single quotation mark or apostrophe",
+    "‘": "a typographic quotation mark",
+    "’": "a typographic quotation mark",
+    "“": "a typographic quotation mark",
+    "”": "a typographic quotation mark",
+    "\r": "a carriage return",
+    "\n": "a line feed",
+}
+
+
+def label_problems(labels, feature_names):
+    """Readable problems with a label map: it must hold exactly one clean,
+    distinct label per feature name."""
+    problems = []
+    for name in feature_names:
+        if name not in labels:
+            problems.append(f"feature '{name}' has no label")
+    for name in labels:
+        if name not in feature_names:
+            problems.append(f"label for '{name}' is not a schema feature")
+
+    texts = {}
+    for name, label in labels.items():
+        if not isinstance(label, str):
+            problems.append(f"label for '{name}' is not a string: {label!r}")
+            continue
+        if not label.strip():
+            problems.append(f"label for '{name}' is empty or only whitespace: {label!r}")
+            continue
+        if label != label.strip():
+            problems.append(f"label for '{name}' has leading or trailing whitespace: {label!r}")
+        for character, description in FORBIDDEN_LABEL_CHARACTERS.items():
+            if character in label:
+                problems.append(f"label for '{name}' contains {description}: {label!r}")
+        texts.setdefault(label.strip().casefold(), []).append(name)
+
+    for names in texts.values():
+        if len(names) > 1:
+            problems.append(f"labels for {names} are the same ignoring case and whitespace")
+    return problems
+
+
+CLEAN_LABELS = {"a": "Alpha", "b": "Beta", "c": "Gamma"}
+CLEAN_NAMES = ["a", "b", "c"]
+
+
+def test_a_clean_map_has_no_problems():
+    assert label_problems(CLEAN_LABELS, CLEAN_NAMES) == []
+
+
+LABEL_PROBLEM_CASES = {
+    "missing-label": ({"a": "Alpha", "b": "Beta"}, ["'c'", "no label"]),
+    "extra-label": ({**CLEAN_LABELS, "z": "Zeta"}, ["'z'", "not a schema feature"]),
+    "integer-label": ({**CLEAN_LABELS, "b": 5}, ["'b'", "not a string"]),
+    "none-label": ({**CLEAN_LABELS, "b": None}, ["'b'", "not a string"]),
+    "empty-label": ({**CLEAN_LABELS, "b": ""}, ["'b'", "empty"]),
+    "whitespace-label": ({**CLEAN_LABELS, "b": "   "}, ["'b'", "empty"]),
+    "leading-space": ({**CLEAN_LABELS, "b": " Beta"}, ["'b'", "leading or trailing"]),
+    "trailing-space": ({**CLEAN_LABELS, "b": "Beta "}, ["'b'", "leading or trailing"]),
+    "comma": ({**CLEAN_LABELS, "b": "Be,ta"}, ["'b'", "comma"]),
+    "double-quote": ({**CLEAN_LABELS, "b": 'Be"ta'}, ["'b'", "double quotation"]),
+    "apostrophe": ({**CLEAN_LABELS, "b": "Be'ta"}, ["'b'", "apostrophe"]),
+    "typographic-single-open": ({**CLEAN_LABELS, "b": "Be‘ta"}, ["'b'", "typographic"]),
+    "typographic-single-close": ({**CLEAN_LABELS, "b": "Be’ta"}, ["'b'", "typographic"]),
+    "typographic-double-open": ({**CLEAN_LABELS, "b": "Be“ta"}, ["'b'", "typographic"]),
+    "typographic-double-close": ({**CLEAN_LABELS, "b": "Be”ta"}, ["'b'", "typographic"]),
+    "carriage-return": ({**CLEAN_LABELS, "b": "Be\rta"}, ["'b'", "carriage return"]),
+    "line-feed": ({**CLEAN_LABELS, "b": "Be\nta"}, ["'b'", "line feed"]),
+    "duplicate-ignoring-case": ({**CLEAN_LABELS, "b": "ALPHA"}, ["'a'", "'b'", "same ignoring case"]),
+    "duplicate-ignoring-whitespace": (
+        {**CLEAN_LABELS, "b": "Alpha "},
+        ["'a'", "'b'", "same ignoring case"],
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "labels,fragments",
+    list(LABEL_PROBLEM_CASES.values()),
+    ids=list(LABEL_PROBLEM_CASES),
+)
+def test_the_label_check_reports_each_problem_with_the_offending_name(labels, fragments):
+    problems = label_problems(labels, CLEAN_NAMES)
+
+    assert problems
+    text = "\n".join(problems)
+    for fragment in fragments:
+        assert fragment in text, f"{fragment!r} not in {text!r}"
+
+
+def test_the_real_label_map_is_complete_and_clean(driver_data):
+    assert label_problems(DRIVER_LABELS, driver_data.names) == []
+    assert len(DRIVER_LABELS) == len(driver_data.names)
+    assert list(DRIVER_LABELS) == driver_data.names
+
+
+def test_every_selected_real_driver_has_a_label(driver_contributions):
+    selected = select_top_drivers(driver_contributions)
+
+    features = set(selected[["driver_1", "driver_2", "driver_3"]].to_numpy().ravel())
+
+    assert features
+    assert features <= set(DRIVER_LABELS)
+
+
+RELATED_FEATURES = {
+    "contract-and-month-to-month": ["contract", "is_month_to_month"],
+    "referrals": ["number_of_referrals", "referred_a_friend"],
+    "charges-and-revenue": ["total_charges", "total_revenue"],
+    "security-add-ons": ["online_security", "internet_without_security", "no_addons_despite_internet"],
+}
+
+
+@pytest.mark.parametrize("group", list(RELATED_FEATURES.values()), ids=list(RELATED_FEATURES))
+def test_related_features_have_different_labels(group):
+    labels = [DRIVER_LABELS[name] for name in group]
+
+    assert len({label.casefold() for label in labels}) == len(group)

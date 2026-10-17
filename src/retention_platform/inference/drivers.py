@@ -33,6 +33,53 @@ DRIVER_COLUMNS = [
     "driver_3_direction",
 ]
 
+# One fixed label per model input feature, in schema order. A label names
+# the feature and does not state a customer's value.
+DRIVER_LABELS = {
+    "gender": "Gender",
+    "age": "Age",
+    "under_30": "Age under 30",
+    "senior_citizen": "Senior citizen status",
+    "married": "Marital status",
+    "dependents": "Dependents",
+    "number_of_dependents": "Number of dependents",
+    "latitude": "Customer location (latitude)",
+    "longitude": "Customer location (longitude)",
+    "population": "Population of the customer zip code area",
+    "referred_a_friend": "Referred a friend",
+    "number_of_referrals": "Number of referrals",
+    "tenure_in_months": "Tenure in months",
+    "offer": "Promotional offer",
+    "phone_service": "Phone service",
+    "avg_monthly_long_distance_charges": "Average monthly long-distance charges",
+    "multiple_lines": "Multiple phone lines",
+    "internet_service": "Internet service",
+    "internet_type": "Internet connection type",
+    "avg_monthly_gb_download": "Average monthly data download (GB)",
+    "online_security": "Online security add-on",
+    "online_backup": "Online backup add-on",
+    "device_protection_plan": "Device protection plan",
+    "premium_tech_support": "Premium tech support",
+    "streaming_tv": "Streaming TV",
+    "streaming_movies": "Streaming movies",
+    "streaming_music": "Streaming music",
+    "unlimited_data": "Unlimited data plan",
+    "contract": "Contract type",
+    "paperless_billing": "Paperless billing",
+    "payment_method": "Payment method",
+    "monthly_charge": "Monthly charge",
+    "total_charges": "Total charges billed to date",
+    "total_refunds": "Total refunds to date",
+    "total_extra_data_charges": "Total extra data charges to date",
+    "total_long_distance_charges": "Total long-distance charges to date",
+    "total_revenue": "Total revenue from the customer to date",
+    "num_addon_services": "Number of add-on services",
+    "is_month_to_month": "Month-to-month contract",
+    "internet_without_security": "Internet service without online security",
+    "no_addons_despite_internet": "Internet service with no add-on services",
+    "is_tenure_censored": "Tenure at the 72-month recording limit",
+}
+
 
 class DriverError(Exception):
     """Raised when the loaded model cannot be used for drivers, when a
