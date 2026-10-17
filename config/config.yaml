@@ -31,10 +31,19 @@ business:
   # not percentages and not customer counts.
   k: 0.10
   k_sensitivity: [0.05, 0.10, 0.15, 0.20, 0.25]
-  risk_tiers: null # TODO (Commit 9 — evaluation & error analysis)
+  risk_tiers:
+    # Fraction of scored customers up to which the Medium tier reaches;
+    # must be above k and at most 1.
+    medium_edge: 0.25
   economics:
-    arpu_proxy: null # TODO (Commit 11 — decision-support outputs)
-    offer_cost: null # TODO (Commit 11)
+    # null derives the value from the flagged group; a positive number overrides it.
+    arpu_proxy: null
+    # In currency units.
+    offer_cost: 20
+    # Fraction of contacted at-risk customers who are retained.
+    save_rate: 0.20
+    # Whole number of months a retained customer stays.
+    months_kept: 3
 
 tuning:
   budget_per_model: 30

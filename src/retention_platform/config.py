@@ -7,6 +7,7 @@ on missing or malformed configuration.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import yaml
@@ -46,7 +47,8 @@ def _is_fraction(value: object) -> bool:
 
 
 def _validate_business(business: object) -> list[str]:
-    """Return problems with business, business.k and business.k_sensitivity.
+    """Return problems with business, business.k, business.k_sensitivity,
+    business.risk_tiers and business.economics.
 
     Called only when the business key is present; a missing section is
     already reported as a missing top-level section.
@@ -74,6 +76,97 @@ def _validate_business(business: object) -> list[str]:
                         f"business.k_sensitivity[{index}] must be a number with "
                         f"0 < value <= 1, got {value!r}"
                     )
+
+    errors.extend(_validate_risk_tiers(business))
+    errors.extend(_validate_economics(business))
+
+    return errors
+
+
+def _is_number(value: object) -> bool:
+    """True for a finite int or float (not bool) that is representable as a float."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        try:
+            float(value)
+        except OverflowError:
+            return False
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _validate_risk_tiers(business: dict) -> list[str]:
+    """Return problems with business.risk_tiers and the k < medium_edge pair rule."""
+    if "risk_tiers" not in business:
+        return ["Missing required key in 'business': 'risk_tiers'"]
+
+    risk_tiers = business["risk_tiers"]
+    if not isinstance(risk_tiers, dict):
+        return [f"business.risk_tiers must be a mapping, got {risk_tiers!r}"]
+
+    if "medium_edge" not in risk_tiers:
+        return ["Missing required key in 'business.risk_tiers': 'medium_edge'"]
+
+    medium_edge = risk_tiers["medium_edge"]
+    if not (_is_number(medium_edge) and _is_fraction(medium_edge)):
+        return [
+            "business.risk_tiers.medium_edge must be a number with "
+            f"0 < medium_edge <= 1, got {medium_edge!r}"
+        ]
+
+    k = business.get("k")
+    if _is_fraction(k) and not k < medium_edge:
+        return [
+            f"business.k ({k!r}) must be below business.risk_tiers.medium_edge ({medium_edge!r})"
+        ]
+
+    return []
+
+
+def _validate_economics(business: dict) -> list[str]:
+    """Return problems with the four business.economics keys."""
+    if "economics" not in business:
+        return ["Missing required key in 'business': 'economics'"]
+
+    economics = business["economics"]
+    if not isinstance(economics, dict):
+        return [f"business.economics must be a mapping, got {economics!r}"]
+
+    errors: list[str] = []
+
+    for key in ("arpu_proxy", "offer_cost", "save_rate", "months_kept"):
+        if key not in economics:
+            errors.append(f"Missing required key in 'business.economics': '{key}'")
+
+    if "arpu_proxy" in economics:
+        value = economics["arpu_proxy"]
+        if value is not None and not (_is_number(value) and value > 0):
+            errors.append(
+                f"business.economics.arpu_proxy must be null or a finite number > 0, got {value!r}"
+            )
+
+    if "offer_cost" in economics:
+        value = economics["offer_cost"]
+        if not (_is_number(value) and value > 0):
+            errors.append(
+                f"business.economics.offer_cost must be a finite number > 0, got {value!r}"
+            )
+
+    if "save_rate" in economics:
+        value = economics["save_rate"]
+        if not (_is_number(value) and _is_fraction(value)):
+            errors.append(
+                "business.economics.save_rate must be a number with "
+                f"0 < save_rate <= 1, got {value!r}"
+            )
+
+    if "months_kept" in economics:
+        value = economics["months_kept"]
+        if not (_is_number(value) and isinstance(value, int) and value >= 1):
+            errors.append(
+                f"business.economics.months_kept must be a whole number >= 1, got {value!r}"
+            )
 
     return errors
 
