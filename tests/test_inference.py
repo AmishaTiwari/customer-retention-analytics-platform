@@ -9,6 +9,7 @@ Section E: the scoring command (population selection, run_scoring, main and
 its failure classes).
 Section F: ranking: top_k_count and risk tiers.
 Section G: drivers (structure check, averaged contributions, top-driver selection).
+Section H: economics (expected value, break-even and sensitivity tables).
 """
 
 from __future__ import annotations
@@ -46,7 +47,17 @@ from retention_platform.data.prepare import (
 from retention_platform.features.build import run_features
 from retention_platform import tracking
 from retention_platform.config import REPO_ROOT, ConfigValidationError, load_config
-from retention_platform.inference import outputs, score, validate
+from retention_platform.inference import economics, outputs, score, validate
+from retention_platform.inference.economics import (
+    ARPU_MULTIPLES,
+    MONTHS_KEPT_SWEEP,
+    OFFER_COST_SWEEP,
+    SAVE_RATE_SWEEP,
+    EconomicsAssumptions,
+    EconomicsError,
+    analyze_economics,
+    flagged_group,
+)
 from retention_platform.inference.outputs import (
     OUTREACH_FILE,
     SNAPSHOT_NOTICE,
@@ -3326,3 +3337,578 @@ def test_the_shared_run_is_unchanged_after_the_damaged_importance_cases(
     pd.testing.assert_frame_equal(
         global_importance(driver_data.run), driver_importance, check_exact=True
     )
+
+
+# =============================================================================
+# Section H: Economics
+# =============================================================================
+
+ECON_ASSUMPTIONS = EconomicsAssumptions(save_rate=0.20, months_kept=3, offer_cost=20.0)
+ECON_K_VALUES = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+
+def economics_inputs(n_rows, seed=0, k_frac=0.10, shape=(5, 2)):
+    """A synthetic ranked table (score_batch columns) and a monthly_charge
+    Series indexed by customer_id, with the seeded values."""
+    rng = np.random.default_rng(seed)
+    ids = [f"C{i:05d}" for i in range(n_rows)]
+    table = (
+        pd.DataFrame({"customer_id": ids, "churn_probability": rng.beta(*shape, size=n_rows)})
+        .sort_values(["churn_probability", "customer_id"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    table["rank"] = np.arange(1, n_rows + 1, dtype="int64")
+    table["in_top_k"] = table["rank"] <= top_k_count(n_rows, k_frac)
+    charges = pd.Series(rng.uniform(20, 120, n_rows).round(2), index=ids, name="monthly_charge")
+    return table, charges
+
+
+def hand_made_inputs():
+    """Three customers: probabilities 0.9, 0.8, 0.7 and charges 70, 80, 90."""
+    table = pd.DataFrame(
+        {
+            "customer_id": pd.Series(["A", "B", "C"], dtype=object),
+            "churn_probability": [0.9, 0.8, 0.7],
+            "rank": pd.Series([1, 2, 3], dtype="int64"),
+            "in_top_k": [True, True, True],
+        }
+    )
+    return table, pd.Series([70.0, 80.0, 90.0], index=["A", "B", "C"])
+
+
+def assert_same_economics(first, second):
+    assert first.base_case == second.base_case
+    for name in ("one_at_a_time", "save_rate_by_months", "break_even_by_cost_and_months", "k_sweep"):
+        pd.testing.assert_frame_equal(getattr(first, name), getattr(second, name), check_exact=True)
+
+
+# Hand-made group
+
+
+def test_hand_made_group_base_case_figures():
+    table, charges = hand_made_inputs()
+
+    base = analyze_economics(table, charges, 1.0, [1.0], ECON_ASSUMPTIONS).base_case
+
+    assert base.customers_contacted == 3
+    assert base.total_offer_cost == pytest.approx(60.0)
+    assert base.expected_would_be_churners == pytest.approx(2.4)
+    assert base.expected_customers_saved == pytest.approx(0.48)
+    assert base.gross_revenue_kept == pytest.approx(115.2)
+    assert base.net_expected_value == pytest.approx(55.2)
+    assert base.ev_per_contacted_customer == pytest.approx(18.4)
+    assert base.break_even_save_rate == pytest.approx(60 / 576)
+    assert base.arpu_proxy == pytest.approx(80.0)
+    assert base.arpu_source == "derived"
+    assert base.arpu_customers_used == 3
+
+
+def test_hand_made_per_customer_values_sum_to_the_group_value():
+    expected = [0.9 * 0.2 * 80 * 3 - 20, 0.8 * 0.2 * 80 * 3 - 20, 0.7 * 0.2 * 80 * 3 - 20]
+    table, charges = hand_made_inputs()
+
+    base = analyze_economics(table, charges, 1.0, [1.0], ECON_ASSUMPTIONS).base_case
+
+    assert expected == pytest.approx([23.2, 18.4, 13.6])
+    assert base.net_expected_value == pytest.approx(sum(expected))
+
+
+def test_expected_value_is_zero_at_the_break_even_save_rate():
+    table, charges = hand_made_inputs()
+    base = analyze_economics(table, charges, 1.0, [1.0], ECON_ASSUMPTIONS).base_case
+
+    at_break_even = EconomicsAssumptions(base.break_even_save_rate, 3, 20.0)
+    result = analyze_economics(table, charges, 1.0, [1.0], at_break_even).base_case
+
+    assert result.net_expected_value == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_break_even_above_one_stays_above_one():
+    table, charges = hand_made_inputs()
+    table["churn_probability"] = [0.1, 0.1, 0.1]
+    charges = pd.Series([10.0, 10.0, 10.0], index=["A", "B", "C"])
+    assumptions = EconomicsAssumptions(0.20, 1, 20.0)
+
+    results = analyze_economics(table, charges, 1.0, [1.0], assumptions)
+
+    assert results.base_case.break_even_save_rate == pytest.approx(3 * 20 / (10 * 1 * 0.3))
+    assert results.base_case.break_even_save_rate > 1
+    assert (results.break_even_by_cost_and_months > 1).any().any()
+
+
+# Independent recomputation
+
+
+def plain_python_group_figures(table, charges, k_frac, assumptions):
+    rows = sorted(zip(table["rank"], table["customer_id"], table["churn_probability"]))
+    group = rows[: top_k_count(len(rows), k_frac)]
+    arpu = assumptions.arpu_proxy
+    if arpu is None:
+        arpu = sum(charges[customer] for _, customer, _ in group) / len(group)
+    net = 0.0
+    sum_p = 0.0
+    for _, _, probability in group:
+        net += (
+            probability * assumptions.save_rate * arpu * assumptions.months_kept
+            - assumptions.offer_cost
+        )
+        sum_p += probability
+    break_even = len(group) * assumptions.offer_cost / (arpu * assumptions.months_kept * sum_p)
+    return {"n": len(group), "arpu": arpu, "net": net, "sum_p": sum_p, "break_even": break_even}
+
+
+def test_group_figures_match_a_plain_python_per_customer_loop():
+    table, charges = economics_inputs(300, seed=1)
+
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    expected = plain_python_group_figures(table, charges, 0.10, ECON_ASSUMPTIONS)
+
+    base = results.base_case
+    assert base.customers_contacted == expected["n"] == 30
+    assert base.arpu_proxy == pytest.approx(expected["arpu"], rel=1e-9)
+    assert base.net_expected_value == pytest.approx(expected["net"], rel=1e-9)
+    assert base.expected_would_be_churners == pytest.approx(expected["sum_p"], rel=1e-9)
+    assert base.break_even_save_rate == pytest.approx(expected["break_even"], rel=1e-9)
+
+
+def test_net_expected_value_is_linear_in_the_save_rate():
+    table, charges = economics_inputs(300, seed=2)
+
+    rows = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS).one_at_a_time
+    save = rows[rows["input"] == "save_rate"].set_index("value")["net_expected_value"]
+
+    slope = (save[0.40] - save[0.05]) / 0.35
+    for rate in (0.10, 0.20, 0.30):
+        assert save[rate] == pytest.approx(save[0.05] + slope * (rate - 0.05), rel=1e-9)
+
+
+def test_expected_value_is_zero_at_the_break_even_on_synthetic_data():
+    table, charges = economics_inputs(300, seed=3)
+    base = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS).base_case
+    assert 0 < base.break_even_save_rate < 1
+
+    at_break_even = EconomicsAssumptions(base.break_even_save_rate, 3, 20.0)
+    result = analyze_economics(table, charges, 0.10, ECON_K_VALUES, at_break_even).base_case
+
+    assert result.net_expected_value == pytest.approx(0.0, abs=1e-8)
+
+
+# Alignment by customer id
+
+
+def test_a_shuffled_or_reversed_series_gives_identical_results():
+    table, charges = economics_inputs(300, seed=4)
+    reference = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    shuffled = charges.sample(frac=1, random_state=5)
+    reversed_series = charges.iloc[::-1]
+
+    assert_same_economics(
+        reference, analyze_economics(table, shuffled, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    )
+    assert_same_economics(
+        reference, analyze_economics(table, reversed_series, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    )
+    pd.testing.assert_frame_equal(
+        flagged_group(table, shuffled, 0.10), flagged_group(table, charges, 0.10), check_exact=True
+    )
+
+
+def test_values_attached_to_the_wrong_ids_by_position_give_a_different_result():
+    table, charges = economics_inputs(300, seed=4)
+    misaligned = pd.Series(charges.to_numpy(), index=list(reversed(charges.index)))
+    assert set(misaligned.index) == set(charges.index)
+
+    correct = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    wrong = analyze_economics(table, misaligned, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+    assert wrong.base_case.arpu_proxy != correct.base_case.arpu_proxy
+
+
+# ARPU
+
+
+def test_a_derived_arpu_is_the_group_mean_and_an_override_is_used_as_given():
+    table, charges = economics_inputs(300, seed=6)
+    group_ids = table["customer_id"][:30]
+
+    derived = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS).base_case
+    override = analyze_economics(
+        table, charges, 0.10, ECON_K_VALUES, EconomicsAssumptions(0.20, 3, 20.0, arpu_proxy=95.5)
+    ).base_case
+
+    assert derived.arpu_source == "derived"
+    assert derived.arpu_customers_used == 30
+    assert derived.arpu_proxy == pytest.approx(charges[group_ids].mean(), rel=1e-12)
+    assert override.arpu_source == "override"
+    assert override.arpu_customers_used is None
+    assert override.arpu_proxy == 95.5
+
+
+@pytest.mark.parametrize("arpu_override", [None, 95.5], ids=["derived", "override"])
+def test_the_multiples_apply_to_the_applicable_base_arpu(arpu_override):
+    table, charges = economics_inputs(300, seed=6)
+    assumptions = EconomicsAssumptions(0.20, 3, 20.0, arpu_proxy=arpu_override)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, assumptions)
+    base = results.base_case
+    rows = results.one_at_a_time
+    multiples = rows[rows["input"] == "arpu_multiple"]
+
+    for multiple, net in zip(multiples["value"], multiples["net_expected_value"]):
+        expected = (
+            base.expected_would_be_churners * 0.20 * base.arpu_proxy * multiple * 3
+            - base.customers_contacted * 20.0
+        )
+        assert net == pytest.approx(expected, rel=1e-9)
+
+
+def test_the_k_sweep_derives_the_arpu_per_k_without_an_override():
+    table, charges = economics_inputs(300, seed=7)
+
+    sweep = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS).k_sweep
+
+    for k, arpu in zip(sweep["k"], sweep["arpu_proxy"]):
+        size = top_k_count(300, k)
+        assert arpu == pytest.approx(charges[table["customer_id"][:size]].mean(), rel=1e-12)
+    assert sweep["arpu_proxy"].nunique() > 1
+
+
+def test_the_k_sweep_shares_one_override_for_every_k():
+    table, charges = economics_inputs(300, seed=7)
+    assumptions = EconomicsAssumptions(0.20, 3, 20.0, arpu_proxy=88.0)
+
+    sweep = analyze_economics(table, charges, 0.10, ECON_K_VALUES, assumptions).k_sweep
+
+    assert (sweep["arpu_proxy"] == 88.0).all()
+
+
+# Tables
+
+
+def test_table_shapes_labels_and_orders():
+    table, charges = economics_inputs(300, seed=8)
+
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+    rows = results.one_at_a_time
+    assert list(rows.columns) == [
+        "input", "value", "net_expected_value", "ev_per_contacted_customer", "break_even_save_rate",
+    ]
+    assert list(rows["input"]) == ["save_rate"] * 5 + ["months_kept"] * 4 + ["offer_cost"] * 4 + ["arpu_multiple"] * 3
+    assert list(rows["value"]) == [*SAVE_RATE_SWEEP, *MONTHS_KEPT_SWEEP, *OFFER_COST_SWEEP, *ARPU_MULTIPLES]
+    assert len(rows) == 16
+    assert (SAVE_RATE_SWEEP, MONTHS_KEPT_SWEEP, OFFER_COST_SWEEP, ARPU_MULTIPLES) == (
+        (0.05, 0.10, 0.20, 0.30, 0.40), (1, 3, 6, 12), (10, 20, 40, 60), (0.8, 1.0, 1.2),
+    )
+
+    by_months = results.save_rate_by_months
+    assert by_months.shape == (5, 4)
+    assert by_months.index.name == "save_rate" and list(by_months.index) == list(SAVE_RATE_SWEEP)
+    assert by_months.columns.name == "months_kept" and list(by_months.columns) == list(MONTHS_KEPT_SWEEP)
+
+    by_cost = results.break_even_by_cost_and_months
+    assert by_cost.shape == (4, 4)
+    assert by_cost.index.name == "months_kept" and list(by_cost.index) == list(MONTHS_KEPT_SWEEP)
+    assert by_cost.columns.name == "offer_cost" and list(by_cost.columns) == list(OFFER_COST_SWEEP)
+
+    sweep = results.k_sweep
+    assert list(sweep.columns) == [
+        "k", "customers_contacted", "arpu_proxy", "expected_would_be_churners",
+        "net_expected_value", "ev_per_contacted_customer", "break_even_save_rate",
+    ]
+    assert list(sweep["k"]) == ECON_K_VALUES
+
+
+def test_the_base_values_appear_once_in_each_one_at_a_time_list():
+    table, charges = economics_inputs(300, seed=8)
+
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    rows = results.one_at_a_time.set_index(["input", "value"])
+    base_rows = [
+        rows.loc[("save_rate", 0.20)], rows.loc[("months_kept", 3)],
+        rows.loc[("offer_cost", 20)], rows.loc[("arpu_multiple", 1.0)],
+    ]
+
+    for row in base_rows:
+        assert row["net_expected_value"] == pytest.approx(results.base_case.net_expected_value, rel=1e-12)
+        assert row["ev_per_contacted_customer"] == pytest.approx(
+            results.base_case.ev_per_contacted_customer, rel=1e-12
+        )
+        assert row["break_even_save_rate"] == pytest.approx(results.base_case.break_even_save_rate, rel=1e-12)
+
+
+def test_a_save_rate_by_months_cell_and_a_break_even_cell_match_a_direct_recomputation():
+    table, charges = economics_inputs(300, seed=8)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    base = results.base_case
+
+    net = base.expected_would_be_churners * 0.30 * base.arpu_proxy * 6 - base.customers_contacted * 20.0
+    break_even = base.customers_contacted * 40.0 / (base.arpu_proxy * 6 * base.expected_would_be_churners)
+
+    assert results.save_rate_by_months.loc[0.30, 6] == pytest.approx(net, rel=1e-9)
+    assert results.break_even_by_cost_and_months.loc[6, 40] == pytest.approx(break_even, rel=1e-9)
+
+
+def test_the_k_sweep_row_for_k_frac_matches_the_base_case():
+    table, charges = economics_inputs(300, seed=8)
+
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    row = results.k_sweep[results.k_sweep["k"] == 0.10].iloc[0]
+
+    assert row["customers_contacted"] == results.base_case.customers_contacted
+    assert row["arpu_proxy"] == results.base_case.arpu_proxy
+    assert row["expected_would_be_churners"] == results.base_case.expected_would_be_churners
+    assert row["net_expected_value"] == results.base_case.net_expected_value
+    assert row["ev_per_contacted_customer"] == results.base_case.ev_per_contacted_customer
+    assert row["break_even_save_rate"] == results.base_case.break_even_save_rate
+
+
+def test_group_sizes_for_a_reference_sized_table():
+    table, charges = economics_inputs(1408, seed=9)
+
+    sweep = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS).k_sweep
+
+    assert list(sweep["customers_contacted"]) == [70, 141, 211, 282, 352]
+
+
+# Consistency guard
+
+
+def test_flagged_group_equals_the_in_top_k_rows():
+    table, charges = economics_inputs(300, seed=10)
+
+    group = flagged_group(table, charges, 0.10)
+
+    assert list(group.columns) == ["customer_id", "churn_probability", "monthly_charge"]
+    assert list(group["customer_id"]) == list(table[table["in_top_k"]]["customer_id"])
+    assert list(group["monthly_charge"]) == [charges[c] for c in group["customer_id"]]
+    assert (np.diff(group["churn_probability"].to_numpy()) <= 0).all()
+
+
+def test_the_guard_refuses_an_in_top_k_column_that_is_not_boolean():
+    table, charges = economics_inputs(300, seed=10)
+    table["in_top_k"] = table["in_top_k"].astype(int)
+
+    with pytest.raises(EconomicsError, match="in_top_k must be a boolean"):
+        analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+
+def test_the_guard_refuses_a_wrong_flag_count_and_names_both_counts():
+    table, charges = economics_inputs(300, seed=10)
+    table.loc[40, "in_top_k"] = True
+
+    with pytest.raises(EconomicsError) as exc_info:
+        analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+    assert "31" in str(exc_info.value) and "30" in str(exc_info.value)
+
+
+def test_the_guard_refuses_the_right_count_with_the_wrong_customers():
+    table, charges = economics_inputs(300, seed=10)
+    table.loc[0, "in_top_k"] = False
+    table.loc[40, "in_top_k"] = True
+
+    with pytest.raises(EconomicsError, match="not the first 30 rows by rank"):
+        analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+
+# Refusals
+
+
+def with_probability(position, value):
+    def mutate(table, charges):
+        table = table.copy()
+        table["churn_probability"] = table["churn_probability"].astype(object)
+        table.at[position, "churn_probability"] = value
+        return table, charges
+
+    return mutate
+
+
+def with_charge(position, value):
+    def mutate(table, charges):
+        charges = charges.astype(object)
+        charges[table["customer_id"][position]] = value
+        return table, charges
+
+    return mutate
+
+
+def with_rank(values, dtype="int64"):
+    def mutate(table, charges):
+        table = table.copy()
+        table["rank"] = pd.Series(values(len(table)), dtype=dtype)
+        return table, charges
+
+    return mutate
+
+
+def drop_series_id(table, charges):
+    return table, charges.drop(table["customer_id"][5])
+
+
+def add_series_id(table, charges):
+    return table, pd.concat([charges, pd.Series([50.0], index=["UNKNOWN"])])
+
+
+def duplicate_series_id(table, charges):
+    return table, pd.concat([charges, charges.iloc[[3]]])
+
+
+def duplicate_table_id(table, charges):
+    table = table.copy()
+    table.loc[7, "customer_id"] = table.loc[6, "customer_id"]
+    return table, charges
+
+
+def zero_charges(table, charges):
+    return table, charges * 0
+
+
+def zero_probabilities(table, charges):
+    table = table.copy()
+    table["churn_probability"] = 0.0
+    return table, charges
+
+
+def empty_table(table, charges):
+    return table.iloc[0:0], charges
+
+
+DATA_REFUSALS = {
+    "probability-nan": (with_probability(2, np.nan), "churn_probability is missing"),
+    "probability-none": (with_probability(2, None), "churn_probability is missing"),
+    "probability-inf": (with_probability(2, np.inf), "churn_probability is not finite"),
+    "probability-negative": (with_probability(2, -0.1), "outside [0, 1]"),
+    "probability-above-one": (with_probability(2, 1.5), "outside [0, 1]"),
+    "probability-text": (with_probability(2, "high"), "churn_probability is not a number"),
+    "probability-bool": (with_probability(2, True), "churn_probability is not a number"),
+    "charge-nan": (with_charge(4, np.nan), "monthly_charge is missing"),
+    "charge-none": (with_charge(4, None), "monthly_charge is missing"),
+    "charge-text": (with_charge(4, "80"), "monthly_charge is not a number"),
+    "charge-bool": (with_charge(4, True), "monthly_charge is not a number"),
+    "charge-inf": (with_charge(4, np.inf), "monthly_charge is not finite"),
+    "charge-negative": (with_charge(4, -1.0), "monthly_charge is negative"),
+    "series-missing-id": (drop_series_id, "monthly_charge has no value for customer"),
+    "series-extra-id": (add_series_id, "unknown customer 'UNKNOWN'"),
+    "series-duplicate-id": (duplicate_series_id, "duplicate customer_id in the monthly_charge index"),
+    "table-duplicate-id": (duplicate_table_id, "duplicate customer_id in the table"),
+    "rank-gap": (with_rank(lambda n: [*range(1, n - 1), n + 1, n + 2]), "complete 1.."),
+    "rank-duplicate": (with_rank(lambda n: [1, *range(1, n)]), "complete 1.."),
+    "rank-zero-based": (with_rank(lambda n: range(n)), "complete 1.."),
+    "rank-float": (with_rank(lambda n: np.arange(1, n + 1), dtype="float64"), "rank must be a complete integer"),
+    "probability-huge-int": (with_probability(2, 10**400), "churn_probability is not finite"),
+    "charge-huge-int": (with_charge(4, 10**400), "monthly_charge is not finite"),
+    "rank-bool": (with_rank(lambda n: [True] * n, dtype="bool"), "rank must be a complete integer"),
+    "rank-missing": (
+        with_rank(lambda n: [*range(1, n), pd.NA], dtype="Int64"),
+        "rank must be a complete integer",
+    ),
+    "derived-arpu-not-positive": (zero_charges, "derived ARPU proxy is not above 0"),
+    "probability-sum-zero": (zero_probabilities, "sum of the churn probabilities of the group is 0"),
+    "empty-table": (empty_table, "no rows"),
+}
+
+
+@pytest.mark.parametrize(
+    "mutate,fragment", list(DATA_REFUSALS.values()), ids=list(DATA_REFUSALS)
+)
+def test_unusable_data_is_refused_with_economics_error(mutate, fragment):
+    table, charges = economics_inputs(300, seed=11)
+    table, charges = mutate(table, charges)
+
+    with pytest.raises(EconomicsError) as exc_info:
+        analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+
+    assert fragment in str(exc_info.value)
+
+
+def test_flagged_group_refuses_unusable_data_too():
+    table, charges = economics_inputs(300, seed=11)
+
+    with pytest.raises(EconomicsError, match="monthly_charge has no value"):
+        flagged_group(table, charges.drop(table["customer_id"][5]), 0.10)
+
+
+CALLER_MISTAKES = {
+    "table-not-a-dataframe": lambda t, c: dict(table=t.to_dict()),
+    "missing-rank-column": lambda t, c: dict(table=t.drop(columns=["rank"])),
+    "missing-in-top-k-column": lambda t, c: dict(table=t.drop(columns=["in_top_k"])),
+    "series-not-a-series": lambda t, c: dict(monthly_charge=c.tolist()),
+    "k-zero": lambda t, c: dict(k_frac=0),
+    "k-above-one": lambda t, c: dict(k_frac=1.5),
+    "k-bool": lambda t, c: dict(k_frac=True),
+    "k-values-empty": lambda t, c: dict(k_values=[]),
+    "k-values-bad-entry": lambda t, c: dict(k_values=[0.1, 0]),
+    "assumptions-wrong-type": lambda t, c: dict(assumptions={"save_rate": 0.2}),
+}
+
+
+@pytest.mark.parametrize("build", list(CALLER_MISTAKES.values()), ids=list(CALLER_MISTAKES))
+def test_caller_mistakes_raise_value_error(build):
+    table, charges = economics_inputs(300, seed=12)
+    arguments = dict(
+        table=table, monthly_charge=charges, k_frac=0.10, k_values=ECON_K_VALUES, assumptions=ECON_ASSUMPTIONS
+    )
+    arguments.update(build(table, charges))
+
+    with pytest.raises(ValueError):
+        analyze_economics(**arguments)
+
+
+@pytest.mark.parametrize("bad_k", [0, -0.1, 1.5, True, None, "0.1"], ids=repr)
+def test_flagged_group_rejects_a_bad_k(bad_k):
+    table, charges = economics_inputs(300, seed=12)
+
+    with pytest.raises(ValueError):
+        flagged_group(table, charges, bad_k)
+
+
+BAD_ASSUMPTIONS = [
+    ("save_rate", v) for v in (0, -0.1, 1.5, True, "0.2", np.nan, np.inf, None, 10**400)
+] + [
+    ("months_kept", v) for v in (0, -3, 2.5, 3.0, True, "3", np.nan, None, 10**400)
+] + [
+    ("offer_cost", v) for v in (0, -5, True, "20", np.nan, np.inf, None, 10**400)
+] + [
+    ("arpu_proxy", v) for v in (0, -80, True, "80", np.nan, np.inf, 10**400)
+]
+
+
+@pytest.mark.parametrize("name,value", BAD_ASSUMPTIONS)
+def test_bad_assumptions_raise_value_error_and_never_overflow(name, value):
+    arguments = {"save_rate": 0.20, "months_kept": 3, "offer_cost": 20.0, "arpu_proxy": None}
+    arguments[name] = value
+
+    with pytest.raises(ValueError, match=name):
+        EconomicsAssumptions(**arguments)
+
+
+def test_good_assumptions_are_accepted():
+    assumptions = EconomicsAssumptions(0.2, 3, 20, 80)
+
+    assert (assumptions.save_rate, assumptions.months_kept) == (0.2, 3)
+    assert EconomicsAssumptions(1, 1, 0.5, None).arpu_proxy is None
+
+
+def test_the_inputs_are_not_changed_by_a_call():
+    table, charges = economics_inputs(300, seed=13)
+    table_before, charges_before = table.copy(deep=True), charges.copy(deep=True)
+
+    analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    flagged_group(table, charges, 0.10)
+
+    pd.testing.assert_frame_equal(table, table_before)
+    pd.testing.assert_series_equal(charges, charges_before)
+
+
+def test_economics_py_imports_only_the_allowed_modules_and_never_the_target():
+    tree = ast.parse(inspect.getsource(economics))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module if node.module.startswith("retention_platform") else node.module.split(".")[0])
+
+    assert imported <= {"__future__", "math", "dataclasses", "numpy", "pandas", "retention_platform.inference.ranking"}
+    assert TARGET_COLUMN not in inspect.getsource(economics)
