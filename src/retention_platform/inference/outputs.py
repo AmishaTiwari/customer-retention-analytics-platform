@@ -23,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from retention_platform.inference.drivers import DIRECTION_LOWERS, DIRECTION_RAISES, DRIVER_LABELS
+from retention_platform.inference.ranking import assign_risk_tiers
 from retention_platform.models.persist import (
     HELD_OUT_RESULTS_REFERENCE,
     TRAINING_CV_ESTIMATE_TYPE,
@@ -44,6 +46,22 @@ MODEL_RUN_ID_LABEL = "Model run ID: "
 
 _TEMP_PREFIX = ".tmp-"
 _TABLE_COLUMNS = ["customer_id", "churn_probability", "rank", "in_top_k"]
+EXTENDED_TABLE_COLUMNS = [
+    *_TABLE_COLUMNS,
+    "risk_tier",
+    "driver_1",
+    "driver_1_direction",
+    "driver_2",
+    "driver_2_direction",
+    "driver_3",
+    "driver_3_direction",
+]
+RISK_TIERS = ("High", "Medium", "Low")
+_DRIVER_PAIRS = (
+    ("driver_1", "driver_1_direction"),
+    ("driver_2", "driver_2_direction"),
+    ("driver_3", "driver_3_direction"),
+)
 _MODEL_HEALTH_KEYS = [
     "trained_at_utc",
     "package_version",
@@ -218,6 +236,94 @@ def outreach_csv_bytes(table: pd.DataFrame) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
+def check_extended_outreach_table(table: pd.DataFrame, k_frac: float, medium_edge: float) -> None:
+    """Raise OutputGenerationError unless the table is a usable eleven-column
+    outreach table.
+
+    The four v1 columns get the v1 checks. risk_tier must follow rank by the
+    tier rule for k_frac and medium_edge, High exactly when in_top_k is True.
+    Every driver is a label of the label map, a customer's three drivers are
+    different, and every direction is one of the two allowed values.
+    """
+    if list(table.columns) != EXTENDED_TABLE_COLUMNS:
+        raise OutputGenerationError(
+            f"the outreach table must have exactly the columns {EXTENDED_TABLE_COLUMNS}, "
+            f"got {list(table.columns)}"
+        )
+    _check_table(table[_TABLE_COLUMNS])
+    if not (
+        _is_number(k_frac)
+        and _is_number(medium_edge)
+        and 0 < k_frac < medium_edge <= 1
+    ):
+        raise OutputGenerationError(
+            f"k_frac ({k_frac!r}) and medium_edge ({medium_edge!r}) must be numbers "
+            "with 0 < k_frac < medium_edge <= 1"
+        )
+
+    ids = table["customer_id"].tolist()
+    tiers = table["risk_tier"].tolist()
+    for customer, tier in zip(ids, tiers):
+        if not isinstance(tier, str) or tier not in RISK_TIERS:
+            raise OutputGenerationError(
+                f"risk_tier is not High, Medium or Low for customer {customer!r}: {tier!r}"
+            )
+    try:
+        expected = assign_risk_tiers(table["rank"].reset_index(drop=True), k_frac, medium_edge)
+    except ValueError as exc:
+        raise OutputGenerationError(f"the ranks cannot be turned into risk tiers: {exc}") from exc
+    for customer, tier, wanted, flagged in zip(ids, tiers, expected.tolist(), table["in_top_k"].tolist()):
+        if (tier == "High") != bool(flagged):
+            raise OutputGenerationError(
+                f"risk_tier is {tier} but in_top_k is {bool(flagged)} for customer {customer!r}: "
+                "High must be exactly the flagged customers"
+            )
+        if tier != wanted:
+            raise OutputGenerationError(
+                f"risk_tier does not follow rank for customer {customer!r}: expected {wanted}, got {tier}"
+            )
+
+    allowed_labels = set(DRIVER_LABELS.values())
+    allowed_directions = (DIRECTION_RAISES, DIRECTION_LOWERS)
+    drivers = [table[driver].tolist() for driver, _ in _DRIVER_PAIRS]
+    directions = [table[direction].tolist() for _, direction in _DRIVER_PAIRS]
+    for position, customer in enumerate(ids):
+        shown = []
+        for (driver_column, direction_column), labels, kinds in zip(_DRIVER_PAIRS, drivers, directions):
+            label, direction = labels[position], kinds[position]
+            if not isinstance(label, str) or not label.strip():
+                raise OutputGenerationError(f"{driver_column} is empty or not text for customer {customer!r}")
+            if label not in allowed_labels:
+                raise OutputGenerationError(
+                    f"{driver_column} is not a label of the label map for customer {customer!r}: {label!r}"
+                )
+            if direction not in allowed_directions:
+                raise OutputGenerationError(
+                    f"{direction_column} is not {DIRECTION_RAISES!r} or {DIRECTION_LOWERS!r} "
+                    f"for customer {customer!r}: {direction!r}"
+                )
+            shown.append(label)
+        if len(set(shown)) != len(shown):
+            raise OutputGenerationError(f"the three drivers of customer {customer!r} are not all different")
+
+
+def extended_outreach_csv_bytes(table: pd.DataFrame, k_frac: float, medium_edge: float) -> bytes:
+    """The eleven-column outreach list as UTF-8 CSV bytes, written the same
+    way as outreach_csv_bytes: one header row, no index, LF line endings,
+    in_top_k as True or False, each probability with its shortest exact text."""
+    check_extended_outreach_table(table, k_frac, medium_edge)
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(EXTENDED_TABLE_COLUMNS)
+    columns = [table[name].tolist() for name in EXTENDED_TABLE_COLUMNS]
+    for customer_id, probability, rank, flagged, *rest in zip(*columns):
+        writer.writerow(
+            [customer_id, repr(float(probability)), str(int(rank)), str(bool(flagged)), *rest]
+        )
+    return buffer.getvalue().encode("utf-8")
+
+
 def summary_json_bytes(summary: dict) -> bytes:
     """The run summary as indented UTF-8 JSON bytes with a trailing newline."""
     try:
@@ -297,3 +403,38 @@ def publish_outputs(
 
     logger.info("Published %s and %s", csv_path, summary_path)
     return csv_path, summary_path
+
+
+def write_extended_outreach_csv(
+    outputs_dir: str | Path, table: pd.DataFrame, k_frac: float, medium_edge: float
+) -> Path:
+    """Replace the outreach CSV in outputs_dir with the eleven-column list.
+
+    The file goes through a temporary file in the same folder and is then
+    replaced as a whole. Returns the path of the CSV.
+    """
+    csv_bytes = extended_outreach_csv_bytes(table, k_frac, medium_edge)
+
+    folder = Path(outputs_dir)
+    csv_path = folder / OUTREACH_FILE
+    csv_temp = folder / (_TEMP_PREFIX + OUTREACH_FILE)
+
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        _write_file(csv_temp, csv_bytes)
+    except OSError as exc:
+        _remove_quietly(csv_temp)
+        raise OutputGenerationError(
+            f"the outreach list could not be written to a temporary file in {folder}: {exc}"
+        ) from exc
+
+    try:
+        os.replace(csv_temp, csv_path)
+    except OSError as exc:
+        _remove_quietly(csv_temp)
+        raise OutputPublicationError(
+            f"Publication failed: {csv_path.name} was not replaced. Cause: {exc}",
+            csv_replaced=False,
+            summary_replaced=False,
+        ) from exc
+    return csv_path

@@ -64,6 +64,7 @@ from retention_platform.inference.economics import (
     render_economics_document,
 )
 from retention_platform.inference.outputs import (
+    EXTENDED_TABLE_COLUMNS,
     MODEL_RUN_ID_LABEL,
     OUTREACH_FILE,
     SCORING_RUN_ID_LABEL,
@@ -72,10 +73,13 @@ from retention_platform.inference.outputs import (
     OutputGenerationError,
     OutputPublicationError,
     build_run_summary,
+    check_extended_outreach_table,
     document_header,
+    extended_outreach_csv_bytes,
     outreach_csv_bytes,
     publish_outputs,
     summary_json_bytes,
+    write_extended_outreach_csv,
 )
 from retention_platform.inference.recommendations import (
     ACTIONABILITY,
@@ -1706,6 +1710,375 @@ def test_a_bad_model_run_id_is_refused(bad):
 def test_a_bad_title_is_refused(title):
     with pytest.raises(OutputGenerationError, match="title"):
         document_header(title, "20261011T123500Z", "20261011T120000Z")
+
+
+# Eleven-column outreach list
+
+EXTENDED_COLUMNS = [
+    "customer_id",
+    "churn_probability",
+    "rank",
+    "in_top_k",
+    "risk_tier",
+    "driver_1",
+    "driver_1_direction",
+    "driver_2",
+    "driver_2_direction",
+    "driver_3",
+    "driver_3_direction",
+]
+EXT_K = 0.2
+EXT_EDGE = 0.5
+EXT_IDS = [f"C{i:02d}" for i in range(1, 11)]
+EXT_PROBABILITIES = [0.95, 0.90, 0.80, 0.70, 0.60, 0.40, 0.30, 0.20, 0.10, 0.05]
+EXT_TIERS = ["High"] * 2 + ["Medium"] * 3 + ["Low"] * 5
+EXT_LABEL_KEYS = ["contract", "monthly_charge", "tenure_in_months", "age", "latitude", "dependents"]
+EXT_DIRECTIONS = [DIRECTION_RAISES, DIRECTION_LOWERS]
+
+
+def extended_table():
+    """Ten customers; each row's three drivers are three different labels."""
+    labels = [DRIVER_LABELS[key] for key in EXT_LABEL_KEYS]
+    data = {
+        "customer_id": pd.Series(EXT_IDS, dtype=object),
+        "churn_probability": pd.Series(EXT_PROBABILITIES, dtype="float64"),
+        "rank": pd.Series(range(1, 11), dtype="int64"),
+        "in_top_k": pd.Series([True, True] + [False] * 8, dtype=bool),
+        "risk_tier": pd.Series(EXT_TIERS, dtype=object),
+    }
+    for slot in range(3):
+        data[f"driver_{slot + 1}"] = pd.Series([labels[(row + slot) % 6] for row in range(10)], dtype=object)
+        data[f"driver_{slot + 1}_direction"] = pd.Series(
+            [EXT_DIRECTIONS[(row + slot) % 2] for row in range(10)], dtype=object
+        )
+    return pd.DataFrame(data)[EXTENDED_COLUMNS]
+
+
+def extended_bytes(table=None):
+    return extended_outreach_csv_bytes(extended_table() if table is None else table, EXT_K, EXT_EDGE)
+
+
+def expected_extended_rows(table):
+    return [
+        [
+            row.customer_id,
+            repr(float(row.churn_probability)),
+            str(int(row.rank)),
+            str(bool(row.in_top_k)),
+            row.risk_tier,
+            row.driver_1,
+            row.driver_1_direction,
+            row.driver_2,
+            row.driver_2_direction,
+            row.driver_3,
+            row.driver_3_direction,
+        ]
+        for row in table.itertuples(index=False)
+    ]
+
+
+def test_the_extended_column_names_are_the_eleven_of_the_contract():
+    assert EXTENDED_TABLE_COLUMNS == EXTENDED_COLUMNS
+    assert len(EXTENDED_COLUMNS) == 11
+
+
+def test_a_hand_made_eleven_column_table_is_accepted_and_every_cell_reads_back():
+    table = extended_table()
+
+    check_extended_outreach_table(table, EXT_K, EXT_EDGE)
+    rows = parse_csv(extended_bytes(table))
+
+    assert rows[0] == EXTENDED_COLUMNS
+    assert rows[1:] == expected_extended_rows(table)
+    assert len(rows) == 11
+
+
+def test_the_extended_csv_has_the_exact_header_line_and_plain_cells():
+    data = extended_bytes()
+    rows = parse_csv(data)
+
+    assert data.decode("utf-8").split("\n")[0] == ",".join(EXTENDED_COLUMNS)
+    assert all(cell != "" for row in rows for cell in row)
+    assert all(len(row) == 11 for row in rows)
+    assert {row[3] for row in rows[1:]} == {"True", "False"}
+    assert {row[4] for row in rows[1:]} == {"High", "Medium", "Low"}
+    assert b"\r" not in data and data.endswith(b"\n")
+    assert data.decode("utf-8").isascii()
+
+
+def test_the_first_four_columns_are_written_as_the_four_column_writer_writes_them():
+    table = extended_table()
+
+    extended_lines = extended_bytes(table).decode("utf-8").split("\n")
+    four_lines = outreach_csv_bytes(table[TABLE_COLUMNS]).decode("utf-8").split("\n")
+
+    assert extended_lines[-1] == four_lines[-1] == ""
+    for extended, four in zip(extended_lines[1:-1], four_lines[1:-1]):
+        assert extended.startswith(four + ",")
+    assert extended_lines[0].startswith(four_lines[0] + ",")
+
+
+def test_the_extended_output_is_deterministic_and_leaves_the_table_unchanged():
+    table = extended_table()
+    before = table.copy(deep=True)
+
+    first = extended_bytes(table)
+    second = extended_bytes(table)
+
+    assert first == second
+    pd.testing.assert_frame_equal(table, before)
+
+
+def test_the_tier_counts_of_the_hand_made_table_follow_the_rule():
+    tiers = assign_risk_tiers(extended_table()["rank"], EXT_K, EXT_EDGE)
+
+    assert [int((tiers == name).sum()) for name in ("High", "Medium", "Low")] == [2, 3, 5]
+    assert list(tiers) == EXT_TIERS
+
+
+def with_cell(column, position, value):
+    def mutate(table):
+        table = table.copy()
+        table[column] = table[column].astype(object)
+        table.at[position, column] = value
+        return table
+
+    return mutate
+
+
+def renamed(old, new):
+    return lambda table: table.rename(columns={old: new})
+
+
+def swapped(first, second):
+    def mutate(table):
+        order = list(table.columns)
+        a, b = order.index(first), order.index(second)
+        order[a], order[b] = order[b], order[a]
+        return table[order]
+
+    return mutate
+
+
+def with_tiers(tiers):
+    def mutate(table):
+        table = table.copy()
+        table["risk_tier"] = pd.Series(tiers, dtype=object)
+        return table
+
+    return mutate
+
+
+EXTENDED_REFUSALS = {
+    "wrong-name": (renamed("risk_tier", "tier"), "exactly the columns"),
+    "wrong-order": (swapped("risk_tier", "driver_1"), "exactly the columns"),
+    "extra-column": (lambda t: t.assign(extra=1), "exactly the columns"),
+    "missing-column": (lambda t: t.drop(columns=["driver_3_direction"]), "exactly the columns"),
+    "four-column-table": (lambda t: t[TABLE_COLUMNS], "exactly the columns"),
+    "unknown-tier": (with_cell("risk_tier", 0, "Urgent"), "risk_tier is not High, Medium or Low"),
+    "tier-missing": (with_cell("risk_tier", 0, None), "risk_tier is not High, Medium or Low"),
+    "tier-in-lower-case": (with_cell("risk_tier", 0, "high"), "risk_tier is not High, Medium or Low"),
+    "high-without-the-flag": (with_cell("in_top_k", 0, False), "High must be exactly the flagged customers"),
+    "flag-without-high": (with_cell("in_top_k", 3, True), "risk_tier is Medium but in_top_k is True"),
+    "flag-on-a-low-customer": (with_cell("in_top_k", 7, True), "risk_tier is Low but in_top_k is True"),
+    "tier-does-not-follow-rank": (with_cell("risk_tier", 2, "Low"), "does not follow rank"),
+    "tier-counts-disagree": (
+        with_tiers(["High"] * 2 + ["Low"] * 8),
+        "does not follow rank",
+    ),
+    "all-low": (with_tiers(["Low"] * 10), "High must be exactly the flagged customers"),
+    "empty-driver": (with_cell("driver_2", 3, ""), "driver_2 is empty or not text"),
+    "blank-driver": (with_cell("driver_1", 3, "   "), "driver_1 is empty or not text"),
+    "driver-not-text": (with_cell("driver_3", 3, 5), "driver_3 is empty or not text"),
+    "driver-missing": (with_cell("driver_3", 3, None), "driver_3 is empty or not text"),
+    "driver-not-in-the-label-map": (with_cell("driver_1", 3, "Made up label"), "not a label of the label map"),
+    "driver-with-a-comma": (with_cell("driver_1", 3, "Contract, type"), "not a label of the label map"),
+    "driver-with-a-quotation-mark": (with_cell("driver_1", 3, 'Contract "type"'), "not a label of the label map"),
+    "driver-with-a-line-break": (with_cell("driver_1", 3, "Contract\ntype"), "not a label of the label map"),
+    "feature-name-instead-of-a-label": (with_cell("driver_1", 3, "contract"), "not a label of the label map"),
+    "repeated-driver": (
+        lambda t: with_cell("driver_3", 3, t.at[3, "driver_1"])(t),
+        "are not all different",
+    ),
+    "unknown-direction": (with_cell("driver_1_direction", 3, "up"), "driver_1_direction"),
+    "direction-in-another-case": (with_cell("driver_2_direction", 3, "Raises risk"), "driver_2_direction"),
+    "direction-missing": (with_cell("driver_3_direction", 3, None), "driver_3_direction"),
+    "probability-nan": (with_cell("churn_probability", 1, np.nan), "churn_probability"),
+    "probability-above-one": (with_cell("churn_probability", 1, 1.5), "churn_probability"),
+    "customer-id-empty": (with_cell("customer_id", 1, ""), "customer_id"),
+    "flag-not-boolean": (lambda t: t.assign(in_top_k=t["in_top_k"].astype(int)), "in_top_k"),
+    "rank-float": (lambda t: t.assign(rank=t["rank"].astype("float64")), "rank must be integers"),
+    "rank-gap": (lambda t: t.assign(rank=[1, 2, 3, 4, 5, 6, 7, 8, 9, 11]), "cannot be turned into risk tiers"),
+    "no-rows": (lambda t: t.iloc[0:0], "no rows"),
+}
+
+
+@pytest.mark.parametrize("mutate,fragment", list(EXTENDED_REFUSALS.values()), ids=list(EXTENDED_REFUSALS))
+def test_a_bad_extended_table_is_refused_with_the_failed_condition(mutate, fragment):
+    table = mutate(extended_table())
+
+    with pytest.raises(OutputGenerationError) as exc_info:
+        check_extended_outreach_table(table, EXT_K, EXT_EDGE)
+    with pytest.raises(OutputGenerationError):
+        extended_outreach_csv_bytes(table, EXT_K, EXT_EDGE)
+
+    assert fragment in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "position,column",
+    [(3, "driver_2"), (3, "risk_tier"), (0, "driver_1_direction")],
+    ids=["driver-refusal-names-the-customer", "tier-refusal-names-the-customer", "direction-refusal-names-the-customer"],
+)
+def test_a_refusal_names_the_customer_where_meaningful(position, column):
+    bad = {"driver_2": "", "risk_tier": "Urgent", "driver_1_direction": "up"}[column]
+    table = with_cell(column, position, bad)(extended_table())
+
+    with pytest.raises(OutputGenerationError, match=repr(EXT_IDS[position])):
+        check_extended_outreach_table(table, EXT_K, EXT_EDGE)
+
+
+@pytest.mark.parametrize(
+    "k_frac,medium_edge",
+    [(0.5, 0.5), (0.6, 0.5), (0.2, 1.5), (0, 0.5), (-0.1, 0.5), (True, 0.5), (0.2, True), (0.2, None), (None, 0.5),
+     ("0.2", 0.5), (float("nan"), 0.5), (0.2, float("nan")), (0.2, float("inf")), (10**400, 0.5), (0.2, 10**400)],
+    ids=repr,
+)
+def test_a_bad_k_and_medium_edge_pair_is_refused(k_frac, medium_edge):
+    with pytest.raises(OutputGenerationError, match="0 < k_frac < medium_edge <= 1"):
+        check_extended_outreach_table(extended_table(), k_frac, medium_edge)
+    with pytest.raises(OutputGenerationError):
+        extended_outreach_csv_bytes(extended_table(), k_frac, medium_edge)
+
+
+def test_a_pair_that_disagrees_with_the_tiers_in_the_table_is_refused():
+    with pytest.raises(OutputGenerationError, match="does not follow rank"):
+        check_extended_outreach_table(extended_table(), EXT_K, 0.3)
+
+
+def test_the_four_column_path_is_unchanged_and_still_refuses_an_eleven_column_table():
+    table = extended_table()
+
+    assert outreach_csv_bytes(table[TABLE_COLUMNS]).startswith(b"customer_id,churn_probability,rank,in_top_k\n")
+    with pytest.raises(OutputGenerationError, match="exactly the columns"):
+        outreach_csv_bytes(table)
+
+
+def test_customer_ids_with_a_comma_a_quotation_mark_and_a_line_break_read_back_unchanged():
+    table = extended_table()
+    table["customer_id"] = pd.Series(["a,b", 'say "hi"', "line\nbreak", *EXT_IDS[3:]], dtype=object)
+
+    rows = parse_csv(extended_bytes(table))
+
+    assert [row[0] for row in rows[1:4]] == ["a,b", 'say "hi"', "line\nbreak"]
+    assert rows[1:] == expected_extended_rows(table)
+
+
+def test_the_extended_writer_replaces_the_csv_through_a_temporary_file(tmp_path):
+    folder = tmp_path / "outputs"
+    folder.mkdir()
+    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
+
+    path = write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
+
+    assert path == folder / OUTREACH_FILE
+    assert path.read_bytes() == extended_bytes()
+    assert folder_names(folder) == [OUTREACH_FILE]
+
+
+def test_the_extended_writer_creates_a_missing_folder(tmp_path):
+    folder = tmp_path / "does" / "not" / "exist"
+
+    write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
+
+    assert folder_names(folder) == [OUTREACH_FILE]
+
+
+def test_a_failed_temporary_write_changes_nothing_for_the_extended_writer(tmp_path, monkeypatch):
+    folder = tmp_path / "outputs"
+    folder.mkdir()
+    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
+
+    def failing_write(path, data):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outputs, "_write_file", failing_write)
+
+    with pytest.raises(OutputGenerationError, match="disk full"):
+        write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
+
+    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
+    assert folder_names(folder) == [OUTREACH_FILE]
+
+
+def test_a_failed_replace_keeps_the_previous_csv_and_leaves_no_temporary_file(tmp_path, monkeypatch):
+    folder = tmp_path / "outputs"
+    folder.mkdir()
+    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
+
+    def failing_replace(source, target):
+        raise OSError("locked by another program")
+
+    monkeypatch.setattr(outputs.os, "replace", failing_replace)
+
+    with pytest.raises(OutputPublicationError, match="locked by another program") as exc_info:
+        write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
+
+    assert exc_info.value.csv_replaced is False
+    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
+    assert folder_names(folder) == [OUTREACH_FILE]
+
+
+def test_a_bad_table_is_refused_before_any_file_is_touched(tmp_path):
+    folder = tmp_path / "outputs"
+    folder.mkdir()
+    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
+
+    with pytest.raises(OutputGenerationError):
+        write_extended_outreach_csv(folder, with_cell("driver_1", 0, "nope")(extended_table()), EXT_K, EXT_EDGE)
+
+    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
+    assert folder_names(folder) == [OUTREACH_FILE]
+
+
+def real_extended_table(driver_data, driver_contributions, k_frac, medium_edge):
+    """The eleven-column table for the real population, assembled in the test
+    from score_batch, assign_risk_tiers, select_top_drivers and DRIVER_LABELS."""
+    frame = driver_data.inputs.copy()
+    frame.insert(0, "customer_id", pd.Series(driver_data.ids, dtype=object))
+    table = score_batch(frame, driver_data.run, k_frac)
+    selected = select_top_drivers(driver_contributions).loc[table["customer_id"]]
+    extended = table.copy()
+    extended["risk_tier"] = assign_risk_tiers(table["rank"], k_frac, medium_edge).to_numpy()
+    for slot in (1, 2, 3):
+        extended[f"driver_{slot}"] = [DRIVER_LABELS[name] for name in selected[f"driver_{slot}"]]
+        extended[f"driver_{slot}_direction"] = selected[f"driver_{slot}_direction"].to_numpy()
+    return extended[EXTENDED_COLUMNS]
+
+
+def test_the_real_population_table_is_accepted_written_and_read_back(
+    tmp_path, driver_data, driver_contributions
+):
+    table = real_extended_table(driver_data, driver_contributions, 0.10, 0.25)
+
+    check_extended_outreach_table(table, 0.10, 0.25)
+    path = write_extended_outreach_csv(tmp_path / "outputs", table, 0.10, 0.25)
+    rows = parse_csv(path.read_bytes())
+
+    assert rows[0] == EXTENDED_COLUMNS
+    assert len(rows) == 1 + 1408
+    tiers = [row[4] for row in rows[1:]]
+    assert [tiers.count(name) for name in ("High", "Medium", "Low")] == [141, 211, 1056]
+    assert tiers == ["High"] * 141 + ["Medium"] * 211 + ["Low"] * 1056
+    assert [row[3] for row in rows[1:]].count("True") == 141
+    assert all(cell != "" for row in rows for cell in row)
+    assert all(len({row[5], row[7], row[9]}) == 3 for row in rows[1:])
+    assert {row[6] for row in rows[1:]} | {row[8] for row in rows[1:]} | {row[10] for row in rows[1:]} <= {
+        DIRECTION_RAISES,
+        DIRECTION_LOWERS,
+    }
+    assert {row[5] for row in rows[1:]} <= set(DRIVER_LABELS.values())
+    assert [row[0] for row in rows[1:]] == list(table["customer_id"])
 
 
 # =============================================================================
