@@ -77,24 +77,47 @@ from retention_platform.inference.outputs import (
     summary_json_bytes,
 )
 from retention_platform.inference.recommendations import (
+    ACTIONABILITY,
     BREAK_EVEN_ABOVE_ONE_ACTION,
     BREAK_EVEN_ABOVE_ONE_FINDING,
     BREAK_EVEN_ACTION,
     BREAK_EVEN_FINDING,
     BREAK_EVEN_LIMIT_TEXT,
+    CATEGORY_INTRO,
+    CORRELATION_CAVEAT,
+    DRIVERS_CAVEAT,
+    DRIVERS_PARAGRAPH,
+    DRIVERS_TABLE_INTRO,
+    ECONOMICS_INTRO,
+    ECONOMICS_POINTER,
     FIBER_OPTIC_ACTION,
     FIBER_OPTIC_FINDING,
     HIGH_TIER_ACTION,
     HIGH_TIER_FINDING,
+    IMPORTANCE_INTRO,
+    INTERNET_TYPE_FIBER_OPTIC,
+    INTERNET_TYPE_IN_TOP,
+    INTERNET_TYPE_NOT_IN_TOP,
     LEAD_DRIVER_ACTION,
     LEAD_DRIVER_FINDING,
     LEAD_DRIVER_SHARE_MINIMUM,
+    LIMITATIONS_BULLETS,
+    LIST_COUNTS,
+    LIST_INTRO,
+    NO_RECOMMENDATION_TEXT,
+    PROFILE_INTRO,
+    TIER_HIGH,
+    TIER_INTRO,
+    TIER_LOW,
+    TIER_MEDIUM,
+    TOP_N_DRIVER_ROWS,
     NO_INTERNET_CATEGORY,
     PROFILE_CATEGORICAL_COLUMNS,
     TOP_N_IMPORTANCE,
     Recommendation,
     RecommendationsError,
     compute_recommendation_facts,
+    render_recommendations_document,
     select_recommendations,
 )
 from retention_platform.inference.score import (
@@ -5032,6 +5055,7 @@ def test_recommendations_py_imports_only_allowed_modules_and_never_the_target():
     assert package <= {
         "retention_platform.inference.drivers",
         "retention_platform.inference.economics",
+        "retention_platform.inference.outputs",
         "retention_platform.inference.ranking",
     }
     assert all(name.startswith("retention_platform.inference") for name in package)
@@ -5440,3 +5464,593 @@ def test_the_facts_and_the_base_case_are_not_changed_by_a_call():
     pd.testing.assert_frame_equal(facts.categorical_profile["internet_type"], frames_before["internet"])
     assert base_case == hand_base_case()
     assert labels == DRIVER_LABELS
+
+
+# Recommendations document
+
+ADR_SECTION_TITLES = [
+    "What the list is",
+    "Risk tiers and their counts",
+    "Profile of the top-K outreach group",
+    "Global feature importance",
+    "Customer-level drivers and how to interpret them",
+    "Headline economics",
+    "Business recommendations",
+    "Limitations",
+]
+DOCUMENT_TEMPLATES = {
+    "LIST_INTRO": LIST_INTRO,
+    "LIST_COUNTS": LIST_COUNTS,
+    "TIER_INTRO": TIER_INTRO,
+    "TIER_HIGH": TIER_HIGH,
+    "TIER_MEDIUM": TIER_MEDIUM,
+    "TIER_LOW": TIER_LOW,
+    "PROFILE_INTRO": PROFILE_INTRO,
+    "CATEGORY_INTRO": CATEGORY_INTRO,
+    "IMPORTANCE_INTRO": IMPORTANCE_INTRO,
+    "INTERNET_TYPE_IN_TOP": INTERNET_TYPE_IN_TOP,
+    "INTERNET_TYPE_NOT_IN_TOP": INTERNET_TYPE_NOT_IN_TOP,
+    "INTERNET_TYPE_FIBER_OPTIC": INTERNET_TYPE_FIBER_OPTIC,
+    "CORRELATION_CAVEAT": CORRELATION_CAVEAT,
+    "DRIVERS_PARAGRAPH": DRIVERS_PARAGRAPH,
+    "DRIVERS_TABLE_INTRO": DRIVERS_TABLE_INTRO,
+    "DRIVERS_CAVEAT": DRIVERS_CAVEAT,
+    "ACTIONABILITY": ACTIONABILITY,
+    "ECONOMICS_INTRO": ECONOMICS_INTRO,
+    "ECONOMICS_POINTER": ECONOMICS_POINTER,
+    "NO_RECOMMENDATION_TEXT": NO_RECOMMENDATION_TEXT,
+    "LIMITATIONS": " ".join(LIMITATIONS_BULLETS),
+}
+CAUSE_ALLOWED_SENTENCES = [LEAD_DRIVER_ACTION, FIBER_OPTIC_ACTION, INTERNET_TYPE_FIBER_OPTIC]
+
+
+def render_recommendations(facts=None, recommendations=None, base_case=None, labels=None, **overrides):
+    facts = hand_facts() if facts is None else facts
+    base_case = hand_base_case() if base_case is None else base_case
+    labels = DRIVER_LABELS if labels is None else labels
+    if recommendations is None:
+        recommendations = select_recommendations(facts, base_case, labels)
+    arguments = dict(
+        facts=facts,
+        recommendations=recommendations,
+        base_case=base_case,
+        labels=labels,
+        k_frac=FACT_K,
+        medium_edge=FACT_EDGE,
+        scoring_run_id=DOC_SCORING_RUN_ID,
+        model_run_id=DOC_MODEL_RUN_ID,
+    )
+    arguments.update(overrides)
+    return render_recommendations_document(**arguments)
+
+
+def facts_with_empty_medium_tier(facts):
+    tiers = facts.tiers.copy()
+    tiers.loc["Medium", "customers"] = 0
+    tiers.loc["Medium", "share"] = 0.0
+    tiers.loc["Medium", "min_probability"] = np.nan
+    tiers.loc["Medium", "max_probability"] = np.nan
+    return dataclasses.replace(facts, tiers=tiers)
+
+
+def document_variants():
+    facts = hand_facts()
+    not_in_top = compute_recommendation_facts(**fact_arguments(internet_position=11))
+    no_fiber = facts_without_fiber(facts)
+    variants = [
+        ("all-four", facts, hand_base_case(0.104)),
+        ("above-one", facts, hand_base_case(1.5)),
+        ("exactly-one", facts, hand_base_case(1.0)),
+        ("empty-medium-tier", facts_with_empty_medium_tier(facts), hand_base_case(0.104)),
+        ("no-fiber", no_fiber, hand_base_case(0.104)),
+        ("internet-type-not-in-top", not_in_top, hand_base_case(0.104)),
+    ]
+    return variants
+
+
+DOCUMENT_VARIANT_IDS = [variant[0] for variant in document_variants()]
+
+
+def section_text(text, title):
+    start = text.index(f"## {title}\n")
+    following = text.find("\n## ", start + 1)
+    return text[start : following if following != -1 else len(text)]
+
+
+def test_the_document_header_is_the_four_fixed_lines():
+    text = render_recommendations()
+    lines = text.split("\n")
+
+    assert lines[:4] == [
+        "# Business Recommendations",
+        "",
+        f"Scoring run ID: {DOC_SCORING_RUN_ID}",
+        f"Model run ID: {DOC_MODEL_RUN_ID}",
+    ]
+    assert lines[1] == ""
+    assert re.fullmatch(r"Scoring run ID: (\d{8}T\d{6}Z)", lines[2]).group(1) == DOC_SCORING_RUN_ID
+    assert re.fullmatch(r"Model run ID: (\d{8}T\d{6}Z)", lines[3]).group(1) == DOC_MODEL_RUN_ID
+    assert text.startswith(document_header("Business Recommendations", DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID))
+
+
+@pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
+def test_the_eight_adr_sections_appear_once_each_in_order(name, facts, base_case):
+    text = render_recommendations(facts, base_case=base_case)
+
+    assert [line[3:] for line in text.split("\n") if line.startswith("## ")] == ADR_SECTION_TITLES
+    assert [line for line in text.split("\n") if line.startswith("# ")] == ["# Business Recommendations"]
+    assert not any(line.startswith("###") for line in text.split("\n"))
+
+
+def test_what_the_list_is_section_for_the_hand_made_facts():
+    section = section_text(render_recommendations(), "What the list is")
+
+    assert "10 customers were scored and 2 are flagged for outreach: the top 20% of the scored customers by churn probability." in section
+    assert SNAPSHOT_NOTICE in section
+
+
+def test_risk_tier_table_and_definitions_for_the_hand_made_facts():
+    section = section_text(render_recommendations(), "Risk tiers and their counts")
+    table = markdown_tables(section)[0]
+
+    assert table[0] == [
+        "Tier", "Customers", "Share of scored customers", "Lowest churn probability", "Highest churn probability",
+    ]
+    assert table[1:] == [
+        ["High", "2", "20.0%", "90.0%", "95.0%"],
+        ["Medium", "3", "30.0%", "60.0%", "80.0%"],
+        ["Low", "5", "50.0%", "5.0%", "40.0%"],
+    ]
+    assert "High is the top 20% of customers by churn probability; these are the customers flagged in the outreach list." in section
+    assert "Medium is the next customers, up to the top 50% of customers by churn probability." in section
+    assert "Low is all remaining customers." in section
+
+
+def test_an_empty_tier_prints_n_a_and_never_nan():
+    text = render_recommendations(facts_with_empty_medium_tier(hand_facts()))
+    table = markdown_tables(section_text(text, "Risk tiers and their counts"))[0]
+
+    assert table[2] == ["Medium", "0", "0.0%", "n/a", "n/a"]
+    assert not re.search(r"\b(nan|inf|None)\b", text, flags=re.IGNORECASE)
+
+
+def test_group_profile_tables_for_the_hand_made_facts():
+    section = section_text(render_recommendations(), "Profile of the top-K outreach group")
+    tables = markdown_tables(section)
+
+    assert "The tables compare the 2 flagged customers with all 10 scored customers." in section
+    assert tables[0] == [
+        ["Characteristic", "Flagged customers (mean)", "All scored customers (mean)"],
+        ["Monthly charge (currency units per month)", "90.00", "55.00"],
+        ["Tenure in months", "3.0", "11.0"],
+    ]
+    assert tables[1][0][0] == "Contract type"
+    assert tables[1][1:] == [
+        ["Month-to-Month", "2", "100.0%", "4", "40.0%"],
+        ["One Year", "0", "0.0%", "3", "30.0%"],
+        ["Two Year", "0", "0.0%", "3", "30.0%"],
+    ]
+    assert tables[2][0][0] == "Internet connection type"
+    assert tables[2][1:] == [
+        ["Fiber Optic", "1", "50.0%", "3", "30.0%"],
+        ["No Internet", "0", "0.0%", "3", "30.0%"],
+        ["Cable", "1", "50.0%", "2", "20.0%"],
+        ["DSL", "0", "0.0%", "2", "20.0%"],
+    ]
+
+
+def test_global_importance_table_and_paragraph_for_the_hand_made_facts():
+    section = section_text(render_recommendations(), "Global feature importance")
+    table = markdown_tables(section)[0]
+    importance = fact_importance(2)
+
+    assert table[0] == ["Rank", "Input", "Share of global importance"]
+    assert len(table) == 1 + 10
+    for shown, (feature, row) in zip(table[1:], importance.head(10).iterrows()):
+        assert shown == [str(int(row["rank"])), DRIVER_LABELS[feature], "{:.1f}%".format(row["share"] * 100)]
+    assert "The internet type is among the 10 most important inputs: it carries 12.1% of the model's global importance, and its rank is 3." in section
+
+
+def test_the_internet_type_paragraph_in_both_variants_and_its_place():
+    inside = render_recommendations()
+    outside = render_recommendations(compute_recommendation_facts(**fact_arguments(internet_position=11)))
+
+    assert "The internet type is among the 10 most important inputs: it carries" in inside
+    assert "is not among" not in inside
+    assert "The internet type is not among the 10 most important inputs: it carries 2.2% of the model's global importance, and its rank is 12." in outside
+    for text in (inside, outside):
+        lines = text.split("\n")
+        table_end = max(i for i, line in enumerate(lines) if line.startswith("|") and i < next(j for j, l in enumerate(lines) if l.startswith("The internet type")))
+        paragraph = next(i for i, line in enumerate(lines) if line.startswith("The internet type"))
+        drivers_heading = lines.index("## Customer-level drivers and how to interpret them")
+        assert table_end < paragraph < drivers_heading
+        assert lines[paragraph - 1] == "" and lines[table_end + 1] == ""
+
+
+def test_the_fiber_optic_sentence_only_appears_with_the_fiber_optic_category():
+    with_fiber = render_recommendations()
+    without_fiber = render_recommendations(facts_without_fiber(hand_facts()))
+
+    assert INTERNET_TYPE_FIBER_OPTIC in with_fiber
+    assert INTERNET_TYPE_FIBER_OPTIC not in without_fiber
+    assert "The internet type is among" in without_fiber
+
+
+def test_driver_table_for_the_hand_made_facts_and_the_fixed_paragraph():
+    section = section_text(render_recommendations(), "Customer-level drivers and how to interpret them")
+    table = markdown_tables(section)[0]
+
+    assert DRIVERS_PARAGRAPH in section
+    assert "The table shows the 4 inputs that lead most often among the flagged customers" in section
+    assert table[0] == ["Input", "First driver", "Among the three drivers", "Raises risk", "Lowers risk"]
+    assert table[1:] == [
+        ["Contract type", "2", "2", "2", "0"],
+        ["Monthly charge", "0", "2", "2", "0"],
+        ["Age", "0", "1", "0", "1"],
+        ["Tenure in months", "0", "1", "0", "1"],
+    ]
+
+
+def test_at_most_ten_driver_rows_are_shown():
+    data = seeded_fact_data()
+    facts = compute_recommendation_facts(**data)
+    assert len(facts.flagged_drivers) == 6
+    wide = pd.DataFrame(
+        {name: facts.flagged_drivers[name].iloc[0] for name in facts.flagged_drivers.columns}
+        | {},
+        index=[f"feature_{i:02d}" for i in range(14)],
+    )
+    wide.index.name = "feature"
+    facts = dataclasses.replace(facts, flagged_drivers=wide)
+    labels = {**DRIVER_LABELS, **{f"feature_{i:02d}": f"Feature {i}" for i in range(14)}}
+    base = BaseCase(30, 600.0, 20.0, 4.0, 400.0, 100.0, 3.3, 0.2, 80.0, "derived", 30)
+
+    text = render_recommendations_document(
+        facts, [], base, labels, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
+    )
+    table = markdown_tables(section_text(text, "Customer-level drivers and how to interpret them"))[0]
+
+    assert TOP_N_DRIVER_ROWS == 10
+    assert len(table) == 1 + 10
+    assert "The table shows the 10 inputs" in text
+
+
+def test_headline_economics_shows_only_the_four_base_case_figures():
+    section = section_text(render_recommendations(), "Headline economics")
+    tables = markdown_tables(section)
+
+    assert len(tables) == 1
+    assert tables[0] == [
+        ["Figure", "Value"],
+        ["Customers contacted", "2"],
+        ["Net expected value (currency units)", "60.00"],
+        ["Expected value per contacted customer (currency units)", "30.00"],
+        ["Break-even save rate", "10.4%"],
+    ]
+    assert "Simulated result under stated assumptions." in section
+    assert "economics_summary.md" in section
+    assert "sweep" in section
+
+
+@pytest.mark.parametrize(
+    "break_even,shown",
+    [(0.9999, "100.0%"), (1.0, "100.0%"), (1.0000001, "above 100%"), (2.5, "above 100%"), (0.104, "10.4%")],
+    ids=["just-below-one", "exactly-one", "just-above-one", "far-above-one", "normal"],
+)
+def test_the_headline_break_even_follows_the_recommendation_rule(break_even, shown):
+    text = render_recommendations(base_case=hand_base_case(break_even))
+
+    assert markdown_tables(section_text(text, "Headline economics"))[0][-1] == ["Break-even save rate", shown]
+
+
+def test_the_money_strings_equal_those_of_the_economics_document():
+    table, charges = economics_inputs(300, seed=21)
+    results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
+    economics_text = render_document(results, ECON_ASSUMPTIONS, 300)
+    economics_base = {row[0]: row[1] for row in markdown_tables(economics_text)[1][1:]}
+    facts = compute_recommendation_facts(**seeded_fact_data(n_rows=300))
+
+    text = render_recommendations_document(
+        facts, [], results.base_case, DRIVER_LABELS, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
+    )
+    economics_rows = {row[0]: row[1] for row in markdown_tables(section_text(text, "Headline economics"))[0][1:]}
+
+    for name in (
+        "Net expected value (currency units)",
+        "Expected value per contacted customer (currency units)",
+    ):
+        assert economics_rows[name] == economics_base[name]
+    assert economics_rows["Break-even save rate"] == economics_base["Break-even save rate"]
+
+
+def test_recommendations_are_embedded_in_the_given_order_with_exact_sentences():
+    recommendations = select_recommendations(hand_facts(), hand_base_case(), DRIVER_LABELS)
+    section = section_text(render_recommendations(), "Business recommendations")
+
+    lines = [line for line in section.split("\n") if line]
+    assert lines[1:] == [
+        part
+        for item in recommendations
+        for part in (f"Finding: {item.finding}", f"Action: {item.action}")
+    ]
+    reversed_section = section_text(
+        render_recommendations(recommendations=list(reversed(recommendations))), "Business recommendations"
+    )
+    assert reversed_section != section
+    assert [line for line in reversed_section.split("\n") if line][1] == f"Finding: {recommendations[-1].finding}"
+
+
+def test_an_empty_recommendation_list_prints_the_single_sentence():
+    section = section_text(render_recommendations(recommendations=[]), "Business recommendations")
+
+    assert [line for line in section.split("\n") if line] == [
+        "## Business recommendations",
+        "No recommendation applies to this run.",
+    ]
+
+
+def test_the_limitations_section_covers_the_required_points():
+    section = section_text(render_recommendations(), "Limitations").lower()
+
+    for fragment in ("snapshot", "not the reasons customers leave", "simulated results", "no outreach has been carried out or measured"):
+        assert fragment in section
+    assert section.count("\n- ") == 5
+
+
+# Rules over several variants
+
+
+@pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
+def test_no_banned_phrase_appears_in_the_document(name, facts, base_case):
+    text = render_recommendations(facts, base_case=base_case)
+
+    for phrase in BANNED_PHRASES:
+        assert re.search(rf"\b{re.escape(phrase)}\b", text, flags=re.IGNORECASE) is None, phrase
+
+
+@pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
+def test_cause_appears_only_in_the_fixed_sentences(name, facts, base_case):
+    text = render_recommendations(facts, base_case=base_case)
+
+    for sentence in CAUSE_ALLOWED_SENTENCES:
+        text = text.replace(sentence, "")
+
+    assert re.search(r"\bcauses?\b", text, flags=re.IGNORECASE) is None
+
+
+@pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
+def test_text_form_is_plain_ascii_with_lf_endings_and_one_trailing_newline(name, facts, base_case):
+    text = render_recommendations(facts, base_case=base_case)
+
+    assert text.isascii()
+    assert "\t" not in text and "\r" not in text
+    assert text.endswith("\n") and not text.endswith("\n\n")
+    assert not any(line != line.rstrip() for line in text.split("\n"))
+    assert "\n\n\n" not in text
+    for line in text.split("\n"):
+        assert not line.startswith(" ")
+
+
+def test_the_document_is_deterministic_and_leaves_the_inputs_unchanged():
+    facts, base_case = hand_facts(), hand_base_case()
+    recommendations = select_recommendations(facts, base_case, DRIVER_LABELS)
+    before = {
+        "tiers": facts.tiers.copy(deep=True),
+        "flagged": facts.flagged_drivers.copy(deep=True),
+        "importance": facts.importance_top.copy(deep=True),
+        "internet": facts.categorical_profile["internet_type"].copy(deep=True),
+    }
+    labels = dict(DRIVER_LABELS)
+
+    first = render_recommendations(facts, recommendations, base_case, labels)
+    second = render_recommendations(facts, recommendations, base_case, labels)
+
+    assert first == second
+    pd.testing.assert_frame_equal(facts.tiers, before["tiers"])
+    pd.testing.assert_frame_equal(facts.flagged_drivers, before["flagged"])
+    pd.testing.assert_frame_equal(facts.importance_top, before["importance"])
+    pd.testing.assert_frame_equal(facts.categorical_profile["internet_type"], before["internet"])
+    assert labels == DRIVER_LABELS
+    assert recommendations == select_recommendations(hand_facts(), hand_base_case(), DRIVER_LABELS)
+
+
+def test_the_document_templates_hold_no_digit_and_the_source_no_reference_run_literal():
+    digits = {name: re.findall(r"\d+", text) for name, text in DOCUMENT_TEMPLATES.items() if re.search(r"\d", text)}
+    source = inspect.getsource(recommendations)
+
+    assert digits == {}
+    for literal in ("20261014T164739Z", "1,408", "1408", "141", "0.0948", "78.13"):
+        assert literal not in source
+
+
+# Refusals and caller mistakes
+
+
+def document_arguments():
+    facts, base_case = hand_facts(), hand_base_case()
+    return dict(
+        facts=facts,
+        recommendations=select_recommendations(facts, base_case, DRIVER_LABELS),
+        base_case=base_case,
+        labels=dict(DRIVER_LABELS),
+        k_frac=FACT_K,
+        medium_edge=FACT_EDGE,
+        scoring_run_id=DOC_SCORING_RUN_ID,
+        model_run_id=DOC_MODEL_RUN_ID,
+    )
+
+
+def tiers_with_high_customers(facts, count):
+    tiers = facts.tiers.copy()
+    tiers.loc["High", "customers"] = count
+    return dataclasses.replace(facts, tiers=tiers)
+
+
+def with_first_record(arguments, **changes):
+    records = list(arguments["recommendations"])
+    records[0] = dataclasses.replace(records[0], **changes)
+    return records
+
+
+DOCUMENT_CALLER_MISTAKES = {
+    "facts-none": lambda a: dict(facts=None),
+    "facts-a-dict": lambda a: dict(facts={"tiers": 1}),
+    "recommendations-a-tuple": lambda a: dict(recommendations=tuple(a["recommendations"])),
+    "recommendations-hold-text": lambda a: dict(recommendations=["start"]),
+    "recommendations-repeat-an-identifier": lambda a: dict(recommendations=[a["recommendations"][0]] * 2),
+    "base-case-a-dict": lambda a: dict(base_case={"customers_contacted": 2}),
+    "labels-a-list": lambda a: dict(labels=["Contract type"]),
+    "label-empty": lambda a: dict(labels={**a["labels"], "contract": " "}),
+    "label-not-text": lambda a: dict(labels={**a["labels"], "contract": 5}),
+    "finding-not-text": lambda a: dict(recommendations=with_first_record(a, finding=5)),
+    "finding-empty": lambda a: dict(recommendations=with_first_record(a, finding="")),
+    "finding-with-a-line-break": lambda a: dict(recommendations=with_first_record(a, finding="one\ntwo")),
+    "finding-with-a-line-separator": lambda a: dict(recommendations=with_first_record(a, finding="one\u2028two")),
+    "finding-that-injects-a-heading": lambda a: dict(
+        recommendations=with_first_record(a, finding="x\n## Injected heading")
+    ),
+    "action-not-text": lambda a: dict(recommendations=with_first_record(a, action=None)),
+    "action-empty": lambda a: dict(recommendations=with_first_record(a, action="   ")),
+    "action-with-a-line-break": lambda a: dict(recommendations=with_first_record(a, action="one\ntwo")),
+    "action-with-a-line-separator": lambda a: dict(recommendations=with_first_record(a, action="one\u2028two")),
+    "action-that-injects-a-heading": lambda a: dict(
+        recommendations=with_first_record(a, action="x\n## Injected heading")
+    ),
+    "k-zero": lambda a: dict(k_frac=0),
+    "k-bool": lambda a: dict(k_frac=True),
+    "k-equal-to-the-edge": lambda a: dict(k_frac=0.5),
+    "edge-above-one": lambda a: dict(medium_edge=1.5),
+    "edge-huge-integer": lambda a: dict(medium_edge=10**400),
+    "k-disagrees-with-the-counts": lambda a: dict(k_frac=0.3),
+    "flagged-count-differs": lambda a: dict(facts=dataclasses.replace(a["facts"], customers_flagged=3)),
+    "high-tier-count-differs": lambda a: dict(facts=tiers_with_high_customers(a["facts"], 3)),
+    "scored-count-differs": lambda a: dict(facts=dataclasses.replace(a["facts"], customers_scored=50)),
+    "contacted-count-differs": lambda a: dict(
+        base_case=dataclasses.replace(a["base_case"], customers_contacted=5)
+    ),
+    "break-even-nan": lambda a: dict(
+        base_case=dataclasses.replace(a["base_case"], break_even_save_rate=float("nan"))
+    ),
+    "break-even-zero": lambda a: dict(base_case=dataclasses.replace(a["base_case"], break_even_save_rate=0.0)),
+}
+
+
+@pytest.mark.parametrize("build", list(DOCUMENT_CALLER_MISTAKES.values()), ids=list(DOCUMENT_CALLER_MISTAKES))
+def test_document_caller_mistakes_raise_value_error(build):
+    arguments = document_arguments()
+    arguments.update(build(arguments))
+
+    with pytest.raises(ValueError):
+        render_recommendations_document(**arguments)
+
+
+@pytest.mark.parametrize("field", ["scoring_run_id", "model_run_id"])
+@pytest.mark.parametrize("bad", ["", "not-an-id", "20261011T123500", "../20261011T123500Z", None], ids=repr)
+def test_a_bad_run_id_is_refused_by_the_document(field, bad):
+    arguments = document_arguments()
+    arguments[field] = bad
+
+    with pytest.raises(OutputGenerationError):
+        render_recommendations_document(**arguments)
+
+
+def facts_with_a_driver_only_feature(facts):
+    drivers = facts.flagged_drivers.copy()
+    drivers.index = pd.Index(["driver_only_feature", *drivers.index[1:]], name="feature")
+    return dataclasses.replace(facts, flagged_drivers=drivers)
+
+
+MISSING_LABEL_CASES = {
+    "profile-numeric": (lambda a: ({k: v for k, v in a["labels"].items() if k != "monthly_charge"}, a["facts"]), "monthly_charge"),
+    "profile-numeric-tenure": (lambda a: ({k: v for k, v in a["labels"].items() if k != "tenure_in_months"}, a["facts"]), "tenure_in_months"),
+    "profile-categorical": (lambda a: ({k: v for k, v in a["labels"].items() if k != "contract"}, a["facts"]), "contract"),
+    "internet-type": (lambda a: ({k: v for k, v in a["labels"].items() if k != "internet_type"}, a["facts"]), "internet_type"),
+    "importance": (lambda a: ({k: v for k, v in a["labels"].items() if k != "gender"}, a["facts"]), "gender"),
+    "drivers": (lambda a: (a["labels"], facts_with_a_driver_only_feature(a["facts"])), "driver_only_feature"),
+}
+
+
+@pytest.mark.parametrize("build,feature", list(MISSING_LABEL_CASES.values()), ids=list(MISSING_LABEL_CASES))
+def test_a_shown_feature_without_a_label_is_refused_and_named(build, feature):
+    arguments = document_arguments()
+    labels, facts = build(arguments)
+    arguments.update(labels=labels, facts=facts)
+
+    with pytest.raises(RecommendationsError, match=f"'{feature}'"):
+        render_recommendations_document(**arguments)
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Caf\u00e9 type", "Contract | type", "Contract\ntype"],
+    ids=["non-ascii", "pipe", "line-break"],
+)
+def test_a_label_that_would_break_the_text_is_refused(label):
+    arguments = document_arguments()
+    arguments["labels"] = {**arguments["labels"], "contract": label}
+
+    with pytest.raises(RecommendationsError):
+        render_recommendations_document(**arguments)
+
+
+def facts_with_profile_categories(facts, column, categories):
+    profile = {name: frame.copy() for name, frame in facts.categorical_profile.items()}
+    profile[column].index = pd.Index(categories, name="category")
+    return dataclasses.replace(facts, categorical_profile=profile)
+
+
+@pytest.mark.parametrize(
+    "category,fragment",
+    [
+        ("Month|to-Month", "pipe or a line break"),
+        ("Month\nto-Month", "pipe or a line break"),
+        ("Month\u2028to-Month", "non-ASCII"),
+        ("Caf\u00e9 plan", "non-ASCII"),
+    ],
+    ids=["pipe", "line-break", "line-separator", "non-ascii"],
+)
+def test_a_profile_category_name_that_would_break_the_text_is_refused(category, fragment):
+    facts = hand_facts()
+    names = list(facts.categorical_profile["contract"].index)
+    arguments = document_arguments()
+    arguments["facts"] = facts_with_profile_categories(facts, "contract", [category, *names[1:]])
+
+    with pytest.raises(RecommendationsError, match=fragment):
+        render_recommendations_document(**arguments)
+
+
+def facts_with_non_finite(facts, where, value):
+    if where == "tier-share":
+        tiers = facts.tiers.copy()
+        tiers.loc["High", "share"] = value
+        return dataclasses.replace(facts, tiers=tiers)
+    if where in ("group-mean", "overall-mean"):
+        profile = facts.numeric_profile.copy()
+        profile.loc["monthly_charge", "group_mean" if where == "group-mean" else "all_mean"] = value
+        return dataclasses.replace(facts, numeric_profile=profile)
+    if where == "importance-share":
+        importance = facts.importance_top.copy()
+        importance.loc["contract", "share"] = value
+        return dataclasses.replace(facts, importance_top=importance)
+    return dataclasses.replace(
+        facts, internet_type_importance=dataclasses.replace(facts.internet_type_importance, share=value)
+    )
+
+
+NON_FINITE_PLACES = {
+    "tier-share": "the High tier share is not finite",
+    "group-mean": "the group mean of monthly_charge is not finite",
+    "overall-mean": "the overall mean of monthly_charge is not finite",
+    "importance-share": "the importance share of contract is not finite",
+    "internet-type-share": "the internet type share is not finite",
+}
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")], ids=["nan", "inf"])
+@pytest.mark.parametrize("where,message", list(NON_FINITE_PLACES.items()), ids=list(NON_FINITE_PLACES))
+def test_a_non_finite_fact_is_refused_and_named(where, message, value):
+    arguments = document_arguments()
+    arguments["facts"] = facts_with_non_finite(arguments["facts"], where, value)
+
+    with pytest.raises(RecommendationsError, match=message):
+        render_recommendations_document(**arguments)
