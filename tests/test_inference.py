@@ -50,6 +50,7 @@ from retention_platform import tracking
 from retention_platform.config import REPO_ROOT, ConfigValidationError, load_config
 from retention_platform.inference import economics, outputs, recommendations, score, validate
 from retention_platform.inference.economics import (
+    BaseCase,
     ARPU_MULTIPLES,
     MONTHS_KEPT_SWEEP,
     OFFER_COST_SWEEP,
@@ -76,11 +77,25 @@ from retention_platform.inference.outputs import (
     summary_json_bytes,
 )
 from retention_platform.inference.recommendations import (
+    BREAK_EVEN_ABOVE_ONE_ACTION,
+    BREAK_EVEN_ABOVE_ONE_FINDING,
+    BREAK_EVEN_ACTION,
+    BREAK_EVEN_FINDING,
+    BREAK_EVEN_LIMIT_TEXT,
+    FIBER_OPTIC_ACTION,
+    FIBER_OPTIC_FINDING,
+    HIGH_TIER_ACTION,
+    HIGH_TIER_FINDING,
+    LEAD_DRIVER_ACTION,
+    LEAD_DRIVER_FINDING,
+    LEAD_DRIVER_SHARE_MINIMUM,
     NO_INTERNET_CATEGORY,
     PROFILE_CATEGORICAL_COLUMNS,
     TOP_N_IMPORTANCE,
+    Recommendation,
     RecommendationsError,
     compute_recommendation_facts,
+    select_recommendations,
 )
 from retention_platform.inference.score import (
     PostPublicationTrackingError,
@@ -5014,9 +5029,13 @@ def test_recommendations_py_imports_only_allowed_modules_and_never_the_target():
             imported.add(node.module)
 
     package = {name for name in imported if name.startswith("retention_platform")}
-    assert package <= {"retention_platform.inference.drivers", "retention_platform.inference.ranking"}
+    assert package <= {
+        "retention_platform.inference.drivers",
+        "retention_platform.inference.economics",
+        "retention_platform.inference.ranking",
+    }
     assert all(name.startswith("retention_platform.inference") for name in package)
-    assert imported - package <= {"__future__", "math", "dataclasses", "numpy", "pandas"}
+    assert imported - package <= {"__future__", "collections.abc", "math", "dataclasses", "numpy", "pandas"}
     assert TARGET_COLUMN not in source
 
 
@@ -5050,3 +5069,374 @@ def test_real_population_facts_are_consistent(driver_data, driver_contributions,
     assert (facts.all_drivers["raises_count"] + facts.all_drivers["lowers_count"] == facts.all_drivers["any_driver_count"]).all()
     assert facts.importance_top.index[0] == driver_importance.index[0]
     assert facts.internet_type_importance.rank == int(driver_importance.loc["internet_type", "rank"])
+
+
+# Recommendations
+
+# Phrases that would turn an association into a promise or a cause. "cause" is
+# not listed because two fixed templates say "not ... the cause" and "does not
+# show that ... causes"; a separate test allows those two and no other use.
+BANNED_PHRASES = [
+    "because",
+    "prevent", "prevents", "prevented",
+    "guarantee", "guarantees", "guaranteed",
+    "ensure", "ensures",
+    "proves", "proven",
+    "will reduce", "will save", "will work", "will retain", "will keep",
+    "will improve", "will increase", "will pay off", "will succeed",
+]
+ALL_TEMPLATES = {
+    "HIGH_TIER_FINDING": HIGH_TIER_FINDING,
+    "HIGH_TIER_ACTION": HIGH_TIER_ACTION,
+    "LEAD_DRIVER_FINDING": LEAD_DRIVER_FINDING,
+    "LEAD_DRIVER_ACTION": LEAD_DRIVER_ACTION,
+    "BREAK_EVEN_FINDING": BREAK_EVEN_FINDING,
+    "BREAK_EVEN_ACTION": BREAK_EVEN_ACTION,
+    "BREAK_EVEN_ABOVE_ONE_FINDING": BREAK_EVEN_ABOVE_ONE_FINDING,
+    "BREAK_EVEN_ABOVE_ONE_ACTION": BREAK_EVEN_ABOVE_ONE_ACTION,
+    "FIBER_OPTIC_FINDING": FIBER_OPTIC_FINDING,
+    "FIBER_OPTIC_ACTION": FIBER_OPTIC_ACTION,
+}
+RECOMMENDATION_ORDER = [
+    "start-with-the-high-tier",
+    "one-input-leads-the-drivers",
+    "break-even-save-rate",
+    "fiber-optic-on-the-list",
+]
+
+
+def hand_base_case(break_even=0.104):
+    return BaseCase(
+        customers_contacted=2,
+        total_offer_cost=40.0,
+        expected_would_be_churners=1.85,
+        expected_customers_saved=0.37,
+        gross_revenue_kept=100.0,
+        net_expected_value=60.0,
+        ev_per_contacted_customer=30.0,
+        break_even_save_rate=break_even,
+        arpu_proxy=90.0,
+        arpu_source="derived",
+        arpu_customers_used=2,
+    )
+
+
+def hand_facts():
+    return compute_recommendation_facts(**fact_arguments())
+
+
+def facts_without_high_customers(facts):
+    tiers = facts.tiers.copy()
+    tiers.loc["High", "customers"] = 0
+    tiers.loc["High", "share"] = 0.0
+    tiers.loc["High", "min_probability"] = np.nan
+    tiers.loc["High", "max_probability"] = np.nan
+    return dataclasses.replace(facts, tiers=tiers)
+
+
+def facts_with_lead_count(facts, flagged, count):
+    drivers = facts.flagged_drivers.copy()
+    drivers.iloc[0, drivers.columns.get_loc("first_driver_count")] = count
+    return dataclasses.replace(facts, customers_flagged=flagged, flagged_drivers=drivers)
+
+
+def facts_with_fiber(facts, **changes):
+    profile = {name: frame.copy() for name, frame in facts.categorical_profile.items()}
+    for column, value in changes.items():
+        profile["internet_type"].loc["Fiber Optic", column] = value
+    return dataclasses.replace(facts, categorical_profile=profile)
+
+
+def facts_without_fiber(facts):
+    profile = {name: frame.copy() for name, frame in facts.categorical_profile.items()}
+    profile["internet_type"] = profile["internet_type"].drop(index="Fiber Optic")
+    return dataclasses.replace(facts, categorical_profile=profile)
+
+
+def identifiers(recommendations):
+    return [item.identifier for item in recommendations]
+
+
+def evidence_text(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return "{:,}".format(value)
+    return "{:.1f}%".format(value * 100)
+
+
+def recommendation_variants():
+    facts = hand_facts()
+    big = facts_with_fiber(facts, all_count=1234)
+    big = dataclasses.replace(big, customers_scored=12345)
+    big = facts_with_lead_count(big, 1408, 1234)
+    return [
+        ("all-four", facts, hand_base_case(0.104)),
+        ("above-one", facts, hand_base_case(1.5)),
+        ("exactly-one", facts, hand_base_case(1.0)),
+        ("large-counts", big, hand_base_case(0.5)),
+        ("minimal", facts_without_fiber(facts_without_high_customers(facts_with_lead_count(facts, 2, 1))), hand_base_case(0.3)),
+    ]
+
+
+VARIANT_IDS = [variant[0] for variant in recommendation_variants()]
+
+
+def test_hand_made_facts_give_the_exact_expected_sentences():
+    recommendations = select_recommendations(hand_facts(), hand_base_case(0.104), DRIVER_LABELS)
+
+    assert identifiers(recommendations) == RECOMMENDATION_ORDER
+    assert [item.finding for item in recommendations] == [
+        "The High tier holds 2 customers, with churn probabilities from 90.0% to 95.0%.",
+        "Contract type is the first driver for 2 of the 2 flagged customers.",
+        "In the simulated base case the break-even save rate is 10.4%: the offer would pay off "
+        "only if at least that share of would-be churners were kept.",
+        "Fiber Optic customers are 1 of the 2 flagged customers (50.0%) and 3 of the 10 scored "
+        "customers (30.0%).",
+    ]
+    assert [item.action for item in recommendations] == [
+        "Start outreach planning with this tier, in list order. The probabilities rank customers "
+        "by modelled risk; they do not show that contact will change any outcome.",
+        "Treat this as a pattern in the model's scores, not as the cause of any customer's risk. "
+        "Investigate whether customers with this characteristic form a segment worth a closer "
+        "look before planning offers around it.",
+        "If a pilot is considered, measure the real save rate and compare it with this break-even "
+        "before extending the offer. The save rate used here is an assumption, not an estimate "
+        "from the data.",
+        "This describes who is on the list. The model's overall reliance on the internet type is "
+        "a separate measure, shown in the global importance section, and it does not show that "
+        "Fiber Optic service causes churn. Understanding Fiber Optic churn would need a separate "
+        "evaluation.",
+    ]
+
+
+def test_the_above_one_version_has_the_exact_sentences():
+    recommendations = select_recommendations(hand_facts(), hand_base_case(1.5), DRIVER_LABELS)
+    item = next(r for r in recommendations if r.identifier == "break-even-save-rate")
+
+    assert item.finding == (
+        "In the simulated base case the break-even save rate is above 100%: the offer cannot pay "
+        "off at any save rate."
+    )
+    assert item.action == (
+        "Review the offer cost and the months kept assumptions, and see the economics document "
+        "for the sensitivity tables, before planning outreach."
+    )
+
+
+# Conditions
+
+
+def test_the_high_tier_recommendation_needs_at_least_one_high_customer():
+    facts = hand_facts()
+
+    shown = select_recommendations(facts, hand_base_case(), DRIVER_LABELS)
+    hidden = select_recommendations(facts_without_high_customers(facts), hand_base_case(), DRIVER_LABELS)
+
+    assert "start-with-the-high-tier" in identifiers(shown)
+    assert "start-with-the-high-tier" not in identifiers(hidden)
+
+
+def test_the_lead_driver_boundary_is_strictly_more_than_half_the_flagged_group():
+    facts = hand_facts()
+    assert LEAD_DRIVER_SHARE_MINIMUM == 0.5
+
+    exactly_half = facts_with_lead_count(facts, 140, 70)
+    one_more = facts_with_lead_count(facts, 140, 71)
+    far_below = facts_with_lead_count(facts, 140, 10)
+
+    assert "one-input-leads-the-drivers" not in identifiers(select_recommendations(exactly_half, hand_base_case(), DRIVER_LABELS))
+    assert "one-input-leads-the-drivers" in identifiers(select_recommendations(one_more, hand_base_case(), DRIVER_LABELS))
+    assert "one-input-leads-the-drivers" not in identifiers(select_recommendations(far_below, hand_base_case(), DRIVER_LABELS))
+    finding = next(r for r in select_recommendations(one_more, hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers").finding
+    assert finding == "Contract type is the first driver for 71 of the 140 flagged customers."
+
+
+@pytest.mark.parametrize(
+    "break_even,above",
+    [(0.104, False), (0.9999, False), (1.0, False), (1.0000001, True), (2.5, True)],
+    ids=["normal", "just-below-one", "exactly-one", "just-above-one", "far-above-one"],
+)
+def test_the_break_even_recommendation_has_exactly_one_version(break_even, above):
+    recommendations = select_recommendations(hand_facts(), hand_base_case(break_even), DRIVER_LABELS)
+
+    matching = [r for r in recommendations if r.identifier == "break-even-save-rate"]
+
+    assert len(matching) == 1
+    assert ("is above 100%" in matching[0].finding) is above
+    assert (matching[0].action == BREAK_EVEN_ABOVE_ONE_ACTION) is above
+    if not above:
+        assert matching[0].finding.startswith("In the simulated base case the break-even save rate is ")
+        assert "above" not in matching[0].finding
+
+
+def test_exactly_one_hundred_percent_is_the_ordinary_version_and_prints_a_number():
+    item = next(
+        r
+        for r in select_recommendations(hand_facts(), hand_base_case(1.0), DRIVER_LABELS)
+        if r.identifier == "break-even-save-rate"
+    )
+
+    assert "break-even save rate is 100.0%:" in item.finding
+
+
+def test_the_fiber_optic_recommendation_conditions():
+    facts = hand_facts()
+    assert facts.categorical_profile["internet_type"].loc["Fiber Optic", "group_share"] > facts.categorical_profile["internet_type"].loc["Fiber Optic", "all_share"]
+    equal = facts_with_fiber(facts, group_share=facts.categorical_profile["internet_type"].loc["Fiber Optic", "all_share"])
+    lower = facts_with_fiber(facts, group_share=0.1)
+
+    assert "fiber-optic-on-the-list" in identifiers(select_recommendations(facts, hand_base_case(), DRIVER_LABELS))
+    assert "fiber-optic-on-the-list" not in identifiers(select_recommendations(equal, hand_base_case(), DRIVER_LABELS))
+    assert "fiber-optic-on-the-list" not in identifiers(select_recommendations(lower, hand_base_case(), DRIVER_LABELS))
+    assert "fiber-optic-on-the-list" not in identifiers(
+        select_recommendations(facts_without_fiber(facts), hand_base_case(), DRIVER_LABELS)
+    )
+
+
+def test_the_order_is_fixed_and_a_subset_keeps_it():
+    facts = hand_facts()
+
+    full = select_recommendations(facts, hand_base_case(), DRIVER_LABELS)
+    subset = select_recommendations(
+        facts_without_fiber(facts_without_high_customers(facts)), hand_base_case(), DRIVER_LABELS
+    )
+
+    assert identifiers(full) == RECOMMENDATION_ORDER
+    assert identifiers(subset) == ["one-input-leads-the-drivers", "break-even-save-rate"]
+
+
+def test_the_break_even_recommendation_is_always_present():
+    for _, facts, base_case in recommendation_variants():
+        assert "break-even-save-rate" in identifiers(select_recommendations(facts, base_case, DRIVER_LABELS))
+
+
+# Evidence and wording rules
+
+
+@pytest.mark.parametrize("name,facts,base_case", recommendation_variants(), ids=VARIANT_IDS)
+def test_every_evidence_value_appears_formatted_in_its_finding(name, facts, base_case):
+    recommendations = select_recommendations(facts, base_case, DRIVER_LABELS)
+
+    assert recommendations
+    for item in recommendations:
+        assert item.evidence
+        for key, value in item.evidence.items():
+            assert evidence_text(value) in item.finding, (item.identifier, key, value)
+
+
+def test_large_counts_use_thousands_separators():
+    _, facts, base_case = next(v for v in recommendation_variants() if v[0] == "large-counts")
+
+    findings = {r.identifier: r.finding for r in select_recommendations(facts, base_case, DRIVER_LABELS)}
+
+    assert "1,234 of the 1,408 flagged customers" in findings["one-input-leads-the-drivers"]
+    assert "1,234 of the 12,345 scored customers" in findings["fiber-optic-on-the-list"]
+
+
+@pytest.mark.parametrize("name,facts,base_case", recommendation_variants(), ids=VARIANT_IDS)
+def test_no_banned_word_appears_in_any_finding_or_action(name, facts, base_case):
+    for item in select_recommendations(facts, base_case, DRIVER_LABELS):
+        for text in (item.finding, item.action):
+            for phrase in BANNED_PHRASES:
+                assert re.search(rf"\b{re.escape(phrase)}\b", text, flags=re.IGNORECASE) is None, (phrase, text)
+
+
+def test_the_word_cause_appears_only_in_the_two_fixed_negations():
+    uses = {
+        name: len(re.findall(r"\bcauses?\b", text, flags=re.IGNORECASE))
+        for name, text in ALL_TEMPLATES.items()
+        if re.search(r"\bcauses?\b", text, flags=re.IGNORECASE)
+    }
+
+    assert uses == {"LEAD_DRIVER_ACTION": 1, "FIBER_OPTIC_ACTION": 1}
+    assert "not as the cause of any customer's risk" in LEAD_DRIVER_ACTION
+    assert "does not show that Fiber Optic service causes churn" in FIBER_OPTIC_ACTION
+
+
+def test_the_templates_hold_no_run_specific_figure():
+    digits = {name: re.findall(r"\d+", text) for name, text in ALL_TEMPLATES.items() if re.search(r"\d", text)}
+
+    assert digits == {}
+    assert BREAK_EVEN_LIMIT_TEXT == "100%"
+    for name in ("HIGH_TIER_FINDING", "LEAD_DRIVER_FINDING", "BREAK_EVEN_FINDING", "FIBER_OPTIC_FINDING"):
+        assert "{" in ALL_TEMPLATES[name]
+
+
+@pytest.mark.parametrize("name,facts,base_case", recommendation_variants(), ids=VARIANT_IDS)
+def test_all_text_is_ascii_and_deterministic(name, facts, base_case):
+    first = select_recommendations(facts, base_case, DRIVER_LABELS)
+    second = select_recommendations(facts, base_case, DRIVER_LABELS)
+
+    assert first == second
+    for item in first:
+        assert (item.finding + item.action + item.identifier).isascii()
+        assert "\n" not in item.finding and "\n" not in item.action
+        assert item.finding == item.finding.strip() and item.action == item.action.strip()
+    assert all(isinstance(item, Recommendation) for item in first)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        first[0].finding = "changed"
+
+
+# Refusals and caller mistakes
+
+
+def test_a_missing_label_for_the_lead_feature_is_refused_and_names_the_feature():
+    with pytest.raises(RecommendationsError, match="'contract'"):
+        select_recommendations(hand_facts(), hand_base_case(), {})
+
+
+def test_a_label_is_only_needed_when_the_lead_driver_recommendation_is_selected():
+    facts = facts_with_lead_count(hand_facts(), 140, 10)
+
+    recommendations = select_recommendations(facts, hand_base_case(), {})
+
+    assert "one-input-leads-the-drivers" not in identifiers(recommendations)
+
+
+RECOMMENDATION_CALLER_MISTAKES = {
+    "facts-none": lambda f, b, m: (None, b, m),
+    "facts-a-dict": lambda f, b, m: ({"tiers": 1}, b, m),
+    "base-case-a-dict": lambda f, b, m: (f, {"break_even_save_rate": 0.1}, m),
+    "base-case-none": lambda f, b, m: (f, None, m),
+    "labels-a-list": lambda f, b, m: (f, b, ["Contract type"]),
+    "labels-none": lambda f, b, m: (f, b, None),
+    "label-not-text": lambda f, b, m: (f, b, {**m, "contract": 5}),
+    "label-empty": lambda f, b, m: (f, b, {**m, "contract": "  "}),
+    "break-even-nan": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate=float("nan")), m),
+    "break-even-infinite": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate=float("inf")), m),
+    "break-even-zero": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate=0.0), m),
+    "break-even-negative": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate=-0.1), m),
+    "break-even-bool": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate=True), m),
+    "break-even-text": lambda f, b, m: (f, dataclasses.replace(b, break_even_save_rate="0.1"), m),
+}
+
+
+@pytest.mark.parametrize(
+    "build", list(RECOMMENDATION_CALLER_MISTAKES.values()), ids=list(RECOMMENDATION_CALLER_MISTAKES)
+)
+def test_recommendation_caller_mistakes_raise_value_error(build):
+    facts, base_case, labels = build(hand_facts(), hand_base_case(), dict(DRIVER_LABELS))
+
+    with pytest.raises(ValueError):
+        select_recommendations(facts, base_case, labels)
+
+
+def test_the_facts_and_the_base_case_are_not_changed_by_a_call():
+    facts, base_case = hand_facts(), hand_base_case()
+    frames_before = {
+        "tiers": facts.tiers.copy(deep=True),
+        "flagged_drivers": facts.flagged_drivers.copy(deep=True),
+        "all_drivers": facts.all_drivers.copy(deep=True),
+        "internet": facts.categorical_profile["internet_type"].copy(deep=True),
+    }
+    labels = dict(DRIVER_LABELS)
+
+    select_recommendations(facts, base_case, labels)
+
+    pd.testing.assert_frame_equal(facts.tiers, frames_before["tiers"])
+    pd.testing.assert_frame_equal(facts.flagged_drivers, frames_before["flagged_drivers"])
+    pd.testing.assert_frame_equal(facts.all_drivers, frames_before["all_drivers"])
+    pd.testing.assert_frame_equal(facts.categorical_profile["internet_type"], frames_before["internet"])
+    assert base_case == hand_base_case()
+    assert labels == DRIVER_LABELS

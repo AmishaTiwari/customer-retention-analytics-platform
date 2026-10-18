@@ -6,6 +6,7 @@ importance. Numbers only: no wording and no thresholds.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,6 +18,7 @@ from retention_platform.inference.drivers import (
     DRIVER_COLUMNS,
     TOP_N_DRIVERS,
 )
+from retention_platform.inference.economics import BaseCase
 from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
 
 PROFILE_NUMERIC_COLUMNS = ("monthly_charge", "tenure_in_months")
@@ -336,3 +338,198 @@ def compute_recommendation_facts(
         flagged_drivers=_driver_facts(features[flagged], directions[flagged]),
         all_drivers=_driver_facts(features, directions),
     )
+
+
+LEAD_DRIVER_SHARE_MINIMUM = 0.5
+FIBER_OPTIC_CATEGORY = "Fiber Optic"
+BREAK_EVEN_LIMIT_TEXT = "100%"
+
+HIGH_TIER_ID = "start-with-the-high-tier"
+LEAD_DRIVER_ID = "one-input-leads-the-drivers"
+BREAK_EVEN_ID = "break-even-save-rate"
+FIBER_OPTIC_ID = "fiber-optic-on-the-list"
+
+HIGH_TIER_FINDING = (
+    "The High tier holds {customers} customers, with churn probabilities from {lowest} to {highest}."
+)
+HIGH_TIER_ACTION = (
+    "Start outreach planning with this tier, in list order. The probabilities rank customers by "
+    "modelled risk; they do not show that contact will change any outcome."
+)
+LEAD_DRIVER_FINDING = "{label} is the first driver for {count} of the {flagged} flagged customers."
+LEAD_DRIVER_ACTION = (
+    "Treat this as a pattern in the model's scores, not as the cause of any customer's risk. "
+    "Investigate whether customers with this characteristic form a segment worth a closer look "
+    "before planning offers around it."
+)
+BREAK_EVEN_FINDING = (
+    "In the simulated base case the break-even save rate is {break_even}: the offer would pay off "
+    "only if at least that share of would-be churners were kept."
+)
+BREAK_EVEN_ACTION = (
+    "If a pilot is considered, measure the real save rate and compare it with this break-even "
+    "before extending the offer. The save rate used here is an assumption, not an estimate from "
+    "the data."
+)
+BREAK_EVEN_ABOVE_ONE_FINDING = (
+    "In the simulated base case the break-even save rate is above {limit}: the offer cannot pay "
+    "off at any save rate."
+)
+BREAK_EVEN_ABOVE_ONE_ACTION = (
+    "Review the offer cost and the months kept assumptions, and see the economics document for "
+    "the sensitivity tables, before planning outreach."
+)
+FIBER_OPTIC_FINDING = (
+    "Fiber Optic customers are {group_count} of the {flagged} flagged customers ({group_share}) "
+    "and {all_count} of the {scored} scored customers ({all_share})."
+)
+FIBER_OPTIC_ACTION = (
+    "This describes who is on the list. The model's overall reliance on the internet type is a "
+    "separate measure, shown in the global importance section, and it does not show that Fiber "
+    "Optic service causes churn. Understanding Fiber Optic churn would need a separate evaluation."
+)
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    """One conditional recommendation: the finding that triggers it, the
+    action, and the figures the finding quotes."""
+
+    identifier: str
+    finding: str
+    action: str
+    evidence: dict
+
+
+def _count_text(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def _percent_text(fraction: float) -> str:
+    return f"{100 * float(fraction):.1f}%"
+
+
+def _check_selection_arguments(
+    facts: RecommendationFacts, base_case: BaseCase, labels: Mapping
+) -> None:
+    if not isinstance(facts, RecommendationFacts):
+        raise ValueError(f"facts must be RecommendationFacts, got {type(facts).__name__}")
+    if not isinstance(base_case, BaseCase):
+        raise ValueError(f"base_case must be a BaseCase, got {type(base_case).__name__}")
+    if not isinstance(labels, Mapping):
+        raise ValueError(f"labels must be a mapping, got {type(labels).__name__}")
+    for feature, label in labels.items():
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"the label for {feature!r} must be non-empty text, got {label!r}")
+    break_even = base_case.break_even_save_rate
+    if not (
+        isinstance(break_even, (int, float, np.integer, np.floating))
+        and not isinstance(break_even, (bool, np.bool_))
+        and math.isfinite(break_even)
+        and break_even > 0
+    ):
+        raise ValueError(f"the base case break-even save rate is not a usable number: {break_even!r}")
+
+
+def select_recommendations(
+    facts: RecommendationFacts, base_case: BaseCase, labels: Mapping
+) -> list[Recommendation]:
+    """The recommendations whose condition holds for these facts, in fixed
+    order. Every sentence is a fixed template with figures inserted; the
+    evidence maps each figure name to the value the finding quotes. A
+    feature that needs a label and has none raises RecommendationsError."""
+    _check_selection_arguments(facts, base_case, labels)
+    selected: list[Recommendation] = []
+
+    high = facts.tiers.loc["High"]
+    if high["customers"] >= 1:
+        evidence = {
+            "customers": int(high["customers"]),
+            "lowest": float(high["min_probability"]),
+            "highest": float(high["max_probability"]),
+        }
+        selected.append(
+            Recommendation(
+                HIGH_TIER_ID,
+                HIGH_TIER_FINDING.format(
+                    customers=_count_text(evidence["customers"]),
+                    lowest=_percent_text(evidence["lowest"]),
+                    highest=_percent_text(evidence["highest"]),
+                ),
+                HIGH_TIER_ACTION,
+                evidence,
+            )
+        )
+
+    lead = facts.flagged_drivers.iloc[0]
+    flagged = facts.customers_flagged
+    if lead["first_driver_count"] > LEAD_DRIVER_SHARE_MINIMUM * flagged:
+        feature = facts.flagged_drivers.index[0]
+        if feature not in labels:
+            raise RecommendationsError(f"the feature {feature!r} has no label")
+        evidence = {
+            "label": labels[feature],
+            "count": int(lead["first_driver_count"]),
+            "flagged": int(flagged),
+        }
+        selected.append(
+            Recommendation(
+                LEAD_DRIVER_ID,
+                LEAD_DRIVER_FINDING.format(
+                    label=evidence["label"],
+                    count=_count_text(evidence["count"]),
+                    flagged=_count_text(evidence["flagged"]),
+                ),
+                LEAD_DRIVER_ACTION,
+                evidence,
+            )
+        )
+
+    break_even = float(base_case.break_even_save_rate)
+    if break_even <= 1:
+        selected.append(
+            Recommendation(
+                BREAK_EVEN_ID,
+                BREAK_EVEN_FINDING.format(break_even=_percent_text(break_even)),
+                BREAK_EVEN_ACTION,
+                {"break_even": break_even},
+            )
+        )
+    else:
+        selected.append(
+            Recommendation(
+                BREAK_EVEN_ID,
+                BREAK_EVEN_ABOVE_ONE_FINDING.format(limit=BREAK_EVEN_LIMIT_TEXT),
+                BREAK_EVEN_ABOVE_ONE_ACTION,
+                {"limit": BREAK_EVEN_LIMIT_TEXT},
+            )
+        )
+
+    internet = facts.categorical_profile["internet_type"]
+    if FIBER_OPTIC_CATEGORY in internet.index:
+        row = internet.loc[FIBER_OPTIC_CATEGORY]
+        if row["group_share"] > row["all_share"]:
+            evidence = {
+                "group_count": int(row["group_count"]),
+                "flagged": int(flagged),
+                "group_share": float(row["group_share"]),
+                "all_count": int(row["all_count"]),
+                "scored": int(facts.customers_scored),
+                "all_share": float(row["all_share"]),
+            }
+            selected.append(
+                Recommendation(
+                    FIBER_OPTIC_ID,
+                    FIBER_OPTIC_FINDING.format(
+                        group_count=_count_text(evidence["group_count"]),
+                        flagged=_count_text(evidence["flagged"]),
+                        group_share=_percent_text(evidence["group_share"]),
+                        all_count=_count_text(evidence["all_count"]),
+                        scored=_count_text(evidence["scored"]),
+                        all_share=_percent_text(evidence["all_share"]),
+                    ),
+                    FIBER_OPTIC_ACTION,
+                    evidence,
+                )
+            )
+    return selected
