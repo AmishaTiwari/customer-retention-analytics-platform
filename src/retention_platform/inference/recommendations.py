@@ -1,6 +1,15 @@
-"""The facts a recommendations document can quote, computed from the ranked
-scoring table, the scoring inputs, the customer drivers and the global
-importance. Numbers only: no wording and no thresholds.
+"""Recommendation facts, recommendation selection and the recommendations document.
+
+compute_recommendation_facts computes numbers only, from the ranked scoring
+table, the scoring inputs, the customer drivers and the global importance.
+select_recommendations picks the recommendations whose condition holds; each
+is a fixed sentence template with figures inserted at run time. The leading
+customer driver is shown when it is among the three main drivers for at least
+20% of the flagged customers (LEAD_DRIVER_SHARE_MINIMUM = 0.2), and the
+internet type note is shown when the internet type carries at least 1% of the
+global importance (INTERNET_TYPE_SHARE_MINIMUM = 0.01).
+render_recommendations_document returns the eight-section Markdown text and
+writes nothing to disk.
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from retention_platform.inference.drivers import (
     DRIVER_COLUMNS,
     TOP_N_DRIVERS,
 )
-from retention_platform.inference.economics import SIMULATED_PHRASE, BaseCase
+from retention_platform.inference.economics import SIMULATED_PHRASE, BaseCase, EconomicsResults
 from retention_platform.inference.outputs import SNAPSHOT_NOTICE, document_header
 from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
 
@@ -54,6 +63,8 @@ class RecommendationFacts:
 
     customers_scored: int
     customers_flagged: int
+    mean_probability_flagged: float
+    mean_probability_all: float
     tiers: pd.DataFrame
     numeric_profile: pd.DataFrame
     categorical_profile: dict
@@ -298,6 +309,9 @@ def compute_recommendation_facts(
     _check_flags(table, ids, ranks, k_frac)
     flagged = table["in_top_k"].to_numpy(dtype=bool)
 
+    mean_probability_flagged = math.fsum(probabilities[flagged].tolist()) / int(flagged.sum())
+    mean_probability_all = math.fsum(probabilities.tolist()) / n_rows
+
     aligned = inputs.loc[ids]
     tiers = assign_risk_tiers(pd.Series(ranks, dtype="int64"), k_frac, medium_edge)
     tier_facts = _tier_facts(tiers, probabilities)
@@ -331,6 +345,8 @@ def compute_recommendation_facts(
     return RecommendationFacts(
         customers_scored=n_rows,
         customers_flagged=int(flagged.sum()),
+        mean_probability_flagged=mean_probability_flagged,
+        mean_probability_all=mean_probability_all,
         tiers=tier_facts,
         numeric_profile=numeric_profile,
         categorical_profile=categorical_profile,
@@ -341,14 +357,15 @@ def compute_recommendation_facts(
     )
 
 
-LEAD_DRIVER_SHARE_MINIMUM = 0.5
+LEAD_DRIVER_SHARE_MINIMUM = 0.2
+INTERNET_TYPE_SHARE_MINIMUM = 0.01
 FIBER_OPTIC_CATEGORY = "Fiber Optic"
 BREAK_EVEN_LIMIT_TEXT = "100%"
 
 HIGH_TIER_ID = "start-with-the-high-tier"
 LEAD_DRIVER_ID = "one-input-leads-the-drivers"
 BREAK_EVEN_ID = "break-even-save-rate"
-FIBER_OPTIC_ID = "fiber-optic-on-the-list"
+INTERNET_CAUTION_ID = "internet-type-caution"
 
 HIGH_TIER_FINDING = (
     "The High tier holds {customers} customers, with churn probabilities from {lowest} to {highest}."
@@ -357,7 +374,9 @@ HIGH_TIER_ACTION = (
     "Start outreach planning with this tier, in list order. The probabilities rank customers by "
     "modelled risk; they do not show that contact will change any outcome."
 )
-LEAD_DRIVER_FINDING = "{label} is the first driver for {count} of the {flagged} flagged customers."
+LEAD_DRIVER_FINDING = (
+    "{label} is among the three main drivers for {count} of the {flagged} flagged customers ({share})."
+)
 LEAD_DRIVER_ACTION = (
     "Treat this as a pattern in the model's scores, not as the cause of any customer's risk. "
     "Investigate whether customers with this characteristic form a segment worth a closer look "
@@ -380,14 +399,14 @@ BREAK_EVEN_ABOVE_ONE_ACTION = (
     "Review the offer cost and the months kept assumptions, and see the economics document for "
     "the sensitivity tables, before planning outreach."
 )
-FIBER_OPTIC_FINDING = (
-    "Fiber Optic customers are {group_count} of the {flagged} flagged customers ({group_share}) "
-    "and {all_count} of the {scored} scored customers ({all_share})."
+INTERNET_CAUTION_FINDING = (
+    "The internet type carries {share} of the model's global importance, and its rank is {rank}."
 )
-FIBER_OPTIC_ACTION = (
-    "This describes who is on the list. The model's overall reliance on the internet type is a "
-    "separate measure, shown in the global importance section, and it does not show that Fiber "
-    "Optic service causes churn. Understanding Fiber Optic churn would need a separate evaluation."
+INTERNET_CAUTION_ACTION = (
+    "This is a measure of how much the model relies on the input. It does not show that any "
+    "internet type, including Fiber Optic service, causes churn, and related inputs share credit, "
+    "so the share is not the separate effect of the internet type. Understanding churn among "
+    "Fiber Optic customers would need a separate evaluation."
 )
 
 
@@ -462,16 +481,17 @@ def select_recommendations(
             )
         )
 
-    lead = facts.flagged_drivers.iloc[0]
     flagged = facts.customers_flagged
-    if lead["first_driver_count"] > LEAD_DRIVER_SHARE_MINIMUM * flagged:
-        feature = facts.flagged_drivers.index[0]
-        if feature not in labels:
-            raise RecommendationsError(f"the feature {feature!r} has no label")
+    leading = facts.flagged_drivers["any_driver_count"].idxmax()
+    lead_count = int(facts.flagged_drivers.loc[leading, "any_driver_count"])
+    if lead_count / flagged >= LEAD_DRIVER_SHARE_MINIMUM:
+        if leading not in labels:
+            raise RecommendationsError(f"the feature {leading!r} has no label")
         evidence = {
-            "label": labels[feature],
-            "count": int(lead["first_driver_count"]),
+            "label": labels[leading],
+            "count": lead_count,
             "flagged": int(flagged),
+            "share": lead_count / flagged,
         }
         selected.append(
             Recommendation(
@@ -480,6 +500,7 @@ def select_recommendations(
                     label=evidence["label"],
                     count=_count_text(evidence["count"]),
                     flagged=_count_text(evidence["flagged"]),
+                    share=_percent_text(evidence["share"]),
                 ),
                 LEAD_DRIVER_ACTION,
                 evidence,
@@ -506,39 +527,26 @@ def select_recommendations(
             )
         )
 
-    internet = facts.categorical_profile["internet_type"]
-    if FIBER_OPTIC_CATEGORY in internet.index:
-        row = internet.loc[FIBER_OPTIC_CATEGORY]
-        if row["group_share"] > row["all_share"]:
-            evidence = {
-                "group_count": int(row["group_count"]),
-                "flagged": int(flagged),
-                "group_share": float(row["group_share"]),
-                "all_count": int(row["all_count"]),
-                "scored": int(facts.customers_scored),
-                "all_share": float(row["all_share"]),
-            }
-            selected.append(
-                Recommendation(
-                    FIBER_OPTIC_ID,
-                    FIBER_OPTIC_FINDING.format(
-                        group_count=_count_text(evidence["group_count"]),
-                        flagged=_count_text(evidence["flagged"]),
-                        group_share=_percent_text(evidence["group_share"]),
-                        all_count=_count_text(evidence["all_count"]),
-                        scored=_count_text(evidence["scored"]),
-                        all_share=_percent_text(evidence["all_share"]),
-                    ),
-                    FIBER_OPTIC_ACTION,
-                    evidence,
-                )
+    internet = facts.internet_type_importance
+    if internet.share >= INTERNET_TYPE_SHARE_MINIMUM:
+        evidence = {"share": float(internet.share), "rank": int(internet.rank)}
+        selected.append(
+            Recommendation(
+                INTERNET_CAUTION_ID,
+                INTERNET_CAUTION_FINDING.format(
+                    share=_percent_text(evidence["share"]), rank=str(evidence["rank"])
+                ),
+                INTERNET_CAUTION_ACTION,
+                evidence,
             )
+        )
     return selected
 
 
 TOP_N_DRIVER_ROWS = 10
 DOCUMENT_TITLE = "Business Recommendations"
 NOT_AVAILABLE_TEXT = "n/a"
+MEAN_PROBABILITY_LABEL = "Mean churn probability"
 BREAK_EVEN_ABOVE_ONE_TEXT = "above 100%"
 NO_RECOMMENDATION_TEXT = "No recommendation applies to this run."
 
@@ -597,9 +605,10 @@ INTERNET_TYPE_NOT_IN_TOP = (
     "model's global importance, and its rank is {rank}."
 )
 INTERNET_TYPE_FIBER_OPTIC = (
-    "How common Fiber Optic service is on the list is shown in the group profile above. It is a "
-    "different measure from the model's reliance on the input, and neither shows that Fiber Optic "
-    "service causes churn."
+    "This measures how much the model relies on the internet type as a whole; it is not a "
+    "measure of Fiber Optic service alone. This share does not establish an observed difference in "
+    "churn between Fiber Optic customers and other customers, and it does not give a causal "
+    "explanation of why any customers leave."
 )
 CORRELATION_CAVEAT = (
     "Related inputs share credit with each other, for example the internet service and the "
@@ -683,7 +692,7 @@ def _label_of(labels: Mapping, feature: str) -> str:
 def _check_document_arguments(
     facts: RecommendationFacts,
     recommendations: list,
-    base_case: BaseCase,
+    results: EconomicsResults,
     labels: Mapping,
     k_frac: float,
     medium_edge: float,
@@ -703,8 +712,11 @@ def _check_document_arguments(
                 raise ValueError(f"the {name} of {item.identifier!r} must be non-empty text, got {text!r}")
             if text.splitlines() != [text]:
                 raise ValueError(f"the {name} of {item.identifier!r} must be a single line, got {text!r}")
+    if not isinstance(results, EconomicsResults):
+        raise ValueError(f"results must be EconomicsResults, got {type(results).__name__}")
+    base_case = results.base_case
     if not isinstance(base_case, BaseCase):
-        raise ValueError(f"base_case must be a BaseCase, got {type(base_case).__name__}")
+        raise ValueError(f"results.base_case must be a BaseCase, got {type(base_case).__name__}")
     if not isinstance(labels, Mapping):
         raise ValueError(f"labels must be a mapping, got {type(labels).__name__}")
     for feature, label in labels.items():
@@ -734,6 +746,15 @@ def _check_document_arguments(
         and break_even > 0
     ):
         raise ValueError(f"the base case break-even save rate is not a usable number: {break_even!r}")
+    for item in recommendations:
+        if item.identifier != BREAK_EVEN_ID:
+            continue
+        if break_even > 1:
+            agrees = item.evidence == {"limit": BREAK_EVEN_LIMIT_TEXT}
+        else:
+            agrees = set(item.evidence) == {"break_even"} and item.evidence["break_even"] == float(break_even)
+        if not agrees:
+            raise ValueError("the break-even recommendation does not agree with results.base_case")
 
 
 def _finite(value: float, what: str) -> float:
@@ -745,7 +766,7 @@ def _finite(value: float, what: str) -> float:
 def render_recommendations_document(
     facts: RecommendationFacts,
     recommendations: list,
-    base_case: BaseCase,
+    results: EconomicsResults,
     labels: Mapping,
     k_frac: float,
     medium_edge: float,
@@ -757,7 +778,8 @@ def render_recommendations_document(
     arguments, so the same inputs give the same text. Nothing is written
     to disk. A feature that is shown and has no label raises
     RecommendationsError."""
-    _check_document_arguments(facts, recommendations, base_case, labels, k_frac, medium_edge)
+    _check_document_arguments(facts, recommendations, results, labels, k_frac, medium_edge)
+    base_case = results.base_case
     header = document_header(DOCUMENT_TITLE, scoring_run_id, model_run_id)
 
     scored = _count_text(facts.customers_scored)
@@ -809,7 +831,13 @@ def render_recommendations_document(
         )
     )
 
-    numeric_rows = []
+    numeric_rows = [
+        [
+            MEAN_PROBABILITY_LABEL,
+            _percent_text(_finite(facts.mean_probability_flagged, "the mean churn probability of the flagged group")),
+            _percent_text(_finite(facts.mean_probability_all, "the mean churn probability of all scored customers")),
+        ]
+    ]
     for column, row in facts.numeric_profile.iterrows():
         group_mean = _finite(row["group_mean"], f"the group mean of {column}")
         all_mean = _finite(row["all_mean"], f"the overall mean of {column}")

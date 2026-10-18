@@ -51,6 +51,7 @@ from retention_platform.config import REPO_ROOT, ConfigValidationError, load_con
 from retention_platform.inference import economics, outputs, recommendations, score, validate
 from retention_platform.inference.economics import (
     BaseCase,
+    EconomicsResults,
     ARPU_MULTIPLES,
     MONTHS_KEPT_SWEEP,
     OFFER_COST_SWEEP,
@@ -90,11 +91,12 @@ from retention_platform.inference.recommendations import (
     DRIVERS_TABLE_INTRO,
     ECONOMICS_INTRO,
     ECONOMICS_POINTER,
-    FIBER_OPTIC_ACTION,
-    FIBER_OPTIC_FINDING,
     HIGH_TIER_ACTION,
     HIGH_TIER_FINDING,
     IMPORTANCE_INTRO,
+    INTERNET_CAUTION_ACTION,
+    INTERNET_CAUTION_FINDING,
+    INTERNET_TYPE_SHARE_MINIMUM,
     INTERNET_TYPE_FIBER_OPTIC,
     INTERNET_TYPE_IN_TOP,
     INTERNET_TYPE_NOT_IN_TOP,
@@ -4489,6 +4491,8 @@ def fact_arguments(internet_position=2):
 
 
 def assert_same_facts(first, second):
+    assert first.mean_probability_flagged == second.mean_probability_flagged
+    assert first.mean_probability_all == second.mean_probability_all
     assert (first.customers_scored, first.customers_flagged) == (second.customers_scored, second.customers_flagged)
     pd.testing.assert_frame_equal(first.tiers, second.tiers, check_exact=True)
     pd.testing.assert_frame_equal(first.numeric_profile, second.numeric_profile, check_exact=True)
@@ -5098,8 +5102,8 @@ def test_real_population_facts_are_consistent(driver_data, driver_contributions,
 # Recommendations
 
 # Phrases that would turn an association into a promise or a cause. "cause" is
-# not listed because two fixed templates say "not ... the cause" and "does not
-# show that ... causes"; a separate test allows those two and no other use.
+# not listed because two fixed action templates say "not as the cause of" and
+# "causes churn" in a negation; a separate test allows those two and no other use.
 BANNED_PHRASES = [
     "because",
     "prevent", "prevents", "prevented",
@@ -5118,14 +5122,14 @@ ALL_TEMPLATES = {
     "BREAK_EVEN_ACTION": BREAK_EVEN_ACTION,
     "BREAK_EVEN_ABOVE_ONE_FINDING": BREAK_EVEN_ABOVE_ONE_FINDING,
     "BREAK_EVEN_ABOVE_ONE_ACTION": BREAK_EVEN_ABOVE_ONE_ACTION,
-    "FIBER_OPTIC_FINDING": FIBER_OPTIC_FINDING,
-    "FIBER_OPTIC_ACTION": FIBER_OPTIC_ACTION,
+    "INTERNET_CAUTION_FINDING": INTERNET_CAUTION_FINDING,
+    "INTERNET_CAUTION_ACTION": INTERNET_CAUTION_ACTION,
 }
 RECOMMENDATION_ORDER = [
     "start-with-the-high-tier",
     "one-input-leads-the-drivers",
     "break-even-save-rate",
-    "fiber-optic-on-the-list",
+    "internet-type-caution",
 ]
 
 
@@ -5145,6 +5149,17 @@ def hand_base_case(break_even=0.104):
     )
 
 
+def hand_results(base_case=None):
+    empty = pd.DataFrame()
+    return EconomicsResults(
+        base_case=hand_base_case() if base_case is None else base_case,
+        one_at_a_time=empty,
+        save_rate_by_months=empty,
+        break_even_by_cost_and_months=empty,
+        k_sweep=empty,
+    )
+
+
 def hand_facts():
     return compute_recommendation_facts(**fact_arguments())
 
@@ -5158,17 +5173,20 @@ def facts_without_high_customers(facts):
     return dataclasses.replace(facts, tiers=tiers)
 
 
-def facts_with_lead_count(facts, flagged, count):
-    drivers = facts.flagged_drivers.copy()
-    drivers.iloc[0, drivers.columns.get_loc("first_driver_count")] = count
+def facts_with_any_counts(facts, flagged, counts):
+    """Facts whose flagged driver rows have the given three-driver counts, in table order."""
+    drivers = facts.flagged_drivers.iloc[: len(counts)].copy()
+    drivers["any_driver_count"] = np.array(counts, dtype="int64")
     return dataclasses.replace(facts, customers_flagged=flagged, flagged_drivers=drivers)
 
 
-def facts_with_fiber(facts, **changes):
-    profile = {name: frame.copy() for name, frame in facts.categorical_profile.items()}
-    for column, value in changes.items():
-        profile["internet_type"].loc["Fiber Optic", column] = value
-    return dataclasses.replace(facts, categorical_profile=profile)
+def facts_with_internet_share(facts, share, rank=None):
+    changes = {"share": share}
+    if rank is not None:
+        changes["rank"] = rank
+    return dataclasses.replace(
+        facts, internet_type_importance=dataclasses.replace(facts.internet_type_importance, **changes)
+    )
 
 
 def facts_without_fiber(facts):
@@ -5191,15 +5209,16 @@ def evidence_text(value):
 
 def recommendation_variants():
     facts = hand_facts()
-    big = facts_with_fiber(facts, all_count=1234)
-    big = dataclasses.replace(big, customers_scored=12345)
-    big = facts_with_lead_count(big, 1408, 1234)
+    big = facts_with_any_counts(facts, 1408, [1234, 100])
+    big = facts_with_internet_share(big, 0.123, rank=7)
+    minimal = facts_with_any_counts(facts_without_high_customers(facts), 10, [1, 1])
+    minimal = facts_with_internet_share(minimal, 0.0099)
     return [
         ("all-four", facts, hand_base_case(0.104)),
         ("above-one", facts, hand_base_case(1.5)),
         ("exactly-one", facts, hand_base_case(1.0)),
         ("large-counts", big, hand_base_case(0.5)),
-        ("minimal", facts_without_fiber(facts_without_high_customers(facts_with_lead_count(facts, 2, 1))), hand_base_case(0.3)),
+        ("minimal", minimal, hand_base_case(0.3)),
     ]
 
 
@@ -5212,11 +5231,10 @@ def test_hand_made_facts_give_the_exact_expected_sentences():
     assert identifiers(recommendations) == RECOMMENDATION_ORDER
     assert [item.finding for item in recommendations] == [
         "The High tier holds 2 customers, with churn probabilities from 90.0% to 95.0%.",
-        "Contract type is the first driver for 2 of the 2 flagged customers.",
+        "Contract type is among the three main drivers for 2 of the 2 flagged customers (100.0%).",
         "In the simulated base case the break-even save rate is 10.4%: the offer would pay off "
         "only if at least that share of would-be churners were kept.",
-        "Fiber Optic customers are 1 of the 2 flagged customers (50.0%) and 3 of the 10 scored "
-        "customers (30.0%).",
+        "The internet type carries 12.1% of the model's global importance, and its rank is 3.",
     ]
     assert [item.action for item in recommendations] == [
         "Start outreach planning with this tier, in list order. The probabilities rank customers "
@@ -5227,10 +5245,10 @@ def test_hand_made_facts_give_the_exact_expected_sentences():
         "If a pilot is considered, measure the real save rate and compare it with this break-even "
         "before extending the offer. The save rate used here is an assumption, not an estimate "
         "from the data.",
-        "This describes who is on the list. The model's overall reliance on the internet type is "
-        "a separate measure, shown in the global importance section, and it does not show that "
-        "Fiber Optic service causes churn. Understanding Fiber Optic churn would need a separate "
-        "evaluation.",
+        "This is a measure of how much the model relies on the input. It does not show that any "
+        "internet type, including Fiber Optic service, causes churn, and related inputs share "
+        "credit, so the share is not the separate effect of the internet type. Understanding "
+        "churn among Fiber Optic customers would need a separate evaluation.",
     ]
 
 
@@ -5248,6 +5266,15 @@ def test_the_above_one_version_has_the_exact_sentences():
     )
 
 
+def test_the_old_fiber_optic_recommendation_is_gone():
+    import retention_platform.inference.recommendations as module
+
+    assert not any(name.startswith("FIBER_OPTIC_") and name != "FIBER_OPTIC_CATEGORY" for name in dir(module))
+    for _, facts, base_case in recommendation_variants():
+        assert "fiber-optic-on-the-list" not in identifiers(select_recommendations(facts, base_case, DRIVER_LABELS))
+    assert module.INTERNET_CAUTION_ID == "internet-type-caution"
+
+
 # Conditions
 
 
@@ -5261,19 +5288,98 @@ def test_the_high_tier_recommendation_needs_at_least_one_high_customer():
     assert "start-with-the-high-tier" not in identifiers(hidden)
 
 
-def test_the_lead_driver_boundary_is_strictly_more_than_half_the_flagged_group():
+def lead_ids(facts):
+    return [r.identifier for r in select_recommendations(facts, hand_base_case(), DRIVER_LABELS)]
+
+
+def test_the_lead_driver_threshold_is_a_named_constant_of_one_fifth():
+    assert LEAD_DRIVER_SHARE_MINIMUM == 0.2
+
+
+@pytest.mark.parametrize(
+    "flagged,count,shown",
+    [(15, 3, True), (15, 2, False), (141, 28, False), (141, 29, True), (5, 1, True), (10, 1, False)],
+    ids=["three-of-fifteen", "two-of-fifteen", "28-of-141", "29-of-141", "one-of-five", "one-of-ten"],
+)
+def test_the_lead_driver_boundary_uses_a_division_and_at_least_one_fifth(flagged, count, shown):
+    facts = facts_with_any_counts(hand_facts(), flagged, [count, 1])
+
+    assert ("one-input-leads-the-drivers" in lead_ids(facts)) is shown
+
+
+def facts_with_driver_rows(facts, flagged, rows):
+    names = [name for name, _ in rows]
+    values = [counts for _, counts in rows]
+    frame = pd.DataFrame(
+        np.array(values, dtype="int64"),
+        index=pd.Index(names, name="feature"),
+        columns=["first_driver_count", "any_driver_count", "raises_count", "lowers_count"],
+    )
+    return dataclasses.replace(facts, customers_flagged=flagged, flagged_drivers=frame)
+
+
+def test_the_leading_feature_is_chosen_by_appearances_and_not_by_first_driver_count():
+    facts = facts_with_driver_rows(
+        hand_facts(), 20, [("alpha", [5, 6, 6, 0]), ("beta", [1, 9, 9, 0]), ("gamma", [0, 2, 2, 0])]
+    )
+    labels = {**DRIVER_LABELS, "alpha": "Alpha label", "beta": "Beta label"}
+
+    item = next(
+        r for r in select_recommendations(facts, hand_base_case(), labels) if r.identifier == "one-input-leads-the-drivers"
+    )
+
+    assert item.finding == "Beta label is among the three main drivers for 9 of the 20 flagged customers (45.0%)."
+    assert item.evidence == {"label": "Beta label", "count": 9, "flagged": 20, "share": 0.45}
+
+
+@pytest.mark.parametrize("order,expected", [(("alpha", "beta"), "Alpha label"), (("beta", "alpha"), "Beta label")], ids=["alpha-first", "beta-first"])
+def test_a_tie_in_appearances_is_resolved_by_the_row_order_of_the_table(order, expected):
+    rows = {"alpha": [5, 6, 6, 0], "beta": [1, 6, 6, 0]}
+    facts = facts_with_driver_rows(hand_facts(), 20, [(name, rows[name]) for name in order])
+    labels = {**DRIVER_LABELS, "alpha": "Alpha label", "beta": "Beta label"}
+
+    item = next(
+        r for r in select_recommendations(facts, hand_base_case(), labels) if r.identifier == "one-input-leads-the-drivers"
+    )
+
+    assert item.evidence["label"] == expected
+
+
+def test_only_the_flagged_driver_table_and_the_flagged_count_decide_the_lead_driver():
     facts = hand_facts()
-    assert LEAD_DRIVER_SHARE_MINIMUM == 0.5
+    changed = dataclasses.replace(
+        facts,
+        all_drivers=facts.all_drivers.iloc[::-1].assign(any_driver_count=1),
+        importance_top=facts.importance_top.assign(rank=list(range(11, 11 + len(facts.importance_top)))),
+        internet_type_importance=dataclasses.replace(facts.internet_type_importance, rank=30),
+    )
 
-    exactly_half = facts_with_lead_count(facts, 140, 70)
-    one_more = facts_with_lead_count(facts, 140, 71)
-    far_below = facts_with_lead_count(facts, 140, 10)
+    first = [(r.identifier, r.finding) for r in select_recommendations(facts, hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers"]
+    second = [(r.identifier, r.finding) for r in select_recommendations(changed, hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers"]
 
-    assert "one-input-leads-the-drivers" not in identifiers(select_recommendations(exactly_half, hand_base_case(), DRIVER_LABELS))
-    assert "one-input-leads-the-drivers" in identifiers(select_recommendations(one_more, hand_base_case(), DRIVER_LABELS))
-    assert "one-input-leads-the-drivers" not in identifiers(select_recommendations(far_below, hand_base_case(), DRIVER_LABELS))
-    finding = next(r for r in select_recommendations(one_more, hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers").finding
-    assert finding == "Contract type is the first driver for 71 of the 140 flagged customers."
+    assert first == second and first
+
+
+def test_the_lead_driver_finding_has_the_exact_sentence_with_count_and_share():
+    facts = facts_with_any_counts(hand_facts(), 141, [1234, 100])
+    big = facts_with_any_counts(hand_facts(), 1408, [1234, 100])
+
+    item = next(r for r in select_recommendations(big, hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers")
+    small = next(r for r in select_recommendations(facts_with_any_counts(hand_facts(), 141, [29, 3]), hand_base_case(), DRIVER_LABELS) if r.identifier == "one-input-leads-the-drivers")
+
+    assert item.finding == "Contract type is among the three main drivers for 1,234 of the 1,408 flagged customers (87.6%)."
+    assert small.finding == "Contract type is among the three main drivers for 29 of the 141 flagged customers (20.6%)."
+
+
+def test_a_missing_label_is_refused_only_when_the_lead_driver_recommendation_is_selected():
+    selected = hand_facts()
+    not_selected = facts_with_any_counts(hand_facts(), 15, [2, 1])
+
+    with pytest.raises(RecommendationsError, match="'contract'"):
+        select_recommendations(selected, hand_base_case(), {})
+    recommendations = select_recommendations(not_selected, hand_base_case(), {})
+
+    assert "one-input-leads-the-drivers" not in identifiers(recommendations)
 
 
 @pytest.mark.parametrize(
@@ -5304,29 +5410,41 @@ def test_exactly_one_hundred_percent_is_the_ordinary_version_and_prints_a_number
     assert "break-even save rate is 100.0%:" in item.finding
 
 
-def test_the_fiber_optic_recommendation_conditions():
-    facts = hand_facts()
-    assert facts.categorical_profile["internet_type"].loc["Fiber Optic", "group_share"] > facts.categorical_profile["internet_type"].loc["Fiber Optic", "all_share"]
-    equal = facts_with_fiber(facts, group_share=facts.categorical_profile["internet_type"].loc["Fiber Optic", "all_share"])
-    lower = facts_with_fiber(facts, group_share=0.1)
-
-    assert "fiber-optic-on-the-list" in identifiers(select_recommendations(facts, hand_base_case(), DRIVER_LABELS))
-    assert "fiber-optic-on-the-list" not in identifiers(select_recommendations(equal, hand_base_case(), DRIVER_LABELS))
-    assert "fiber-optic-on-the-list" not in identifiers(select_recommendations(lower, hand_base_case(), DRIVER_LABELS))
-    assert "fiber-optic-on-the-list" not in identifiers(
-        select_recommendations(facts_without_fiber(facts), hand_base_case(), DRIVER_LABELS)
-    )
+def test_the_internet_type_threshold_is_a_named_constant_of_one_percent():
+    assert INTERNET_TYPE_SHARE_MINIMUM == 0.01
 
 
-def test_the_order_is_fixed_and_a_subset_keeps_it():
+@pytest.mark.parametrize(
+    "share,shown",
+    [(0.0099, False), (0.01, True), (0.0101, True), (0.0, False), (0.5, True)],
+    ids=["just-below", "exactly-one-percent", "just-above", "zero", "large"],
+)
+def test_the_internet_type_caution_follows_the_share_threshold(share, shown):
+    facts = facts_with_internet_share(hand_facts(), share, rank=20)
+
+    assert ("internet-type-caution" in lead_ids(facts)) is shown
+
+
+def test_the_internet_type_caution_has_the_exact_sentence_with_share_and_rank():
+    facts = facts_with_internet_share(hand_facts(), 0.01, rank=20)
+
+    item = next(r for r in select_recommendations(facts, hand_base_case(), DRIVER_LABELS) if r.identifier == "internet-type-caution")
+
+    assert item.finding == "The internet type carries 1.0% of the model's global importance, and its rank is 20."
+    assert item.action == INTERNET_CAUTION_ACTION
+    assert item.evidence == {"share": 0.01, "rank": 20}
+
+
+def test_the_internet_type_caution_is_last_and_the_order_is_fixed():
     facts = hand_facts()
 
     full = select_recommendations(facts, hand_base_case(), DRIVER_LABELS)
     subset = select_recommendations(
-        facts_without_fiber(facts_without_high_customers(facts)), hand_base_case(), DRIVER_LABELS
+        facts_without_high_customers(facts_with_internet_share(facts, 0.001)), hand_base_case(), DRIVER_LABELS
     )
 
     assert identifiers(full) == RECOMMENDATION_ORDER
+    assert identifiers(full)[-1] == "internet-type-caution"
     assert identifiers(subset) == ["one-input-leads-the-drivers", "break-even-save-rate"]
 
 
@@ -5355,7 +5473,6 @@ def test_large_counts_use_thousands_separators():
     findings = {r.identifier: r.finding for r in select_recommendations(facts, base_case, DRIVER_LABELS)}
 
     assert "1,234 of the 1,408 flagged customers" in findings["one-input-leads-the-drivers"]
-    assert "1,234 of the 12,345 scored customers" in findings["fiber-optic-on-the-list"]
 
 
 @pytest.mark.parametrize("name,facts,base_case", recommendation_variants(), ids=VARIANT_IDS)
@@ -5373,9 +5490,9 @@ def test_the_word_cause_appears_only_in_the_two_fixed_negations():
         if re.search(r"\bcauses?\b", text, flags=re.IGNORECASE)
     }
 
-    assert uses == {"LEAD_DRIVER_ACTION": 1, "FIBER_OPTIC_ACTION": 1}
+    assert uses == {"LEAD_DRIVER_ACTION": 1, "INTERNET_CAUTION_ACTION": 1}
     assert "not as the cause of any customer's risk" in LEAD_DRIVER_ACTION
-    assert "does not show that Fiber Optic service causes churn" in FIBER_OPTIC_ACTION
+    assert "causes churn" in INTERNET_CAUTION_ACTION
 
 
 def test_the_templates_hold_no_run_specific_figure():
@@ -5383,7 +5500,7 @@ def test_the_templates_hold_no_run_specific_figure():
 
     assert digits == {}
     assert BREAK_EVEN_LIMIT_TEXT == "100%"
-    for name in ("HIGH_TIER_FINDING", "LEAD_DRIVER_FINDING", "BREAK_EVEN_FINDING", "FIBER_OPTIC_FINDING"):
+    for name in ("HIGH_TIER_FINDING", "LEAD_DRIVER_FINDING", "BREAK_EVEN_FINDING", "INTERNET_CAUTION_FINDING"):
         assert "{" in ALL_TEMPLATES[name]
 
 
@@ -5403,19 +5520,6 @@ def test_all_text_is_ascii_and_deterministic(name, facts, base_case):
 
 
 # Refusals and caller mistakes
-
-
-def test_a_missing_label_for_the_lead_feature_is_refused_and_names_the_feature():
-    with pytest.raises(RecommendationsError, match="'contract'"):
-        select_recommendations(hand_facts(), hand_base_case(), {})
-
-
-def test_a_label_is_only_needed_when_the_lead_driver_recommendation_is_selected():
-    facts = facts_with_lead_count(hand_facts(), 140, 10)
-
-    recommendations = select_recommendations(facts, hand_base_case(), {})
-
-    assert "one-input-leads-the-drivers" not in identifiers(recommendations)
 
 
 RECOMMENDATION_CALLER_MISTAKES = {
@@ -5479,6 +5583,7 @@ ADR_SECTION_TITLES = [
     "Limitations",
 ]
 DOCUMENT_TEMPLATES = {
+    **ALL_TEMPLATES,
     "LIST_INTRO": LIST_INTRO,
     "LIST_COUNTS": LIST_COUNTS,
     "TIER_INTRO": TIER_INTRO,
@@ -5501,19 +5606,26 @@ DOCUMENT_TEMPLATES = {
     "NO_RECOMMENDATION_TEXT": NO_RECOMMENDATION_TEXT,
     "LIMITATIONS": " ".join(LIMITATIONS_BULLETS),
 }
-CAUSE_ALLOWED_SENTENCES = [LEAD_DRIVER_ACTION, FIBER_OPTIC_ACTION, INTERNET_TYPE_FIBER_OPTIC]
+CAUSE_ALLOWED_SENTENCES = [LEAD_DRIVER_ACTION, INTERNET_CAUTION_ACTION]
+NEW_FIBER_SENTENCE = (
+    "This measures how much the model relies on the internet type as a whole; it is not a measure "
+    "of Fiber Optic service alone. This share does not establish an observed difference in churn between "
+    "Fiber Optic customers and other customers, and it does not give a causal explanation of why "
+    "any customers leave."
+)
 
 
-def render_recommendations(facts=None, recommendations=None, base_case=None, labels=None, **overrides):
+def render_recommendations(facts=None, recommendations=None, base_case=None, labels=None, results=None, **overrides):
     facts = hand_facts() if facts is None else facts
-    base_case = hand_base_case() if base_case is None else base_case
+    if results is None:
+        results = hand_results(hand_base_case() if base_case is None else base_case)
     labels = DRIVER_LABELS if labels is None else labels
     if recommendations is None:
-        recommendations = select_recommendations(facts, base_case, labels)
+        recommendations = select_recommendations(facts, results.base_case, labels)
     arguments = dict(
         facts=facts,
         recommendations=recommendations,
-        base_case=base_case,
+        results=results,
         labels=labels,
         k_frac=FACT_K,
         medium_edge=FACT_EDGE,
@@ -5536,16 +5648,14 @@ def facts_with_empty_medium_tier(facts):
 def document_variants():
     facts = hand_facts()
     not_in_top = compute_recommendation_facts(**fact_arguments(internet_position=11))
-    no_fiber = facts_without_fiber(facts)
-    variants = [
+    return [
         ("all-four", facts, hand_base_case(0.104)),
         ("above-one", facts, hand_base_case(1.5)),
         ("exactly-one", facts, hand_base_case(1.0)),
         ("empty-medium-tier", facts_with_empty_medium_tier(facts), hand_base_case(0.104)),
-        ("no-fiber", no_fiber, hand_base_case(0.104)),
+        ("no-fiber", facts_without_fiber(facts), hand_base_case(0.104)),
         ("internet-type-not-in-top", not_in_top, hand_base_case(0.104)),
     ]
-    return variants
 
 
 DOCUMENT_VARIANT_IDS = [variant[0] for variant in document_variants()]
@@ -5621,6 +5731,7 @@ def test_group_profile_tables_for_the_hand_made_facts():
     assert "The tables compare the 2 flagged customers with all 10 scored customers." in section
     assert tables[0] == [
         ["Characteristic", "Flagged customers (mean)", "All scored customers (mean)"],
+        ["Mean churn probability", "92.5%", "50.0%"],
         ["Monthly charge (currency units per month)", "90.00", "55.00"],
         ["Tenure in months", "3.0", "11.0"],
     ]
@@ -5637,6 +5748,15 @@ def test_group_profile_tables_for_the_hand_made_facts():
         ["Cable", "1", "50.0%", "2", "20.0%"],
         ["DSL", "0", "0.0%", "2", "20.0%"],
     ]
+
+
+def test_the_mean_probability_row_needs_no_label_in_the_label_map():
+    labels = dict(DRIVER_LABELS)
+    assert "Mean churn probability" not in labels.values() and "mean_probability" not in labels
+
+    text = render_recommendations(labels=labels)
+
+    assert "| Mean churn probability | 92.5% | 50.0% |" in text
 
 
 def test_global_importance_table_and_paragraph_for_the_hand_made_facts():
@@ -5660,20 +5780,35 @@ def test_the_internet_type_paragraph_in_both_variants_and_its_place():
     assert "The internet type is not among the 10 most important inputs: it carries 2.2% of the model's global importance, and its rank is 12." in outside
     for text in (inside, outside):
         lines = text.split("\n")
-        table_end = max(i for i, line in enumerate(lines) if line.startswith("|") and i < next(j for j, l in enumerate(lines) if l.startswith("The internet type")))
-        paragraph = next(i for i, line in enumerate(lines) if line.startswith("The internet type"))
+        first_paragraph = next(i for i, line in enumerate(lines) if line.startswith("The internet type"))
+        table_end = max(i for i, line in enumerate(lines) if line.startswith("|") and i < first_paragraph)
         drivers_heading = lines.index("## Customer-level drivers and how to interpret them")
-        assert table_end < paragraph < drivers_heading
-        assert lines[paragraph - 1] == "" and lines[table_end + 1] == ""
+        assert table_end < first_paragraph < drivers_heading
+        assert lines[first_paragraph - 1] == "" and lines[table_end + 1] == ""
 
 
-def test_the_fiber_optic_sentence_only_appears_with_the_fiber_optic_category():
+def test_the_new_fiber_sentence_appears_only_with_the_fiber_optic_category():
     with_fiber = render_recommendations()
     without_fiber = render_recommendations(facts_without_fiber(hand_facts()))
 
-    assert INTERNET_TYPE_FIBER_OPTIC in with_fiber
-    assert INTERNET_TYPE_FIBER_OPTIC not in without_fiber
+    assert INTERNET_TYPE_FIBER_OPTIC == NEW_FIBER_SENTENCE
+    paragraph = next(line for line in with_fiber.split("\n") if line.startswith("The internet type"))
+    assert paragraph.endswith(NEW_FIBER_SENTENCE)
+    assert NEW_FIBER_SENTENCE not in without_fiber
     assert "The internet type is among" in without_fiber
+    assert CORRELATION_CAVEAT in with_fiber and CORRELATION_CAVEAT in without_fiber
+
+
+@pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
+def test_no_fiber_specific_percentage_appears_in_any_recommendation_or_paragraph(name, facts, base_case):
+    text = render_recommendations(facts, base_case=base_case)
+
+    assert "Fiber Optic customers are" not in text
+    assert "fiber-optic-on-the-list" not in text
+    section = section_text(text, "Business recommendations")
+    assert not re.search(r"Fiber Optic[^.]*\d", section)
+    paragraph = [line for line in text.split("\n") if line.startswith("This measures how much")]
+    assert all(not re.search(r"\d", line) for line in paragraph)
 
 
 def test_driver_table_for_the_hand_made_facts_and_the_fixed_paragraph():
@@ -5696,17 +5831,16 @@ def test_at_most_ten_driver_rows_are_shown():
     facts = compute_recommendation_facts(**data)
     assert len(facts.flagged_drivers) == 6
     wide = pd.DataFrame(
-        {name: facts.flagged_drivers[name].iloc[0] for name in facts.flagged_drivers.columns}
-        | {},
+        {name: facts.flagged_drivers[name].iloc[0] for name in facts.flagged_drivers.columns},
         index=[f"feature_{i:02d}" for i in range(14)],
     )
     wide.index.name = "feature"
     facts = dataclasses.replace(facts, flagged_drivers=wide)
     labels = {**DRIVER_LABELS, **{f"feature_{i:02d}": f"Feature {i}" for i in range(14)}}
-    base = BaseCase(30, 600.0, 20.0, 4.0, 400.0, 100.0, 3.3, 0.2, 80.0, "derived", 30)
+    results = hand_results(BaseCase(30, 600.0, 20.0, 4.0, 400.0, 100.0, 3.3, 0.2, 80.0, "derived", 30))
 
     text = render_recommendations_document(
-        facts, [], base, labels, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
+        facts, [], results, labels, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
     )
     table = markdown_tables(section_text(text, "Customer-level drivers and how to interpret them"))[0]
 
@@ -5743,24 +5877,36 @@ def test_the_headline_break_even_follows_the_recommendation_rule(break_even, sho
     assert markdown_tables(section_text(text, "Headline economics"))[0][-1] == ["Break-even save rate", shown]
 
 
-def test_the_money_strings_equal_those_of_the_economics_document():
+def test_the_headline_figures_come_from_the_results_base_case():
+    base = dataclasses.replace(hand_base_case(), net_expected_value=1234.5, ev_per_contacted_customer=617.25)
+    recommendations = select_recommendations(hand_facts(), base, DRIVER_LABELS)
+
+    text = render_recommendations(recommendations=recommendations, results=hand_results(base))
+
+    rows = {row[0]: row[1] for row in markdown_tables(section_text(text, "Headline economics"))[0][1:]}
+    assert rows["Net expected value (currency units)"] == "1,234.50"
+    assert rows["Expected value per contacted customer (currency units)"] == "617.25"
+
+
+def test_the_money_strings_equal_those_of_the_economics_document_for_the_same_results():
     table, charges = economics_inputs(300, seed=21)
     results = analyze_economics(table, charges, 0.10, ECON_K_VALUES, ECON_ASSUMPTIONS)
     economics_text = render_document(results, ECON_ASSUMPTIONS, 300)
     economics_base = {row[0]: row[1] for row in markdown_tables(economics_text)[1][1:]}
     facts = compute_recommendation_facts(**seeded_fact_data(n_rows=300))
+    recommendations = select_recommendations(facts, results.base_case, DRIVER_LABELS)
 
     text = render_recommendations_document(
-        facts, [], results.base_case, DRIVER_LABELS, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
+        facts, recommendations, results, DRIVER_LABELS, 0.10, 0.25, DOC_SCORING_RUN_ID, DOC_MODEL_RUN_ID
     )
-    economics_rows = {row[0]: row[1] for row in markdown_tables(section_text(text, "Headline economics"))[0][1:]}
+    rows = {row[0]: row[1] for row in markdown_tables(section_text(text, "Headline economics"))[0][1:]}
 
     for name in (
         "Net expected value (currency units)",
         "Expected value per contacted customer (currency units)",
     ):
-        assert economics_rows[name] == economics_base[name]
-    assert economics_rows["Break-even save rate"] == economics_base["Break-even save rate"]
+        assert rows[name] == economics_base[name]
+    assert rows["Break-even save rate"] == economics_base["Break-even save rate"]
 
 
 def test_recommendations_are_embedded_in_the_given_order_with_exact_sentences():
@@ -5809,7 +5955,7 @@ def test_no_banned_phrase_appears_in_the_document(name, facts, base_case):
 
 
 @pytest.mark.parametrize("name,facts,base_case", document_variants(), ids=DOCUMENT_VARIANT_IDS)
-def test_cause_appears_only_in_the_fixed_sentences(name, facts, base_case):
+def test_cause_appears_only_in_the_two_allowed_action_sentences(name, facts, base_case):
     text = render_recommendations(facts, base_case=base_case)
 
     for sentence in CAUSE_ALLOWED_SENTENCES:
@@ -5833,6 +5979,7 @@ def test_text_form_is_plain_ascii_with_lf_endings_and_one_trailing_newline(name,
 
 def test_the_document_is_deterministic_and_leaves_the_inputs_unchanged():
     facts, base_case = hand_facts(), hand_base_case()
+    results = hand_results(base_case)
     recommendations = select_recommendations(facts, base_case, DRIVER_LABELS)
     before = {
         "tiers": facts.tiers.copy(deep=True),
@@ -5842,8 +5989,8 @@ def test_the_document_is_deterministic_and_leaves_the_inputs_unchanged():
     }
     labels = dict(DRIVER_LABELS)
 
-    first = render_recommendations(facts, recommendations, base_case, labels)
-    second = render_recommendations(facts, recommendations, base_case, labels)
+    first = render_recommendations(facts, recommendations, results=results, labels=labels)
+    second = render_recommendations(facts, recommendations, results=results, labels=labels)
 
     assert first == second
     pd.testing.assert_frame_equal(facts.tiers, before["tiers"])
@@ -5851,6 +5998,7 @@ def test_the_document_is_deterministic_and_leaves_the_inputs_unchanged():
     pd.testing.assert_frame_equal(facts.importance_top, before["importance"])
     pd.testing.assert_frame_equal(facts.categorical_profile["internet_type"], before["internet"])
     assert labels == DRIVER_LABELS
+    assert results.base_case == hand_base_case()
     assert recommendations == select_recommendations(hand_facts(), hand_base_case(), DRIVER_LABELS)
 
 
@@ -5871,7 +6019,7 @@ def document_arguments():
     return dict(
         facts=facts,
         recommendations=select_recommendations(facts, base_case, DRIVER_LABELS),
-        base_case=base_case,
+        results=hand_results(base_case),
         labels=dict(DRIVER_LABELS),
         k_frac=FACT_K,
         medium_edge=FACT_EDGE,
@@ -5892,16 +6040,20 @@ def with_first_record(arguments, **changes):
     return records
 
 
+def results_with(arguments, **changes):
+    return hand_results(dataclasses.replace(arguments["results"].base_case, **changes))
+
+
+def recommendations_from(arguments, break_even):
+    return select_recommendations(arguments["facts"], hand_base_case(break_even), DRIVER_LABELS)
+
+
 DOCUMENT_CALLER_MISTAKES = {
     "facts-none": lambda a: dict(facts=None),
     "facts-a-dict": lambda a: dict(facts={"tiers": 1}),
     "recommendations-a-tuple": lambda a: dict(recommendations=tuple(a["recommendations"])),
     "recommendations-hold-text": lambda a: dict(recommendations=["start"]),
     "recommendations-repeat-an-identifier": lambda a: dict(recommendations=[a["recommendations"][0]] * 2),
-    "base-case-a-dict": lambda a: dict(base_case={"customers_contacted": 2}),
-    "labels-a-list": lambda a: dict(labels=["Contract type"]),
-    "label-empty": lambda a: dict(labels={**a["labels"], "contract": " "}),
-    "label-not-text": lambda a: dict(labels={**a["labels"], "contract": 5}),
     "finding-not-text": lambda a: dict(recommendations=with_first_record(a, finding=5)),
     "finding-empty": lambda a: dict(recommendations=with_first_record(a, finding="")),
     "finding-with-a-line-break": lambda a: dict(recommendations=with_first_record(a, finding="one\ntwo")),
@@ -5916,6 +6068,13 @@ DOCUMENT_CALLER_MISTAKES = {
     "action-that-injects-a-heading": lambda a: dict(
         recommendations=with_first_record(a, action="x\n## Injected heading")
     ),
+    "results-none": lambda a: dict(results=None),
+    "results-a-dict": lambda a: dict(results={"base_case": 1}),
+    "results-hold-a-base-case-of-the-wrong-type": lambda a: dict(results=hand_results({"customers_contacted": 2})),
+    "results-given-as-a-base-case": lambda a: dict(results=a["results"].base_case),
+    "labels-a-list": lambda a: dict(labels=["Contract type"]),
+    "label-empty": lambda a: dict(labels={**a["labels"], "contract": " "}),
+    "label-not-text": lambda a: dict(labels={**a["labels"], "contract": 5}),
     "k-zero": lambda a: dict(k_frac=0),
     "k-bool": lambda a: dict(k_frac=True),
     "k-equal-to-the-edge": lambda a: dict(k_frac=0.5),
@@ -5925,13 +6084,16 @@ DOCUMENT_CALLER_MISTAKES = {
     "flagged-count-differs": lambda a: dict(facts=dataclasses.replace(a["facts"], customers_flagged=3)),
     "high-tier-count-differs": lambda a: dict(facts=tiers_with_high_customers(a["facts"], 3)),
     "scored-count-differs": lambda a: dict(facts=dataclasses.replace(a["facts"], customers_scored=50)),
-    "contacted-count-differs": lambda a: dict(
-        base_case=dataclasses.replace(a["base_case"], customers_contacted=5)
+    "contacted-count-differs": lambda a: dict(results=results_with(a, customers_contacted=5)),
+    "break-even-nan": lambda a: dict(results=results_with(a, break_even_save_rate=float("nan"))),
+    "break-even-zero": lambda a: dict(results=results_with(a, break_even_save_rate=0.0)),
+    "break-even-recommendation-from-another-base-case": lambda a: dict(results=results_with(a, break_even_save_rate=0.2)),
+    "break-even-recommendation-above-one-but-results-below": lambda a: dict(
+        recommendations=recommendations_from(a, 1.5)
     ),
-    "break-even-nan": lambda a: dict(
-        base_case=dataclasses.replace(a["base_case"], break_even_save_rate=float("nan"))
+    "break-even-recommendation-below-one-but-results-above": lambda a: dict(
+        results=results_with(a, break_even_save_rate=1.5)
     ),
-    "break-even-zero": lambda a: dict(base_case=dataclasses.replace(a["base_case"], break_even_save_rate=0.0)),
 }
 
 
@@ -5942,6 +6104,25 @@ def test_document_caller_mistakes_raise_value_error(build):
 
     with pytest.raises(ValueError):
         render_recommendations_document(**arguments)
+
+
+def test_a_document_without_a_break_even_recommendation_has_nothing_to_compare():
+    arguments = document_arguments()
+    arguments["recommendations"] = [r for r in arguments["recommendations"] if r.identifier != "break-even-save-rate"]
+    arguments["results"] = results_with(arguments, break_even_save_rate=0.2)
+
+    text = render_recommendations_document(**arguments)
+
+    assert "20.0%" in text
+
+
+def test_matching_break_even_recommendations_are_accepted_below_and_above_one():
+    for break_even in (0.104, 1.0, 1.5):
+        arguments = document_arguments()
+        arguments["recommendations"] = recommendations_from(arguments, break_even)
+        arguments["results"] = hand_results(hand_base_case(break_even))
+
+        assert render_recommendations_document(**arguments).startswith("# Business Recommendations")
 
 
 @pytest.mark.parametrize("field", ["scoring_run_id", "model_run_id"])
@@ -6032,6 +6213,10 @@ def facts_with_non_finite(facts, where, value):
         importance = facts.importance_top.copy()
         importance.loc["contract", "share"] = value
         return dataclasses.replace(facts, importance_top=importance)
+    if where == "mean-probability-flagged":
+        return dataclasses.replace(facts, mean_probability_flagged=value)
+    if where == "mean-probability-all":
+        return dataclasses.replace(facts, mean_probability_all=value)
     return dataclasses.replace(
         facts, internet_type_importance=dataclasses.replace(facts.internet_type_importance, share=value)
     )
@@ -6043,6 +6228,8 @@ NON_FINITE_PLACES = {
     "overall-mean": "the overall mean of monthly_charge is not finite",
     "importance-share": "the importance share of contract is not finite",
     "internet-type-share": "the internet type share is not finite",
+    "mean-probability-flagged": "the mean churn probability of the flagged group is not finite",
+    "mean-probability-all": "the mean churn probability of all scored customers is not finite",
 }
 
 
@@ -6054,3 +6241,71 @@ def test_a_non_finite_fact_is_refused_and_named(where, message, value):
 
     with pytest.raises(RecommendationsError, match=message):
         render_recommendations_document(**arguments)
+
+
+# Mean churn probability facts
+
+
+def test_hand_made_mean_probabilities():
+    facts = hand_facts()
+
+    assert facts.mean_probability_flagged == pytest.approx((0.95 + 0.90) / 2, rel=1e-12)
+    assert facts.mean_probability_all == pytest.approx(sum(FACT_PROBABILITIES) / 10, rel=1e-12)
+    assert facts.mean_probability_all == pytest.approx(0.5, rel=1e-12)
+
+
+def test_seeded_mean_probabilities_match_a_plain_python_recomputation():
+    data = seeded_fact_data()
+    facts = compute_recommendation_facts(**data)
+    table = data["table"]
+    ordered = sorted(zip(table["rank"], table["churn_probability"]))
+    group = [probability for _, probability in ordered[: top_k_count(len(ordered), 0.10)]]
+
+    assert facts.mean_probability_flagged == pytest.approx(sum(group) / len(group), rel=1e-12)
+    assert facts.mean_probability_all == pytest.approx(sum(p for _, p in ordered) / len(ordered), rel=1e-12)
+    assert facts.mean_probability_flagged > facts.mean_probability_all
+
+
+def test_the_flagged_mean_uses_only_the_flagged_rows():
+    arguments = fact_arguments()
+    reference = compute_recommendation_facts(**arguments)
+    changed = dict(arguments)
+    table = arguments["table"].copy()
+    table.loc[9, "churn_probability"] = 0.01
+    changed["table"] = table
+
+    facts = compute_recommendation_facts(**changed)
+
+    assert facts.mean_probability_flagged == reference.mean_probability_flagged
+    assert facts.mean_probability_all != reference.mean_probability_all
+    assert facts.mean_probability_all == pytest.approx((sum(FACT_PROBABILITIES) - 0.05 + 0.01) / 10, rel=1e-12)
+
+
+def test_the_mean_probabilities_do_not_depend_on_the_order_of_the_inputs():
+    data = seeded_fact_data()
+    reference = compute_recommendation_facts(**data)
+    shuffled = dict(data)
+    shuffled["table"] = data["table"].sample(frac=1, random_state=7).reset_index(drop=True)
+    shuffled["inputs"] = data["inputs"].sample(frac=1, random_state=8)
+    shuffled["drivers"] = data["drivers"].sample(frac=1, random_state=9)
+
+    facts = compute_recommendation_facts(**shuffled)
+
+    assert facts.mean_probability_flagged == reference.mean_probability_flagged
+    assert facts.mean_probability_all == reference.mean_probability_all
+    assert isinstance(facts.mean_probability_flagged, float) and isinstance(facts.mean_probability_all, float)
+
+
+def test_real_population_mean_probabilities(driver_data, driver_contributions, driver_importance):
+    frame = driver_data.inputs.copy()
+    frame.insert(0, "customer_id", pd.Series(driver_data.ids, dtype=object))
+    table = score_batch(frame, driver_data.run, 0.10)
+    inputs = driver_data.inputs.set_axis(pd.Index(driver_data.ids, name="customer_id"))
+    drivers = select_top_drivers(driver_contributions)
+
+    facts = compute_recommendation_facts(table, inputs, drivers, driver_importance, 0.10, 0.25)
+
+    probabilities = table["churn_probability"].tolist()
+    assert facts.mean_probability_all == pytest.approx(sum(probabilities) / len(probabilities), rel=1e-12)
+    assert facts.mean_probability_flagged == pytest.approx(sum(probabilities[:141]) / 141, rel=1e-12)
+    assert 0 < facts.mean_probability_all < facts.mean_probability_flagged <= 1
