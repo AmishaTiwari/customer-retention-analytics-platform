@@ -10,6 +10,7 @@ its failure classes).
 Section F: ranking: top_k_count and risk tiers.
 Section G: drivers (structure check, averaged contributions, top-driver selection).
 Section H: economics (expected value, break-even and sensitivity tables).
+Section I: recommendation facts (tiers, group profile, importance and driver counts).
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ from retention_platform.data.prepare import (
 from retention_platform.features.build import run_features
 from retention_platform import tracking
 from retention_platform.config import REPO_ROOT, ConfigValidationError, load_config
-from retention_platform.inference import economics, outputs, score, validate
+from retention_platform.inference import economics, outputs, recommendations, score, validate
 from retention_platform.inference.economics import (
     ARPU_MULTIPLES,
     MONTHS_KEPT_SWEEP,
@@ -73,6 +74,13 @@ from retention_platform.inference.outputs import (
     outreach_csv_bytes,
     publish_outputs,
     summary_json_bytes,
+)
+from retention_platform.inference.recommendations import (
+    NO_INTERNET_CATEGORY,
+    PROFILE_CATEGORICAL_COLUMNS,
+    TOP_N_IMPORTANCE,
+    RecommendationsError,
+    compute_recommendation_facts,
 )
 from retention_platform.inference.score import (
     PostPublicationTrackingError,
@@ -110,6 +118,7 @@ from retention_platform.models.persist import (
     publish_run,
 )
 from retention_platform.pipeline.preprocess import (
+    INTERNET_TYPE_SENTINEL,
     build_preprocessing_pipeline,
     prepare_model_inputs,
 )
@@ -4353,3 +4362,691 @@ def test_a_break_even_that_is_not_finite_in_the_base_case_is_refused(bad):
 
     with pytest.raises(ValueError, match="break-even save rate is not finite"):
         render_document(damaged, ECON_ASSUMPTIONS, 3, k_frac=1.0)
+
+
+# =============================================================================
+# Section I: Recommendation facts
+# =============================================================================
+
+FACT_K = 0.2
+FACT_EDGE = 0.5
+FACT_IDS = [f"C{i:02d}" for i in range(1, 11)]
+FACT_PROBABILITIES = [0.95, 0.90, 0.80, 0.70, 0.60, 0.40, 0.30, 0.20, 0.10, 0.05]
+FACT_CHARGES = [100, 80, 60, 70, 50, 40, 90, 30, 20, 10]
+FACT_TENURES = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+FACT_CONTRACTS = [
+    "Month-to-Month", "Month-to-Month", "One Year", "Two Year", "Month-to-Month",
+    "One Year", "Two Year", "Two Year", "Month-to-Month", "One Year",
+]
+FACT_INTERNET = [
+    "Fiber Optic", "Cable", None, "DSL", "Fiber Optic", None, "DSL", "Cable", None, "Fiber Optic",
+]
+R, L = DIRECTION_RAISES, DIRECTION_LOWERS
+FACT_DRIVERS = [
+    [("contract", R), ("monthly_charge", R), ("tenure_in_months", L)],
+    [("contract", R), ("age", L), ("monthly_charge", R)],
+    [("contract", L), ("age", R), ("tenure_in_months", R)],
+    [("age", R), ("contract", L), ("tenure_in_months", L)],
+    [("tenure_in_months", L), ("contract", R), ("age", L)],
+    [("contract", L), ("monthly_charge", L), ("age", R)],
+    [("monthly_charge", R), ("age", R), ("contract", R)],
+    [("contract", R), ("tenure_in_months", R), ("age", L)],
+    [("age", L), ("contract", L), ("monthly_charge", R)],
+    [("monthly_charge", L), ("contract", R), ("tenure_in_months", L)],
+]
+FACT_OTHER_FEATURES = [
+    "contract", "number_of_referrals", "monthly_charge", "age", "tenure_in_months", "gender",
+    "offer", "dependents", "latitude", "longitude", "population", "married",
+]
+
+
+def fact_table():
+    return pd.DataFrame(
+        {
+            "customer_id": pd.Series(FACT_IDS, dtype=object),
+            "churn_probability": pd.Series(FACT_PROBABILITIES, dtype="float64"),
+            "rank": pd.Series(range(1, 11), dtype="int64"),
+            "in_top_k": pd.Series([True, True] + [False] * 8, dtype=bool),
+        }
+    )
+
+
+def fact_inputs():
+    return pd.DataFrame(
+        {
+            "monthly_charge": FACT_CHARGES,
+            "tenure_in_months": FACT_TENURES,
+            "contract": FACT_CONTRACTS,
+            "internet_type": np.array(FACT_INTERNET, dtype=object),
+        },
+        index=pd.Index(FACT_IDS, name="customer_id"),
+    )
+
+
+def fact_drivers(rows=None):
+    rows = FACT_DRIVERS if rows is None else rows
+    flat = [[item for pair in row for item in pair] for row in rows]
+    return pd.DataFrame(flat, index=pd.Index(FACT_IDS, name="customer_id"), columns=DRIVER_COLUMNS, dtype=object)
+
+
+def fact_importance(internet_position):
+    names = list(FACT_OTHER_FEATURES)
+    names.insert(internet_position, "internet_type")
+    weights = np.arange(len(names), 0, -1, dtype=float)
+    return pd.DataFrame(
+        {"share": weights / weights.sum(), "rank": np.arange(1, len(names) + 1, dtype="int64")},
+        index=pd.Index(names, name="feature"),
+    )
+
+
+def fact_arguments(internet_position=2):
+    return dict(
+        table=fact_table(),
+        inputs=fact_inputs(),
+        drivers=fact_drivers(),
+        importance=fact_importance(internet_position),
+        k_frac=FACT_K,
+        medium_edge=FACT_EDGE,
+    )
+
+
+def assert_same_facts(first, second):
+    assert (first.customers_scored, first.customers_flagged) == (second.customers_scored, second.customers_flagged)
+    pd.testing.assert_frame_equal(first.tiers, second.tiers, check_exact=True)
+    pd.testing.assert_frame_equal(first.numeric_profile, second.numeric_profile, check_exact=True)
+    assert list(first.categorical_profile) == list(second.categorical_profile)
+    for column in first.categorical_profile:
+        pd.testing.assert_frame_equal(
+            first.categorical_profile[column], second.categorical_profile[column], check_exact=True
+        )
+    pd.testing.assert_frame_equal(first.importance_top, second.importance_top, check_exact=True)
+    assert first.internet_type_importance == second.internet_type_importance
+    pd.testing.assert_frame_equal(first.flagged_drivers, second.flagged_drivers, check_exact=True)
+    pd.testing.assert_frame_equal(first.all_drivers, second.all_drivers, check_exact=True)
+
+
+# Hand-made population
+
+
+def test_part_zero_the_sentinel_equals_the_preprocessing_sentinel():
+    assert NO_INTERNET_CATEGORY == INTERNET_TYPE_SENTINEL == "No Internet"
+
+
+def test_hand_made_tier_facts():
+    facts = compute_recommendation_facts(**fact_arguments())
+
+    assert list(facts.tiers.index) == ["High", "Medium", "Low"]
+    assert facts.tiers.index.name == "tier"
+    assert list(facts.tiers["customers"]) == [2, 3, 5]
+    assert list(facts.tiers["share"]) == pytest.approx([0.2, 0.3, 0.5])
+    assert list(facts.tiers["min_probability"]) == pytest.approx([0.90, 0.60, 0.05])
+    assert list(facts.tiers["max_probability"]) == pytest.approx([0.95, 0.80, 0.40])
+    assert (facts.customers_scored, facts.customers_flagged) == (10, 2)
+
+
+def test_hand_made_numeric_profile():
+    facts = compute_recommendation_facts(**fact_arguments())
+    profile = facts.numeric_profile
+
+    assert list(profile.index) == ["monthly_charge", "tenure_in_months"]
+    assert list(profile.columns) == ["group_mean", "all_mean"]
+    assert profile.loc["monthly_charge", "group_mean"] == pytest.approx(90.0)
+    assert profile.loc["monthly_charge", "all_mean"] == pytest.approx(55.0)
+    assert profile.loc["tenure_in_months", "group_mean"] == pytest.approx(3.0)
+    assert profile.loc["tenure_in_months", "all_mean"] == pytest.approx(11.0)
+
+
+def test_hand_made_categorical_profiles_with_ties_ordered_by_name():
+    facts = compute_recommendation_facts(**fact_arguments())
+
+    contract = facts.categorical_profile["contract"]
+    assert list(contract.index) == ["Month-to-Month", "One Year", "Two Year"]
+    assert list(contract["group_count"]) == [2, 0, 0]
+    assert list(contract["group_share"]) == pytest.approx([1.0, 0.0, 0.0])
+    assert list(contract["all_count"]) == [4, 3, 3]
+    assert list(contract["all_share"]) == pytest.approx([0.4, 0.3, 0.3])
+
+    internet = facts.categorical_profile["internet_type"]
+    assert list(internet.index) == ["Fiber Optic", "No Internet", "Cable", "DSL"]
+    assert list(internet["group_count"]) == [1, 0, 1, 0]
+    assert list(internet["group_share"]) == pytest.approx([0.5, 0.0, 0.5, 0.0])
+    assert list(internet["all_count"]) == [3, 3, 2, 2]
+    assert list(internet["all_share"]) == pytest.approx([0.3, 0.3, 0.2, 0.2])
+    assert list(facts.categorical_profile) == ["contract", "internet_type"]
+
+
+def test_hand_made_driver_facts_for_the_group_and_for_everyone():
+    facts = compute_recommendation_facts(**fact_arguments())
+
+    flagged = facts.flagged_drivers
+    assert flagged.index.name == "feature"
+    assert list(flagged.columns) == ["first_driver_count", "any_driver_count", "raises_count", "lowers_count"]
+    assert list(flagged.index) == ["contract", "monthly_charge", "age", "tenure_in_months"]
+    assert flagged.loc["contract"].tolist() == [2, 2, 2, 0]
+    assert flagged.loc["monthly_charge"].tolist() == [0, 2, 2, 0]
+    assert flagged.loc["age"].tolist() == [0, 1, 0, 1]
+    assert flagged.loc["tenure_in_months"].tolist() == [0, 1, 0, 1]
+
+    everyone = facts.all_drivers
+    assert list(everyone.index) == ["contract", "age", "monthly_charge", "tenure_in_months"]
+    assert everyone.loc["contract"].tolist() == [5, 10, 6, 4]
+    assert everyone.loc["age"].tolist() == [2, 8, 4, 4]
+    assert everyone.loc["monthly_charge"].tolist() == [2, 6, 4, 2]
+    assert everyone.loc["tenure_in_months"].tolist() == [1, 6, 2, 4]
+    assert (everyone.dtypes == np.int64).all()
+
+
+@pytest.mark.parametrize("position,inside", [(2, True), (11, False)], ids=["inside-the-top-rows", "outside-the-top-rows"])
+def test_the_internet_type_row_is_always_reported(position, inside):
+    facts = compute_recommendation_facts(**fact_arguments(internet_position=position))
+    importance = fact_importance(position)
+
+    assert len(facts.importance_top) == TOP_N_IMPORTANCE == 10
+    assert ("internet_type" in facts.importance_top.index) is inside
+    assert facts.internet_type_importance.in_top_rows is inside
+    assert facts.internet_type_importance.rank == position + 1
+    assert facts.internet_type_importance.share == importance.loc["internet_type", "share"]
+    pd.testing.assert_frame_equal(facts.importance_top, importance.head(10))
+
+
+# Independent recomputation on seeded data
+
+
+def seeded_fact_data(seed=5, n_rows=300, k_frac=0.10, medium_edge=0.25):
+    rng = np.random.default_rng(seed)
+    ids = [f"C{i:04d}" for i in range(n_rows)]
+    table = (
+        pd.DataFrame({"customer_id": ids, "churn_probability": rng.beta(2, 5, n_rows)})
+        .sort_values(["churn_probability", "customer_id"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    table["rank"] = np.arange(1, n_rows + 1, dtype="int64")
+    table["in_top_k"] = table["rank"] <= top_k_count(n_rows, k_frac)
+    options = ["DSL", "Cable", "Fiber Optic", None]
+    inputs = pd.DataFrame(
+        {
+            "monthly_charge": rng.uniform(20, 120, n_rows).round(2),
+            "tenure_in_months": rng.integers(1, 73, n_rows),
+            "contract": [["Month-to-Month", "One Year", "Two Year"][i] for i in rng.integers(0, 3, n_rows)],
+            "internet_type": np.array([options[i] for i in rng.integers(0, 4, n_rows)], dtype=object),
+        },
+        index=pd.Index(ids, name="customer_id"),
+    )
+    pool = ["contract", "age", "monthly_charge", "tenure_in_months", "latitude", "dependents"]
+    rows = []
+    for _ in range(n_rows):
+        chosen = [pool[i] for i in rng.permutation(len(pool))[:3]]
+        rows.append([item for name in chosen for item in (name, [R, L][int(rng.integers(0, 2))])])
+    drivers = pd.DataFrame(rows, index=inputs.index, columns=DRIVER_COLUMNS, dtype=object)
+    names = [*pool, "internet_type", "gender", "offer", "married", "population", "number_of_dependents"]
+    names = [names[i] for i in rng.permutation(len(names))]
+    shares = np.sort(rng.random(len(names)))[::-1]
+    importance = pd.DataFrame(
+        {"share": shares / shares.sum(), "rank": np.arange(1, len(names) + 1, dtype="int64")},
+        index=pd.Index(names, name="feature"),
+    )
+    return dict(
+        table=table, inputs=inputs, drivers=drivers, importance=importance, k_frac=k_frac, medium_edge=medium_edge
+    )
+
+
+def test_seeded_facts_match_a_plain_python_recomputation():
+    data = seeded_fact_data()
+    facts = compute_recommendation_facts(**data)
+    table, inputs, drivers = data["table"], data["inputs"], data["drivers"]
+    n_rows = len(table)
+    high, upto_medium = top_k_count(n_rows, 0.10), top_k_count(n_rows, 0.25)
+
+    for tier, low_rank, high_rank in (("High", 1, high), ("Medium", high + 1, upto_medium), ("Low", upto_medium + 1, n_rows)):
+        rows = [r for r in table.itertuples() if low_rank <= r.rank <= high_rank]
+        row = facts.tiers.loc[tier]
+        assert row["customers"] == len(rows)
+        assert row["share"] == pytest.approx(len(rows) / n_rows, rel=1e-12)
+        assert row["min_probability"] == min(r.churn_probability for r in rows)
+        assert row["max_probability"] == max(r.churn_probability for r in rows)
+
+    group_ids = [r.customer_id for r in table.itertuples() if r.rank <= high]
+    for column in ("monthly_charge", "tenure_in_months"):
+        group_mean = sum(float(inputs.loc[c, column]) for c in group_ids) / len(group_ids)
+        all_mean = sum(float(v) for v in inputs[column]) / n_rows
+        assert facts.numeric_profile.loc[column, "group_mean"] == pytest.approx(group_mean, rel=1e-12)
+        assert facts.numeric_profile.loc[column, "all_mean"] == pytest.approx(all_mean, rel=1e-12)
+
+    for column in ("contract", "internet_type"):
+        label = lambda v: "No Internet" if v is None else v
+        for category, row in facts.categorical_profile[column].iterrows():
+            in_all = [c for c in inputs.index if label(inputs.loc[c, column]) == category]
+            in_group = [c for c in group_ids if label(inputs.loc[c, column]) == category]
+            assert row["all_count"] == len(in_all)
+            assert row["group_count"] == len(in_group)
+            assert row["all_share"] == pytest.approx(len(in_all) / n_rows, rel=1e-12)
+            assert row["group_share"] == pytest.approx(len(in_group) / len(group_ids), rel=1e-12)
+        assert facts.categorical_profile[column]["all_count"].sum() == n_rows
+        assert facts.categorical_profile[column]["group_share"].sum() == pytest.approx(1.0)
+
+    for scope, frame in ((group_ids, facts.flagged_drivers), (list(drivers.index), facts.all_drivers)):
+        for feature, row in frame.iterrows():
+            first = anywhere = raised = lowered = 0
+            for customer in scope:
+                values = drivers.loc[customer].tolist()
+                names, directions = values[0::2], values[1::2]
+                first += names[0] == feature
+                if feature in names:
+                    anywhere += 1
+                    raised += directions[names.index(feature)] == R
+                    lowered += directions[names.index(feature)] == L
+            assert row.tolist() == [first, anywhere, raised, lowered]
+        assert frame["first_driver_count"].sum() == len(scope)
+        assert frame["any_driver_count"].sum() == 3 * len(scope)
+        keys = [(-r.first_driver_count, -r.any_driver_count, name) for name, r in frame.iterrows()]
+        assert keys == sorted(keys)
+
+
+def test_shuffled_table_inputs_and_drivers_give_identical_facts():
+    data = seeded_fact_data()
+    reference = compute_recommendation_facts(**data)
+    shuffled = dict(data)
+    shuffled["table"] = data["table"].sample(frac=1, random_state=1).reset_index(drop=True)
+    shuffled["inputs"] = data["inputs"].sample(frac=1, random_state=2)
+    shuffled["drivers"] = data["drivers"].sample(frac=1, random_state=3)
+
+    assert_same_facts(reference, compute_recommendation_facts(**shuffled))
+
+
+def test_values_attached_to_the_wrong_ids_change_the_facts():
+    data = seeded_fact_data()
+    reference = compute_recommendation_facts(**data)
+    wrong = dict(data)
+    wrong["inputs"] = pd.DataFrame(data["inputs"].to_numpy(), index=data["inputs"].index[::-1], columns=data["inputs"].columns)
+
+    changed = compute_recommendation_facts(**wrong)
+
+    assert changed.numeric_profile.loc["monthly_charge", "group_mean"] != reference.numeric_profile.loc["monthly_charge", "group_mean"]
+
+
+def test_the_fact_inputs_are_not_changed_by_a_call():
+    data = seeded_fact_data()
+    before = {name: value.copy(deep=True) for name, value in data.items() if isinstance(value, pd.DataFrame)}
+
+    compute_recommendation_facts(**data)
+
+    for name, frame in before.items():
+        pd.testing.assert_frame_equal(data[name], frame)
+
+
+# Empty tiers
+
+
+def tier_sizes(n_rows, k_frac, medium_edge):
+    tiers = assign_risk_tiers(pd.Series(np.arange(1, n_rows + 1)), k_frac, medium_edge)
+    return [int((tiers == name).sum()) for name in ("High", "Medium", "Low")]
+
+
+def assert_other_facts_are_complete(facts, n_rows):
+    assert facts.customers_scored == n_rows
+    assert facts.tiers["customers"].sum() == n_rows
+    assert facts.tiers["share"].sum() == pytest.approx(1.0)
+    for column in PROFILE_CATEGORICAL_COLUMNS:
+        assert facts.categorical_profile[column]["all_share"].sum() == pytest.approx(1.0)
+        assert facts.categorical_profile[column]["group_share"].sum() == pytest.approx(1.0)
+    assert facts.flagged_drivers["any_driver_count"].sum() == 3 * facts.customers_flagged
+    assert facts.all_drivers["first_driver_count"].sum() == n_rows
+    assert np.isfinite(facts.numeric_profile.to_numpy()).all()
+
+
+def test_an_empty_medium_tier_has_zero_customers_and_nan_probabilities():
+    n_rows, k_frac, medium_edge = 2, 0.10, 0.25
+    assert tier_sizes(n_rows, k_frac, medium_edge) == [1, 0, 1]
+    data = seeded_fact_data(n_rows=n_rows, k_frac=k_frac, medium_edge=medium_edge)
+
+    facts = compute_recommendation_facts(**data)
+
+    medium = facts.tiers.loc["Medium"]
+    assert medium["customers"] == 0
+    assert medium["share"] == 0.0
+    assert np.isnan(medium["min_probability"]) and np.isnan(medium["max_probability"])
+    top, bottom = data["table"]["churn_probability"].tolist()
+    assert facts.tiers.loc["High"].tolist() == [1, 0.5, top, top]
+    assert facts.tiers.loc["Low"].tolist() == [1, 0.5, bottom, bottom]
+    assert facts.customers_flagged == 1
+    assert_other_facts_are_complete(facts, n_rows)
+
+
+def test_an_empty_low_tier_has_zero_customers_and_nan_probabilities():
+    n_rows, k_frac, medium_edge = 10, 0.10, 1.0
+    assert tier_sizes(n_rows, k_frac, medium_edge) == [1, 9, 0]
+    data = seeded_fact_data(n_rows=n_rows, k_frac=k_frac, medium_edge=medium_edge)
+
+    facts = compute_recommendation_facts(**data)
+
+    low = facts.tiers.loc["Low"]
+    assert low["customers"] == 0
+    assert low["share"] == 0.0
+    assert np.isnan(low["min_probability"]) and np.isnan(low["max_probability"])
+    probabilities = data["table"]["churn_probability"].tolist()
+    assert facts.tiers.loc["High"].tolist() == [1, 0.1, probabilities[0], probabilities[0]]
+    assert facts.tiers.loc["Medium"].tolist() == [9, 0.9, min(probabilities[1:]), max(probabilities[1:])]
+    assert facts.customers_flagged == 1
+    assert_other_facts_are_complete(facts, n_rows)
+
+
+# Ties in the driver order
+
+
+def test_driver_ties_are_ordered_by_first_count_then_any_count_then_name():
+    rows = [
+        [("b", R), ("a", R), ("z", L)],
+        [("a", R), ("b", L), ("y", R)],
+        [("z", R), ("a", R), ("b", R)],
+        [("y", L), ("z", R), ("a", L)],
+    ]
+    ids = FACT_IDS[:4]
+    table = fact_table().iloc[:4].copy()
+    table["rank"] = pd.Series(range(1, 5), dtype="int64")
+    table["in_top_k"] = pd.Series([True, False, False, False])
+    arguments = dict(
+        table=table,
+        inputs=fact_inputs().loc[ids],
+        drivers=fact_drivers(rows + FACT_DRIVERS[4:]).loc[ids],
+        importance=fact_importance(2),
+        k_frac=0.25,
+        medium_edge=0.5,
+    )
+
+    facts = compute_recommendation_facts(**arguments)
+
+    assert list(facts.all_drivers.index) == ["a", "b", "z", "y"]
+    assert facts.all_drivers["first_driver_count"].tolist() == [1, 1, 1, 1]
+    assert facts.all_drivers["any_driver_count"].tolist() == [4, 3, 3, 2]
+    keys = [(-r.first_driver_count, -r.any_driver_count, n) for n, r in facts.all_drivers.iterrows()]
+    assert keys == sorted(keys)
+    assert list(facts.flagged_drivers.index) == ["b", "a", "z"]
+
+
+# Refusals
+
+
+def mutate_table(change):
+    def mutate(table, inputs, drivers, importance):
+        table = table.copy()
+        change(table)
+        return table, inputs, drivers, importance
+
+    return mutate
+
+
+def mutate_inputs(change):
+    def mutate(table, inputs, drivers, importance):
+        inputs = inputs.copy()
+        inputs = change(inputs)
+        return table, inputs, drivers, importance
+
+    return mutate
+
+
+def mutate_drivers(change):
+    def mutate(table, inputs, drivers, importance):
+        drivers = drivers.copy()
+        drivers = change(drivers)
+        return table, inputs, drivers, importance
+
+    return mutate
+
+
+def mutate_importance(change):
+    def mutate(table, inputs, drivers, importance):
+        importance = importance.copy()
+        importance = change(importance)
+        return table, inputs, drivers, importance
+
+    return mutate
+
+
+def set_cell(frame, label, column, value):
+    frame[column] = frame[column].astype(object)
+    frame.at[label, column] = value
+    return frame
+
+
+FACT_REFUSALS = {
+    "empty-table": (lambda t, i, d, m: (t.iloc[0:0], i, d, m), "no rows"),
+    "duplicate-id-in-table": (
+        mutate_table(lambda t: t.__setitem__("customer_id", ["C01"] + FACT_IDS[1:-1] + ["C01"])),
+        "duplicate customer id in the table",
+    ),
+    "duplicate-id-in-inputs": (
+        mutate_inputs(lambda i: i.set_axis(["C01"] + FACT_IDS[1:-1] + ["C01"])),
+        "duplicate customer id in the inputs",
+    ),
+    "duplicate-id-in-drivers": (
+        mutate_drivers(lambda d: d.set_axis(["C01"] + FACT_IDS[1:-1] + ["C01"])),
+        "duplicate customer id in the driver table",
+    ),
+    "inputs-missing-a-customer": (mutate_inputs(lambda i: i.drop(index="C05")), "the inputs has no row for customer"),
+    "inputs-with-an-extra-customer": (
+        mutate_inputs(lambda i: pd.concat([i, i.iloc[[0]].set_axis(["C99"])])),
+        "unknown customer 'C99'",
+    ),
+    "drivers-missing-a-customer": (
+        mutate_drivers(lambda d: d.drop(index="C05")),
+        "the driver table has no row for customer",
+    ),
+    "drivers-with-an-extra-customer": (
+        mutate_drivers(lambda d: pd.concat([d, d.iloc[[0]].set_axis(["C99"])])),
+        "unknown customer 'C99'",
+    ),
+    "rank-gap": (mutate_table(lambda t: t.__setitem__("rank", [1, 2, 3, 4, 5, 6, 7, 8, 9, 11])), "complete 1.."),
+    "rank-float": (
+        mutate_table(lambda t: t.__setitem__("rank", t["rank"].astype("float64"))),
+        "rank must be a complete integer",
+    ),
+    "probability-nan": (
+        mutate_table(lambda t: t.__setitem__("churn_probability", [np.nan] + FACT_PROBABILITIES[1:])),
+        "churn_probability is missing",
+    ),
+    "probability-above-one": (
+        mutate_table(lambda t: t.__setitem__("churn_probability", [1.5] + FACT_PROBABILITIES[1:])),
+        "outside [0, 1]",
+    ),
+    "flags-not-boolean": (
+        mutate_table(lambda t: t.__setitem__("in_top_k", t["in_top_k"].astype(int))),
+        "in_top_k must be a boolean",
+    ),
+    "flag-count-wrong": (
+        mutate_table(lambda t: t.__setitem__("in_top_k", [True] * 3 + [False] * 7)),
+        "marks 3 rows but top_k_count for k=0.2 is 2",
+    ),
+    "right-count-wrong-customers": (
+        mutate_table(lambda t: t.__setitem__("in_top_k", [True, False, True] + [False] * 7)),
+        "not the first 2 rows by rank",
+    ),
+    "monthly-charge-missing": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "monthly_charge", np.nan)),
+        "monthly_charge is missing for customer 'C03'",
+    ),
+    "tenure-missing": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "tenure_in_months", None)),
+        "tenure_in_months is missing",
+    ),
+    "monthly-charge-text": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "monthly_charge", "60")),
+        "monthly_charge is not a number",
+    ),
+    "tenure-infinite": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "tenure_in_months", np.inf)),
+        "tenure_in_months is not finite",
+    ),
+    "contract-missing": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "contract", None)),
+        "contract is missing for customer 'C03'",
+    ),
+    "contract-not-text": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "contract", 5)),
+        "contract is not text",
+    ),
+    "internet-type-not-text": (
+        mutate_inputs(lambda i: set_cell(i, "C01", "internet_type", 5)),
+        "internet_type is not text",
+    ),
+    "internet-type-holds-the-reserved-category": (
+        mutate_inputs(lambda i: set_cell(i, "C01", "internet_type", "No Internet")),
+        "reserved category 'No Internet'",
+    ),
+    "driver-repeated-in-a-row": (
+        mutate_drivers(lambda d: set_cell(d, "C02", "driver_2", "contract")),
+        "does not have three different drivers",
+    ),
+    "driver-missing": (
+        mutate_drivers(lambda d: set_cell(d, "C02", "driver_3", None)),
+        "missing or not text",
+    ),
+    "driver-direction-invalid": (
+        mutate_drivers(lambda d: set_cell(d, "C02", "driver_1_direction", "up")),
+        "direction is not valid",
+    ),
+    "importance-without-internet-type": (
+        mutate_importance(lambda m: m.drop(index="internet_type").assign(rank=range(1, len(m)))),
+        "no internet_type row",
+    ),
+    "importance-ranks-wrong": (
+        mutate_importance(lambda m: m.assign(rank=list(range(2, len(m) + 2)))),
+        "ranks are not 1..n",
+    ),
+    "importance-negative-share": (
+        mutate_importance(lambda m: m.assign(share=[-0.1] + list(m["share"][1:]))),
+        "negative or not finite",
+    ),
+    "importance-empty": (mutate_importance(lambda m: m.iloc[0:0]), "no rows"),
+    "importance-nan-share": (
+        mutate_importance(lambda m: set_cell(m, m.index[0], "share", np.nan)),
+        "negative or not finite",
+    ),
+    "importance-infinite-share": (
+        mutate_importance(lambda m: set_cell(m, m.index[0], "share", np.inf)),
+        "negative or not finite",
+    ),
+    "importance-huge-integer-share": (
+        mutate_importance(lambda m: set_cell(m, m.index[0], "share", 10**400)),
+        "negative or not finite",
+    ),
+    "importance-text-share": (
+        mutate_importance(lambda m: set_cell(m, m.index[0], "share", "high")),
+        "negative or not finite",
+    ),
+    "rank-bool": (
+        mutate_table(lambda t: t.__setitem__("rank", [True] * 10)),
+        "rank must be a complete integer",
+    ),
+    "probability-huge-integer": (
+        mutate_table(lambda t: set_cell(t, 0, "churn_probability", 10**400)),
+        "churn_probability is not finite",
+    ),
+    "monthly-charge-huge-integer": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "monthly_charge", 10**400)),
+        "monthly_charge is not finite",
+    ),
+    "tenure-huge-integer": (
+        mutate_inputs(lambda i: set_cell(i, "C03", "tenure_in_months", 10**400)),
+        "tenure_in_months is not finite",
+    ),
+    "importance-repeated-feature": (
+        mutate_importance(lambda m: m.set_axis(["contract", "contract"] + list(m.index[2:]))),
+        "repeated feature",
+    ),
+}
+
+
+@pytest.mark.parametrize("mutate,fragment", list(FACT_REFUSALS.values()), ids=list(FACT_REFUSALS))
+def test_unusable_data_is_refused_with_recommendations_error(mutate, fragment):
+    arguments = fact_arguments()
+    table, inputs, drivers, importance = mutate(
+        arguments["table"], arguments["inputs"], arguments["drivers"], arguments["importance"]
+    )
+    arguments.update(table=table, inputs=inputs, drivers=drivers, importance=importance)
+
+    with pytest.raises(RecommendationsError) as exc_info:
+        compute_recommendation_facts(**arguments)
+
+    assert fragment in str(exc_info.value)
+
+
+FACT_CALLER_MISTAKES = {
+    "table-not-a-dataframe": lambda a: dict(table=a["table"].to_dict()),
+    "table-missing-rank": lambda a: dict(table=a["table"].drop(columns=["rank"])),
+    "inputs-not-a-dataframe": lambda a: dict(inputs=None),
+    "inputs-missing-a-profile-column": lambda a: dict(inputs=a["inputs"].drop(columns=["contract"])),
+    "drivers-not-a-dataframe": lambda a: dict(drivers=[]),
+    "drivers-missing-a-column": lambda a: dict(drivers=a["drivers"].drop(columns=["driver_3_direction"])),
+    "importance-not-a-dataframe": lambda a: dict(importance=None),
+    "importance-wrong-columns": lambda a: dict(importance=a["importance"].rename(columns={"share": "value"})),
+    "k-zero": lambda a: dict(k_frac=0),
+    "k-bool": lambda a: dict(k_frac=True),
+    "k-text": lambda a: dict(k_frac="0.2"),
+    "k-equal-to-the-edge": lambda a: dict(k_frac=0.5),
+    "k-above-the-edge": lambda a: dict(k_frac=0.6),
+    "k-huge-integer": lambda a: dict(k_frac=10**400),
+    "edge-huge-integer": lambda a: dict(medium_edge=10**400),
+    "edge-above-one": lambda a: dict(medium_edge=1.5),
+    "edge-none": lambda a: dict(medium_edge=None),
+}
+
+
+@pytest.mark.parametrize("build", list(FACT_CALLER_MISTAKES.values()), ids=list(FACT_CALLER_MISTAKES))
+def test_fact_caller_mistakes_raise_value_error(build):
+    arguments = fact_arguments()
+    arguments.update(build(arguments))
+
+    with pytest.raises(ValueError):
+        compute_recommendation_facts(**arguments)
+
+
+# Source checks
+
+
+def test_recommendations_py_imports_only_allowed_modules_and_never_the_target():
+    source = inspect.getsource(recommendations)
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module)
+
+    package = {name for name in imported if name.startswith("retention_platform")}
+    assert package <= {"retention_platform.inference.drivers", "retention_platform.inference.ranking"}
+    assert all(name.startswith("retention_platform.inference") for name in package)
+    assert imported - package <= {"__future__", "math", "dataclasses", "numpy", "pandas"}
+    assert TARGET_COLUMN not in source
+
+
+# Real population
+
+
+def test_real_population_facts_are_consistent(driver_data, driver_contributions, driver_importance):
+    frame = driver_data.inputs.copy()
+    frame.insert(0, "customer_id", pd.Series(driver_data.ids, dtype=object))
+    table = score_batch(frame, driver_data.run, 0.10)
+    inputs = driver_data.inputs.set_axis(pd.Index(driver_data.ids, name="customer_id"))
+    drivers = select_top_drivers(driver_contributions)
+
+    facts = compute_recommendation_facts(table, inputs, drivers, driver_importance, 0.10, 0.25)
+
+    assert facts.customers_scored == len(driver_data.ids) == 1408
+    assert facts.tiers["customers"].sum() == 1408
+    assert list(facts.tiers["customers"][:1]) == [top_k_count(1408, 0.10)] == [141]
+    assert facts.tiers["share"].sum() == pytest.approx(1.0)
+    assert facts.customers_flagged == 141
+    for column in PROFILE_CATEGORICAL_COLUMNS:
+        profile = facts.categorical_profile[column]
+        assert profile["all_share"].sum() == pytest.approx(1.0)
+        assert profile["group_share"].sum() == pytest.approx(1.0)
+        assert profile["group_count"].sum() == 141
+    missing = int(driver_data.inputs["internet_type"].isna().sum())
+    assert facts.categorical_profile["internet_type"].loc["No Internet", "all_count"] == missing
+    assert facts.flagged_drivers["first_driver_count"].sum() == 141
+    assert facts.all_drivers["first_driver_count"].sum() == 1408
+    assert facts.all_drivers["any_driver_count"].sum() == 3 * 1408
+    assert (facts.all_drivers["raises_count"] + facts.all_drivers["lowers_count"] == facts.all_drivers["any_driver_count"]).all()
+    assert facts.importance_top.index[0] == driver_importance.index[0]
+    assert facts.internet_type_importance.rank == int(driver_importance.loc["internet_type", "rank"])
