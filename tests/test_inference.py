@@ -77,13 +77,10 @@ from retention_platform.inference.outputs import (
     OutputGenerationError,
     OutputPublicationError,
     build_extended_run_summary,
-    build_run_summary,
     check_extended_outreach_table,
     document_header,
     extended_outreach_csv_bytes,
-    outreach_csv_bytes,
     publish_output_set,
-    publish_outputs,
     summary_json_bytes,
 )
 from retention_platform.inference.recommendations import (
@@ -1076,12 +1073,6 @@ TABLE_COLUMNS = ["customer_id", "churn_probability", "rank", "in_top_k"]
 
 
 @pytest.fixture(scope="module")
-def ranked_table(scoring_artifacts):
-    frame = scoring_frame(scoring_artifacts, [f"C{i:02d}" for i in range(12)])
-    return score_batch(frame, real_run(scoring_artifacts), K_FRAC)
-
-
-@pytest.fixture(scope="module")
 def output_manifest(scoring_artifacts):
     return build_manifest(
         run_id=MODEL_RUN_ID,
@@ -1093,34 +1084,16 @@ def output_manifest(scoring_artifacts):
     )
 
 
-def make_summary(table, manifest, **overrides):
-    arguments = {
-        "k_frac": K_FRAC,
-        "model_run_id": MODEL_RUN_ID,
-        "scoring_run_id": SCORING_RUN_ID,
-        "manifest": manifest,
-    }
-    arguments.update(overrides)
-    return build_run_summary(table, **arguments)
-
-
-def table_from(ids, probabilities, flagged=1) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "customer_id": pd.Series(list(ids), dtype=object),
-            "churn_probability": pd.Series(list(probabilities), dtype="float64"),
-            "rank": pd.Series(range(1, len(ids) + 1), dtype="int64"),
-            "in_top_k": pd.Series([position < flagged for position in range(len(ids))], dtype=bool),
-        }
-    )
-
-
 AWKWARD_IDS = ["C1", "a,b", 'say "hi"', "Zoë"]
 AWKWARD_PROBABILITIES = [2 / 3, 1 / 3, 0.1 + 0.2, 0.1]
 
 
-def awkward_table() -> pd.DataFrame:
-    return table_from(AWKWARD_IDS, AWKWARD_PROBABILITIES, flagged=2)
+def awkward_extended_table() -> pd.DataFrame:
+    """The hand-made eleven-column table with awkward ids and probabilities in its first four rows."""
+    table = extended_table()
+    table["customer_id"] = pd.Series([*AWKWARD_IDS, *EXT_IDS[4:]], dtype=object)
+    table["churn_probability"] = pd.Series([*AWKWARD_PROBABILITIES, *EXT_PROBABILITIES[4:]], dtype="float64")
+    return table
 
 
 def parse_csv(data: bytes) -> list[list[str]]:
@@ -1130,200 +1103,40 @@ def parse_csv(data: bytes) -> list[list[str]]:
 # CSV
 
 
-def test_csv_has_the_exact_header_one_row_per_customer_and_ascending_rank(ranked_table):
-    rows = parse_csv(outreach_csv_bytes(ranked_table))
-
-    assert rows[0] == TABLE_COLUMNS
-    assert len(rows) - 1 == len(ranked_table)
-    assert all(len(row) == 4 for row in rows)
-    assert [int(row[2]) for row in rows[1:]] == list(range(1, len(ranked_table) + 1))
-    assert [row[0] for row in rows[1:]] == list(ranked_table["customer_id"])
-
-
-def test_csv_writes_in_top_k_as_true_and_false(ranked_table):
-    rows = parse_csv(outreach_csv_bytes(ranked_table))
-
-    assert {row[3] for row in rows[1:]} <= {"True", "False"}
-    assert [row[3] == "True" for row in rows[1:]] == list(ranked_table["in_top_k"])
-
-
 def test_csv_is_utf8_with_lf_endings_and_a_trailing_newline():
-    data = outreach_csv_bytes(awkward_table())
+    data = extended_bytes(awkward_extended_table())
 
-    assert "Zoë" in data.decode("utf-8")
+    assert AWKWARD_IDS[3] in data.decode("utf-8")
+    assert not data.decode("utf-8").isascii()
     assert b"\r" not in data
     assert data.endswith(b"\n")
-    assert data.count(b"\n") == len(AWKWARD_IDS) + 1
+    assert data.count(b"\n") == len(EXT_IDS) + 1
 
 
 def test_csv_probabilities_round_trip_exactly():
-    rows = parse_csv(outreach_csv_bytes(awkward_table()))
+    rows = parse_csv(extended_bytes(awkward_extended_table()))
 
-    assert [float(row[1]) for row in rows[1:]] == AWKWARD_PROBABILITIES
+    assert [float(row[1]) for row in rows[1:5]] == AWKWARD_PROBABILITIES
     assert rows[3][1] == "0.30000000000000004"
-
-
-def test_csv_has_no_empty_cell(ranked_table):
-    rows = parse_csv(outreach_csv_bytes(ranked_table))
-
-    assert all(cell != "" for row in rows for cell in row)
-
-
-def test_csv_ids_with_commas_and_quotes_survive_a_round_trip():
-    rows = parse_csv(outreach_csv_bytes(awkward_table()))
-
-    assert [row[0] for row in rows[1:]] == AWKWARD_IDS
-
-
-def _drop_column(table):
-    return table.drop(columns=["rank"])
-
-
-def _extra_column(table):
-    return table.assign(extra=1)
-
-
-def _reordered_columns(table):
-    return table[["churn_probability", "customer_id", "rank", "in_top_k"]]
-
-
-def _nan_probability(table):
-    table = table.copy()
-    table.loc[1, "churn_probability"] = np.nan
-    return table
-
-
-def _none_id(table):
-    table = table.copy()
-    table.loc[1, "customer_id"] = None
-    return table
-
-
-def _empty_id(table):
-    table = table.copy()
-    table.loc[1, "customer_id"] = ""
-    return table
-
-
-def _blank_id(table):
-    table = table.copy()
-    table.loc[1, "customer_id"] = "   "
-    return table
-
-
-def _no_rows(table):
-    return table.iloc[0:0]
-
-
-def _probability_above_one(table):
-    table = table.copy()
-    table.loc[0, "churn_probability"] = 1.5
-    return table
-
-
-def _flag_not_boolean(table):
-    return table.assign(in_top_k=table["in_top_k"].astype(int))
-
-
-BAD_TABLES = {
-    "missing-column": _drop_column,
-    "extra-column": _extra_column,
-    "reordered-columns": _reordered_columns,
-    "nan-probability": _nan_probability,
-    "none-id": _none_id,
-    "empty-id": _empty_id,
-    "whitespace-id": _blank_id,
-    "no-rows": _no_rows,
-    "probability-above-one": _probability_above_one,
-    "flag-not-boolean": _flag_not_boolean,
-}
-
-
-@pytest.mark.parametrize("damage", list(BAD_TABLES.values()), ids=list(BAD_TABLES))
-def test_csv_refuses_a_bad_table(ranked_table, damage):
-    with pytest.raises(OutputGenerationError):
-        outreach_csv_bytes(damage(ranked_table))
 
 
 # Summary
 
 
-def test_summary_has_the_exact_key_sets_in_order_with_plain_types(ranked_table, output_manifest):
-    summary = make_summary(ranked_table, output_manifest)
-
-    assert list(summary) == SUMMARY_KEYS
-    assert list(summary["model_health"]) == MODEL_HEALTH_KEYS
-    assert list(summary["model_health"]["training_cv_metrics"]) == METRIC_KEYS
-    assert type(summary["contract_version"]) is str
-    assert type(summary["k"]) is float
-    assert type(summary["customers_scored"]) is int
-    assert type(summary["customers_flagged"]) is int
-    assert type(summary["model_run_id"]) is str
-    assert type(summary["scoring_run_id"]) is str
-    assert type(summary["snapshot_notice"]) is str
-    health = summary["model_health"]
-    assert type(health["trained_at_utc"]) is str
-    assert type(health["package_version"]) is str
-    assert type(health["held_out_results_reference"]) is str
-    metrics = health["training_cv_metrics"]
-    assert type(metrics["k"]) is float
-    assert type(metrics["training_rows"]) is int
-    assert type(metrics["estimate_type"]) is str
-    for name in ("precision_at_k", "lift_at_k", "pr_auc", "brier_score"):
-        assert type(metrics[name]) is float
-
-
-def test_summary_counts_and_fixed_texts(ranked_table, output_manifest):
-    summary = make_summary(ranked_table, output_manifest)
+def test_summary_counts_and_fixed_texts(output_set):
+    summary = output_set.summary
     contract = (REPO_ROOT / "docs" / "platform_output_contract.md").read_text(encoding="utf-8")
 
-    assert summary["contract_version"] == "1"
-    assert summary["customers_scored"] == len(ranked_table)
-    assert summary["customers_flagged"] == int(ranked_table["in_top_k"].sum())
-    assert summary["k"] == K_FRAC
+    assert summary["contract_version"] == CONTRACT_VERSION_V2
+    assert summary["customers_scored"] == len(output_set.table)
+    assert summary["customers_flagged"] == int(output_set.table["in_top_k"].sum())
+    assert summary["k"] == EXT_K
     assert summary["model_run_id"] == MODEL_RUN_ID
     assert summary["scoring_run_id"] == SCORING_RUN_ID
     assert summary["snapshot_notice"] == SNAPSHOT_NOTICE
     assert f"`{SNAPSHOT_NOTICE}`" in contract
     assert summary["model_health"]["held_out_results_reference"] == "ADR-0014"
     assert summary["model_health"]["held_out_results_reference"] == HELD_OUT_RESULTS_REFERENCE
-
-
-def test_summary_equals_the_expected_object_so_no_held_out_numbers_can_appear(
-    ranked_table, output_manifest
-):
-    expected = {
-        "contract_version": "1",
-        "k": 0.1,
-        "customers_scored": 12,
-        "customers_flagged": 1,
-        "model_run_id": MODEL_RUN_ID,
-        "scoring_run_id": SCORING_RUN_ID,
-        "snapshot_notice": (
-            "Historical snapshot: this list scores the held-out test split for "
-            "demonstration. It is not a live outreach list."
-        ),
-        "model_health": {
-            "trained_at_utc": "2026-10-11T12:00:00Z",
-            "package_version": output_manifest["package_version"],
-            "training_cv_metrics": OUTPUT_METRICS,
-            "held_out_results_reference": "ADR-0014",
-        },
-    }
-
-    assert make_summary(ranked_table, output_manifest) == expected
-
-
-def test_model_health_equals_the_manifest_and_is_a_deep_copy(ranked_table, output_manifest):
-    manifest_before = copy.deepcopy(output_manifest)
-
-    summary = make_summary(ranked_table, output_manifest)
-    for key in MODEL_HEALTH_KEYS:
-        assert summary["model_health"][key] == output_manifest[key]
-    summary["model_health"]["training_cv_metrics"]["pr_auc"] = 0.0
-    summary["model_health"]["package_version"] = "changed"
-
-    assert output_manifest == manifest_before
 
 
 def _manifest_without(key):
@@ -1371,46 +1184,18 @@ MANIFEST_DAMAGE = {
 }
 
 
-@pytest.mark.parametrize("damage", list(MANIFEST_DAMAGE.values()), ids=list(MANIFEST_DAMAGE))
-def test_summary_refuses_a_manifest_that_breaks_the_contract(ranked_table, output_manifest, damage):
-    manifest = copy.deepcopy(output_manifest)
-    damage(manifest)
-
+def test_summary_refuses_an_empty_table(output_manifest):
     with pytest.raises(OutputGenerationError):
-        make_summary(ranked_table, manifest)
+        build_extended_run_summary(extended_table().iloc[0:0], **summary_arguments(output_manifest))
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"k_frac": 0},
-        {"k_frac": 1.5},
-        {"k_frac": True},
-        {"model_run_id": "not-a-run-id"},
-        {"scoring_run_id": "../20261011T123500Z"},
-        {"scoring_run_id": ""},
-    ],
-    ids=["k-zero", "k-above-one", "k-bool", "bad-model-run-id", "bad-scoring-run-id", "empty-scoring-run-id"],
-)
-def test_summary_refuses_bad_arguments(ranked_table, output_manifest, overrides):
-    with pytest.raises(OutputGenerationError):
-        make_summary(ranked_table, output_manifest, **overrides)
+def test_summary_bytes_are_json_with_a_trailing_newline(output_set):
+    data = summary_json_bytes(output_set.summary)
 
-
-def test_summary_refuses_an_empty_table(ranked_table, output_manifest):
-    with pytest.raises(OutputGenerationError):
-        make_summary(ranked_table.iloc[0:0], output_manifest)
-
-
-def test_summary_bytes_are_json_with_a_trailing_newline(ranked_table, output_manifest):
-    summary = make_summary(ranked_table, output_manifest)
-
-    data = summary_json_bytes(summary)
-
-    assert json.loads(data.decode("utf-8")) == summary
+    assert json.loads(data.decode("utf-8")) == output_set.summary
     assert data.endswith(b"\n")
     assert b"\n  " in data
-    assert list(json.loads(data.decode("utf-8"))) == SUMMARY_KEYS
+    assert list(json.loads(data.decode("utf-8"))) == SUMMARY_KEYS_V2
 
 
 def test_summary_bytes_refuse_nan():
@@ -1425,120 +1210,8 @@ OLD_CSV = b"customer_id,churn_probability,rank,in_top_k\nOLD,0.5,1,True\n"
 OLD_SUMMARY = b'{"previous": "summary"}\n'
 
 
-@pytest.fixture
-def publication(tmp_path, ranked_table, output_manifest):
-    summary = make_summary(ranked_table, output_manifest)
-    return SimpleNamespace(
-        folder=tmp_path / "outputs",
-        table=ranked_table,
-        summary=summary,
-        csv_bytes=outreach_csv_bytes(ranked_table),
-        summary_bytes=summary_json_bytes(summary),
-    )
-
-
-def write_previous_pair(folder):
-    folder.mkdir(parents=True, exist_ok=True)
-    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
-    (folder / SUMMARY_FILE).write_bytes(OLD_SUMMARY)
-
-
 def folder_names(folder):
     return sorted(path.name for path in folder.iterdir())
-
-
-def test_publishing_writes_both_files_with_the_exact_bytes(publication):
-    csv_path, summary_path = publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert csv_path == publication.folder / OUTREACH_FILE
-    assert summary_path == publication.folder / SUMMARY_FILE
-    assert csv_path.read_bytes() == publication.csv_bytes
-    assert summary_path.read_bytes() == publication.summary_bytes
-
-
-def test_publishing_replaces_the_previous_pair_and_keeps_no_copy_or_temp_file(publication):
-    write_previous_pair(publication.folder)
-
-    publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert folder_names(publication.folder) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-    assert (publication.folder / OUTREACH_FILE).read_bytes() == publication.csv_bytes
-    assert (publication.folder / SUMMARY_FILE).read_bytes() == publication.summary_bytes
-
-
-def test_a_missing_folder_is_created(tmp_path, publication):
-    nested = tmp_path / "does" / "not" / "exist"
-
-    publish_outputs(nested, publication.table, publication.summary)
-
-    assert folder_names(nested) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-
-
-def test_leftover_temporary_files_are_overwritten(publication):
-    publication.folder.mkdir()
-    (publication.folder / (".tmp-" + OUTREACH_FILE)).write_bytes(b"junk")
-    (publication.folder / (".tmp-" + SUMMARY_FILE)).write_bytes(b"junk")
-
-    publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert folder_names(publication.folder) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-    assert (publication.folder / OUTREACH_FILE).read_bytes() == publication.csv_bytes
-
-
-def test_the_csv_is_replaced_before_the_summary(publication, monkeypatch):
-    real_replace = os.replace
-    order = []
-
-    def spy(source, target):
-        order.append(Path(target).name)
-        return real_replace(source, target)
-
-    monkeypatch.setattr(outputs.os, "replace", spy)
-
-    publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert order == [OUTREACH_FILE, SUMMARY_FILE]
-
-
-def assert_previous_pair_unchanged(folder):
-    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
-    assert (folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
-    assert folder_names(folder) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-
-
-@pytest.mark.parametrize("failing", [OUTREACH_FILE, SUMMARY_FILE], ids=["csv-temp", "summary-temp"])
-def test_a_failed_temporary_write_changes_nothing(publication, monkeypatch, failing):
-    write_previous_pair(publication.folder)
-    real_write = outputs._write_file
-
-    def failing_write(path, data):
-        if path.name == ".tmp-" + failing:
-            raise OSError("disk full")
-        return real_write(path, data)
-
-    monkeypatch.setattr(outputs, "_write_file", failing_write)
-
-    with pytest.raises(OutputGenerationError, match="disk full"):
-        publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert_previous_pair_unchanged(publication.folder)
-
-
-def test_a_failed_csv_replace_leaves_both_files_unchanged(publication, monkeypatch):
-    write_previous_pair(publication.folder)
-
-    def failing_replace(source, target):
-        raise OSError("locked by another program")
-
-    monkeypatch.setattr(outputs.os, "replace", failing_replace)
-
-    with pytest.raises(OutputPublicationError) as exc_info:
-        publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert exc_info.value.csv_replaced is False
-    assert exc_info.value.summary_replaced is False
-    assert "locked by another program" in str(exc_info.value)
-    assert_previous_pair_unchanged(publication.folder)
 
 
 def fail_summary_replace(monkeypatch):
@@ -1550,68 +1223,6 @@ def fail_summary_replace(monkeypatch):
         return real_replace(source, target)
 
     monkeypatch.setattr(outputs.os, "replace", replace)
-
-
-def test_a_failed_summary_replace_after_the_csv_is_a_class_2b_failure(publication, monkeypatch):
-    write_previous_pair(publication.folder)
-    fail_summary_replace(monkeypatch)
-
-    with pytest.raises(OutputPublicationError) as exc_info:
-        publish_outputs(publication.folder, publication.table, publication.summary)
-
-    error = exc_info.value
-    message = str(error)
-    assert error.csv_replaced is True
-    assert error.summary_replaced is False
-    assert (publication.folder / OUTREACH_FILE).read_bytes() == publication.csv_bytes
-    assert (publication.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
-    assert f"{OUTREACH_FILE} was replaced" in message
-    assert f"{SUMMARY_FILE} was not replaced" in message
-    assert "may be inconsistent" in message
-    assert "not restored" in message
-    assert "no copy" in message
-    assert folder_names(publication.folder) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-    assert isinstance(error.__cause__, OSError)
-
-
-def test_the_same_failure_on_a_first_run_leaves_only_the_csv(publication, monkeypatch):
-    fail_summary_replace(monkeypatch)
-
-    with pytest.raises(OutputPublicationError) as exc_info:
-        publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert exc_info.value.csv_replaced is True
-    assert exc_info.value.summary_replaced is False
-    assert folder_names(publication.folder) == [OUTREACH_FILE]
-    assert not (publication.folder / SUMMARY_FILE).exists()
-
-
-def test_a_failing_cleanup_does_not_mask_the_original_error(publication, monkeypatch):
-    write_previous_pair(publication.folder)
-
-    def failing_replace(source, target):
-        raise OSError("original failure")
-
-    def failing_remove(path):
-        raise OSError("cleanup failure")
-
-    monkeypatch.setattr(outputs.os, "replace", failing_replace)
-    monkeypatch.setattr(outputs.os, "remove", failing_remove)
-
-    with pytest.raises(OutputPublicationError, match="original failure") as exc_info:
-        publish_outputs(publication.folder, publication.table, publication.summary)
-
-    assert "cleanup failure" not in str(exc_info.value)
-    assert "original failure" in str(exc_info.value.__cause__)
-
-
-def test_a_table_that_cannot_be_written_fails_before_any_file_is_touched(publication):
-    write_previous_pair(publication.folder)
-
-    with pytest.raises(OutputGenerationError):
-        publish_outputs(publication.folder, publication.table.iloc[0:0], publication.summary)
-
-    assert_previous_pair_unchanged(publication.folder)
 
 
 # Source checks
@@ -1812,18 +1423,6 @@ def test_the_extended_csv_has_the_exact_header_line_and_plain_cells():
     assert data.decode("utf-8").isascii()
 
 
-def test_the_first_four_columns_are_written_as_the_four_column_writer_writes_them():
-    table = extended_table()
-
-    extended_lines = extended_bytes(table).decode("utf-8").split("\n")
-    four_lines = outreach_csv_bytes(table[TABLE_COLUMNS]).decode("utf-8").split("\n")
-
-    assert extended_lines[-1] == four_lines[-1] == ""
-    for extended, four in zip(extended_lines[1:-1], four_lines[1:-1]):
-        assert extended.startswith(four + ",")
-    assert extended_lines[0].startswith(four_lines[0] + ",")
-
-
 def test_the_extended_output_is_deterministic_and_leaves_the_table_unchanged():
     table = extended_table()
     before = table.copy(deep=True)
@@ -1912,6 +1511,8 @@ EXTENDED_REFUSALS = {
     "probability-nan": (with_cell("churn_probability", 1, np.nan), "churn_probability"),
     "probability-above-one": (with_cell("churn_probability", 1, 1.5), "churn_probability"),
     "customer-id-empty": (with_cell("customer_id", 1, ""), "customer_id"),
+    "customer-id-missing": (with_cell("customer_id", 1, None), "customer_id"),
+    "customer-id-blank": (with_cell("customer_id", 1, "   "), "customer_id"),
     "flag-not-boolean": (lambda t: t.assign(in_top_k=t["in_top_k"].astype(int)), "in_top_k"),
     "rank-float": (lambda t: t.assign(rank=t["rank"].astype("float64")), "rank must be integers"),
     "rank-gap": (lambda t: t.assign(rank=[1, 2, 3, 4, 5, 6, 7, 8, 9, 11]), "cannot be turned into risk tiers"),
@@ -1960,14 +1561,6 @@ def test_a_bad_k_and_medium_edge_pair_is_refused(k_frac, medium_edge):
 def test_a_pair_that_disagrees_with_the_tiers_in_the_table_is_refused():
     with pytest.raises(OutputGenerationError, match="does not follow rank"):
         check_extended_outreach_table(extended_table(), EXT_K, 0.3)
-
-
-def test_the_four_column_path_is_unchanged_and_still_refuses_an_eleven_column_table():
-    table = extended_table()
-
-    assert outreach_csv_bytes(table[TABLE_COLUMNS]).startswith(b"customer_id,churn_probability,rank,in_top_k\n")
-    with pytest.raises(OutputGenerationError, match="exactly the columns"):
-        outreach_csv_bytes(table)
 
 
 def test_customer_ids_with_a_comma_a_quotation_mark_and_a_line_break_read_back_unchanged():
@@ -2145,6 +1738,16 @@ def test_the_version_two_summary_is_the_exact_dict_with_the_nine_fields_in_order
     assert list(summary["output_files"]) == ["outreach_list", "economics_summary", "business_recommendations"]
     assert list(summary["model_health"]) == MODEL_HEALTH_KEYS
     assert type(summary["k"]) is float and type(summary["customers_scored"]) is int
+    assert type(summary["customers_flagged"]) is int
+    for key in ("contract_version", "model_run_id", "scoring_run_id", "snapshot_notice"):
+        assert type(summary[key]) is str
+    health = summary["model_health"]
+    assert all(type(health[key]) is str for key in ("trained_at_utc", "package_version", "held_out_results_reference"))
+    metrics = health["training_cv_metrics"]
+    assert list(metrics) == METRIC_KEYS
+    assert type(metrics["k"]) is float and type(metrics["training_rows"]) is int
+    assert type(metrics["estimate_type"]) is str
+    assert all(type(metrics[name]) is float for name in ("precision_at_k", "lift_at_k", "pr_auc", "brier_score"))
 
 
 def test_the_version_two_summary_model_health_is_a_deep_copy(output_set):
@@ -2206,12 +1809,9 @@ def test_the_version_two_summary_refuses_a_manifest_that_breaks_the_contract(out
         build_extended_run_summary(extended_table(), **summary_arguments(manifest))
 
 
-def test_the_version_one_summary_and_error_constructions_are_unchanged(ranked_table, output_manifest):
-    summary = make_summary(ranked_table, output_manifest)
+def test_the_publication_error_accepts_the_two_old_flags_and_defaults_the_two_new_flags_to_false():
     error = OutputPublicationError("m", csv_replaced=True, summary_replaced=False)
 
-    assert summary["contract_version"] == "1"
-    assert list(summary) == SUMMARY_KEYS
     assert (error.csv_replaced, error.summary_replaced) == (True, False)
     assert (error.economics_replaced, error.recommendations_replaced) == (False, False)
 
@@ -2256,6 +1856,25 @@ def test_publishing_replaces_a_previous_set_and_is_deterministic(output_set, tmp
 
     assert [(other / name).read_bytes() for name in FINAL_NAMES] == first
     assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+def test_a_missing_folder_is_created(tmp_path, output_set):
+    nested = tmp_path / "does" / "not" / "exist"
+
+    output_set.publish(outputs_dir=nested)
+
+    assert folder_names(nested) == sorted(FINAL_NAMES)
+
+
+def test_leftover_temporary_files_are_overwritten(output_set):
+    output_set.folder.mkdir()
+    for name in FINAL_NAMES:
+        (output_set.folder / (".tmp-" + name)).write_bytes(b"junk")
+
+    paths = output_set.publish()
+
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+    assert paths[0].read_bytes() == extended_outreach_csv_bytes(output_set.table, EXT_K, EXT_EDGE)
 
 
 def test_the_inputs_are_not_changed_by_publishing(output_set):

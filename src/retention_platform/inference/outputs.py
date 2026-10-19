@@ -1,10 +1,8 @@
 """Build and publish the scoring outputs.
 
-Two publication paths exist. publish_outputs replaces the four-column
-outreach CSV and then the run summary, using a temporary file next to each
-final file. publish_output_set writes the eleven-column outreach CSV, the
-economics document, the recommendations document and the run summary to
-temporary files first, replaces the CSV, the economics document and the
+publish_output_set writes the eleven-column outreach CSV, the economics
+document, the recommendations document and the run summary to temporary
+files first, replaces the CSV, the economics document and the
 recommendations document in that order, checks the three files and the run
 IDs read back from the two documents, and replaces the run summary last.
 
@@ -40,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 OUTREACH_FILE = "prioritized_outreach_list.csv"
 SUMMARY_FILE = "run_summary.json"
-CONTRACT_VERSION = "1"
 CONTRACT_VERSION_V2 = "2"
 ECONOMICS_FILE = "economics_summary.md"
 RECOMMENDATIONS_FILE = "business_recommendations.md"
@@ -194,37 +191,6 @@ def _check_manifest_health(manifest: dict) -> dict:
     return copy.deepcopy({key: manifest[key] for key in _MODEL_HEALTH_KEYS})
 
 
-def build_run_summary(
-    table: pd.DataFrame,
-    *,
-    k_frac: float,
-    model_run_id: str,
-    scoring_run_id: str,
-    manifest: dict,
-) -> dict:
-    """Build the run summary as plain Python data, with the keys and key
-    order of the output contract. model_health is a deep copy of the
-    manifest's values."""
-    _check_table(table)
-    if not _is_number(k_frac) or not 0 < k_frac <= 1:
-        raise OutputGenerationError(f"k_frac must be a number with 0 < k_frac <= 1, got {k_frac!r}")
-    for name, value in (("model_run_id", model_run_id), ("scoring_run_id", scoring_run_id)):
-        if not is_valid_run_id(value):
-            raise OutputGenerationError(f"{name} is not a valid run id: {value!r}")
-    model_health = _check_manifest_health(manifest)
-
-    return {
-        "contract_version": CONTRACT_VERSION,
-        "k": float(k_frac),
-        "customers_scored": int(len(table)),
-        "customers_flagged": int(table["in_top_k"].sum()),
-        "model_run_id": model_run_id,
-        "scoring_run_id": scoring_run_id,
-        "snapshot_notice": SNAPSHOT_NOTICE,
-        "model_health": model_health,
-    }
-
-
 def document_header(title: str, scoring_run_id: str, model_run_id: str) -> str:
     """The four fixed header lines of a Markdown document, each ending in a
     line feed: the title, an empty line, the scoring run ID and the model
@@ -244,30 +210,15 @@ def document_header(title: str, scoring_run_id: str, model_run_id: str) -> str:
     )
 
 
-def outreach_csv_bytes(table: pd.DataFrame) -> bytes:
-    """The outreach list as UTF-8 CSV bytes: one header row, no index, LF line
-    endings, in_top_k as True or False, and each probability written with
-    its shortest exact text."""
-    _check_table(table)
-
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(_TABLE_COLUMNS)
-    for customer_id, probability, rank, flagged in zip(
-        table["customer_id"], table["churn_probability"], table["rank"], table["in_top_k"]
-    ):
-        writer.writerow([customer_id, repr(float(probability)), str(int(rank)), str(bool(flagged))])
-    return buffer.getvalue().encode("utf-8")
-
-
 def check_extended_outreach_table(table: pd.DataFrame, k_frac: float, medium_edge: float) -> None:
     """Raise OutputGenerationError unless the table is a usable eleven-column
     outreach table.
 
-    The four v1 columns get the v1 checks. risk_tier must follow rank by the
-    tier rule for k_frac and medium_edge, High exactly when in_top_k is True.
-    Every driver is a label of the label map, a customer's three drivers are
-    different, and every direction is one of the two allowed values.
+    The first four columns get the checks of a ranked table. risk_tier must
+    follow rank by the tier rule for k_frac and medium_edge, High exactly when
+    in_top_k is True. Every driver is a label of the label map, a customer's
+    three drivers are different, and every direction is one of the two
+    allowed values.
     """
     if list(table.columns) != EXTENDED_TABLE_COLUMNS:
         raise OutputGenerationError(
@@ -332,9 +283,9 @@ def check_extended_outreach_table(table: pd.DataFrame, k_frac: float, medium_edg
 
 
 def extended_outreach_csv_bytes(table: pd.DataFrame, k_frac: float, medium_edge: float) -> bytes:
-    """The eleven-column outreach list as UTF-8 CSV bytes, written the same
-    way as outreach_csv_bytes: one header row, no index, LF line endings,
-    in_top_k as True or False, each probability with its shortest exact text."""
+    """The eleven-column outreach list as UTF-8 CSV bytes: one header row, no
+    index, LF line endings, in_top_k as True or False, each probability with
+    its shortest exact text."""
     check_extended_outreach_table(table, k_frac, medium_edge)
 
     buffer = io.StringIO()
@@ -370,63 +321,6 @@ def _remove_quietly(*paths: Path) -> None:
             os.remove(path)
         except Exception:
             pass
-
-
-def publish_outputs(
-    outputs_dir: str | Path, table: pd.DataFrame, summary: dict
-) -> tuple[Path, Path]:
-    """Replace the outreach CSV and then the run summary in outputs_dir.
-
-    Each file is replaced as a whole through a temporary file in the same
-    folder. The CSV is replaced first. If the summary replacement then
-    fails, the new CSV stays, the previous summary is untouched, and the
-    previous CSV is not restored. Returns (csv_path, summary_path).
-    """
-    csv_bytes = outreach_csv_bytes(table)
-    summary_bytes = summary_json_bytes(summary)
-
-    folder = Path(outputs_dir)
-    csv_path = folder / OUTREACH_FILE
-    summary_path = folder / SUMMARY_FILE
-    csv_temp = folder / (_TEMP_PREFIX + OUTREACH_FILE)
-    summary_temp = folder / (_TEMP_PREFIX + SUMMARY_FILE)
-
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        _write_file(csv_temp, csv_bytes)
-        _write_file(summary_temp, summary_bytes)
-    except OSError as exc:
-        _remove_quietly(csv_temp, summary_temp)
-        raise OutputGenerationError(
-            f"the outputs could not be written to temporary files in {folder}: {exc}"
-        ) from exc
-
-    try:
-        os.replace(csv_temp, csv_path)
-    except OSError as exc:
-        _remove_quietly(csv_temp, summary_temp)
-        raise OutputPublicationError(
-            f"Publication failed: {csv_path.name} was not replaced and {summary_path.name} "
-            f"was not replaced. Both output files are as they were. Cause: {exc}",
-            csv_replaced=False,
-            summary_replaced=False,
-        ) from exc
-
-    try:
-        os.replace(summary_temp, summary_path)
-    except OSError as exc:
-        _remove_quietly(summary_temp)
-        raise OutputPublicationError(
-            f"Publication failed part way: {csv_path.name} was replaced with the new list, "
-            f"but {summary_path.name} was not replaced. The pair may be inconsistent until a "
-            f"successful run. The previous {csv_path.name} was not restored and no copy of it "
-            f"is kept. Cause: {exc}",
-            csv_replaced=True,
-            summary_replaced=False,
-        ) from exc
-
-    logger.info("Published %s and %s", csv_path, summary_path)
-    return csv_path, summary_path
 
 
 def build_extended_run_summary(
