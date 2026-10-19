@@ -26,7 +26,9 @@ Platform Output Contract v2 holds the exact CSV schema, the allowed values and t
 
 Boundary counts use `max(1, round(n × fraction))`, the same rule as the flag count (ADR-0017). For the 1,408-customer reference run this gives 141 High, 211 Medium and 1,056 Low customers. The 25% edge is an explicit project assumption: it is the largest K in ADR-0010's sensitivity range, and it is not a previously locked business rule. Only the Medium edge is added to the configuration (`business.risk_tiers`), and the configuration must satisfy `0 < K < Medium edge <= 1`, so a configuration in which the Medium tier would end before the High tier does is rejected before scoring.
 
-`churn_probability` stays a numeric column. There is no probability-based tier column and no probability cut-off that changes an action in Commit 11; such thresholds may be revisited if the economics (ADR-0019) justify them. The economics document reports the mean calibrated probability per tier.
+`churn_probability` stays a numeric column. There is no probability-based tier column and no probability cut-off that changes an action in Commit 11; such thresholds may be revisited if the economics (ADR-0019) justify them. The recommendations document reports, for each tier, the number of customers, the share of scored customers, and the lowest and highest calibrated churn probability, and it reports the mean calibrated churn probability of the flagged group and of all scored customers. The economics document reports no tier figures.
+
+*(Corrected 19 October 2026, before the merge to `main`: the earlier text said the economics document reports the mean calibrated probability per tier. The generated documents report no per-tier mean, and none is required.)*
 
 ### 2. Customer-level drivers come from XGBoost's own contributions
 
@@ -61,7 +63,9 @@ Two different things must be kept apart. **Observed in the data:** Fiber Optic c
 
 ### 7. Drivers are computed at scoring time
 
-Customer drivers and global importance are computed at scoring time from the model returned by `load_run`. The existing model bundle format is unchanged, so no retraining and no new model run are needed. The driver module checks the structure it relies on at run time (five fitted XGBoost estimators, the 55 encoded columns, and a complete assignment of each encoded column to one input feature) and stops with a clear error if it does not hold. The detailed verification results are kept in the implementation tracker.
+Customer drivers and global importance are computed at scoring time from the model returned by `load_run`. The existing model bundle format is unchanged, so no retraining and no new model run are needed. The driver module checks the structure it relies on at run time and stops with a clear error if it does not hold: exactly five fitted XGBoost estimators; a fitted column transformer whose encoded output width, taken from the transformer itself, equals the feature count of each estimator's booster; and a complete assignment of the encoded columns to input features, with exactly one owner per encoded column, in which every owner is an input feature of the schema and every schema input owns at least one encoded column. The reference model run has 55 encoded columns and 42 inputs; these numbers describe that run and are not a requirement of the check. The check compares counts: it does not compare the estimators' feature names or their order with the preprocessor's output names. The detailed verification results are kept in the implementation tracker.
+
+*(Corrected 19 October 2026, before the merge to `main`: the earlier text listed "the 55 encoded columns" as a condition of the check. The check compares the encoded width taken from the transformer with each estimator's feature count and does not require the number 55. The wording now describes what the code checks.)*
 
 ### 8. The interpretation caveat
 
@@ -86,7 +90,7 @@ This is the one place where the caveat is stated in full. Drivers and importance
 - The tier counts and the driver rules are tested against the contract, including: `High` exactly when `in_top_k` is `True`; three non-empty, different drivers per customer; every direction cell one of the two values; and the label-map test.
 - The 42 labels are written and reviewed at implementation. Labels must keep related features apart; `number of referrals` and `referred a friend` are an example that must stay distinct.
 - Strong features such as `latitude`, `longitude`, `population` and `age` are not directly actionable for a retention team, but they may still appear as drivers. This is intended and is handled in the recommendations document.
-- A future model with another structure fails the driver compatibility check until the new structure is reviewed. It is never explained silently.
+- A future model that does not satisfy the driver compatibility checks fails them, and the run stops until its structure is reviewed. It is never explained silently. The checks do not require the column counts of the reference run.
 - The CSV is wider (eleven columns), and the output validation and the contract tests change accordingly.
 - The interpretation caveat has one home (section 8). A change to its meaning needs a new ADR, because ADRs are append-only.
 
