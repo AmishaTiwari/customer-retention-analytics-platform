@@ -135,6 +135,7 @@ from retention_platform.inference.score import (
     PostPublicationTrackingError,
     ScoringError,
     ScoringResult,
+    extend_outreach_table,
     run_scoring,
     score_batch,
     select_scoring_population,
@@ -2657,6 +2658,26 @@ def command_model(conn):
     )
 
 
+@pytest.fixture(scope="module")
+def calibrated_fit(conn):
+    """A small calibrated XGBoost model fitted once on the real training
+    rows, with the real preprocessor and generated schema. It has the same
+    attributes as command_model and carries the five fold models the
+    driver step needs."""
+    inputs = prepare_model_inputs(conn)
+    model = CalibratedClassifierCV(
+        xgb.XGBClassifier(n_estimators=20, max_depth=3, random_state=0),
+        method="sigmoid",
+        cv=5,
+    ).fit(inputs.X_train, inputs.y_train.astype(int))
+    return SimpleNamespace(
+        preprocessor=inputs.preprocessor,
+        model=model,
+        schema=build_input_schema(read_feat_churn_types(conn), inputs.preprocessor),
+        train_rows=len(inputs.y_train),
+    )
+
+
 def publish_model(models_dir, parts, instant) -> str:
     run_id = format_run_id(instant)
     manifest = build_manifest(
@@ -2711,23 +2732,32 @@ def run_command(argv=(), code=1):
 
 
 def failure_env(tmp_path, monkeypatch, conn, parts, model_instants=(FIRST_MODEL_INSTANT,)):
-    """An environment with a previous output pair already in place."""
+    """An environment with a previous set of four outputs already in place."""
     env = make_command_env(tmp_path, parts, model_instants)
     patch_main(monkeypatch, env, conn)
-    write_previous_pair(env.outputs_dir)
+    write_old_files(env.outputs_dir)
     return env
+
+
+def assert_old_set_unchanged(folder):
+    assert_old_files(folder, FINAL_NAMES)
+    assert folder_names(folder) == sorted(FINAL_NAMES)
 
 
 def assert_no_metrics(env):
     assert not (env.run_dir / "metrics.json").exists()
 
 
+def document_lines(path):
+    return path.read_bytes().decode("utf-8").split("\n")
+
+
 @pytest.fixture(scope="module")
-def reference_run(tmp_path_factory, conn, command_model):
+def reference_run(tmp_path_factory, conn, calibrated_fit):
     """One complete successful run through main() on the reference-like
     population (n = 1,408, K = 0.10), with what was observed on the way."""
     tmp_path = tmp_path_factory.mktemp("reference")
-    env = make_command_env(tmp_path, command_model)
+    env = make_command_env(tmp_path, calibrated_fit)
     observed: dict = {}
     real_score_batch = score.score_batch
     real_write_metrics = tracking.TrackedRun.write_metrics
@@ -2754,7 +2784,7 @@ def reference_run(tmp_path_factory, conn, command_model):
         csv_bytes=csv_bytes,
         rows=parse_csv(csv_bytes),
         summary=summary,
-        schema=command_model.schema,
+        schema=calibrated_fit.schema,
     )
 
 
@@ -2766,7 +2796,7 @@ def test_reference_csv_columns_rows_and_ranking(reference_run):
     body = rows[1:]
     probabilities = [float(row[1]) for row in body]
 
-    assert rows[0] == TABLE_COLUMNS
+    assert rows[0] == EXTENDED_COLUMNS
     assert len(body) == 1408
     assert len({row[0] for row in body}) == 1408
     assert [int(row[2]) for row in body] == list(range(1, 1409))
@@ -2793,13 +2823,13 @@ def test_reference_csv_has_no_empty_cell_and_lf_endings(reference_run):
 def test_reference_summary_has_the_contract_keys_and_types(reference_run):
     summary = reference_run.summary
 
-    assert list(summary) == SUMMARY_KEYS
+    assert list(summary) == SUMMARY_KEYS_V2
     assert list(summary["model_health"]) == MODEL_HEALTH_KEYS
     assert list(summary["model_health"]["training_cv_metrics"]) == METRIC_KEYS
     assert isinstance(summary["customers_scored"], int) and not isinstance(summary["customers_scored"], bool)
     assert isinstance(summary["customers_flagged"], int)
     assert isinstance(summary["k"], float)
-    assert summary["contract_version"] == "1"
+    assert summary["contract_version"] == "2"
 
 
 def test_reference_summary_agrees_with_the_csv_and_the_run_folders(reference_run):
@@ -2845,14 +2875,14 @@ def test_the_tracking_folder_holds_only_config_log_and_operational_metrics(refer
     }
 
 
-def test_metrics_are_written_only_after_both_outputs_are_published(reference_run):
-    assert reference_run.observed["outputs_at_metrics_write"] == sorted([OUTREACH_FILE, SUMMARY_FILE])
+def test_metrics_are_written_only_after_all_four_outputs_are_published(reference_run):
+    assert reference_run.observed["outputs_at_metrics_write"] == sorted(FINAL_NAMES)
 
 
 def test_outputs_go_to_the_passed_folder_not_the_configured_one(reference_run):
     env = reference_run.env
 
-    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
+    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted(FINAL_NAMES)
     assert not env.config["paths"]["outputs_dir"].exists()
 
 
@@ -2863,9 +2893,9 @@ def test_the_default_outputs_folder_is_the_repository_outputs_folder():
 
 
 def test_run_scoring_writes_to_the_given_folder_and_returns_the_paths(
-    tmp_path, conn, command_model
+    tmp_path, conn, calibrated_fit
 ):
-    env = make_command_env(tmp_path, command_model)
+    env = make_command_env(tmp_path, calibrated_fit)
 
     result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
 
@@ -2874,6 +2904,8 @@ def test_run_scoring_writes_to_the_given_folder_and_returns_the_paths(
     assert result.model_run_id == env.model_ids[0]
     assert (result.customers_scored, result.customers_flagged) == (1408, 141)
     assert result.outreach_path == env.outputs_dir / OUTREACH_FILE
+    assert result.economics_path == env.outputs_dir / ECONOMICS_FILE
+    assert result.recommendations_path == env.outputs_dir / RECOMMENDATIONS_FILE
     assert result.summary_path == env.outputs_dir / SUMMARY_FILE
     assert not env.config["paths"]["outputs_dir"].exists()
 
@@ -2894,9 +2926,9 @@ def test_the_scoring_population_is_the_test_split_with_nullable_columns_kept_as_
 
 
 def test_an_explicit_run_id_selects_that_model_and_the_default_selects_the_newest(
-    tmp_path, conn, command_model
+    tmp_path, conn, calibrated_fit
 ):
-    env = make_command_env(tmp_path, command_model, (FIRST_MODEL_INSTANT, SECOND_MODEL_INSTANT))
+    env = make_command_env(tmp_path, calibrated_fit, (FIRST_MODEL_INSTANT, SECOND_MODEL_INSTANT))
     older, newer = env.model_ids
 
     default_result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
@@ -2917,14 +2949,14 @@ def test_an_explicit_run_id_selects_that_model_and_the_default_selects_the_newes
 # Retention
 
 
-def test_a_successful_run_replaces_the_previous_pair(tmp_path, monkeypatch, conn, command_model):
-    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+def test_a_successful_run_replaces_the_previous_set(tmp_path, monkeypatch, conn, calibrated_fit):
+    env = failure_env(tmp_path, monkeypatch, conn, calibrated_fit)
 
     score.main([])
 
-    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
-    assert (env.outputs_dir / OUTREACH_FILE).read_bytes() != OLD_CSV
-    assert (env.outputs_dir / SUMMARY_FILE).read_bytes() != OLD_SUMMARY
+    assert folder_names(env.outputs_dir) == sorted(FINAL_NAMES)
+    for name in FINAL_NAMES:
+        assert (env.outputs_dir / name).read_bytes() != OLD_FILES[name], name
     assert sorted(path.name for path in env.run_dir.iterdir()) == ["config.json", "metrics.json", "run.log"]
 
 
@@ -2948,7 +2980,7 @@ def test_class_1_a_damaged_population_publishes_nothing(
     with caplog.at_level(logging.ERROR):
         run_command()
 
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
     assert "class 1" in caplog.text
     assert "duplicate customer_id" in caplog.text
@@ -2970,7 +3002,7 @@ def test_class_2a_no_valid_model(tmp_path, monkeypatch, conn, command_model, cap
     run_2a(caplog)
 
     assert "make train" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
 
 
@@ -2984,7 +3016,7 @@ def test_class_2a_an_explicit_run_id_that_is_missing_or_invalid_has_no_fallback(
         run_command(["--run-id", requested])
 
     assert "class 2a" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
 
 
@@ -2997,7 +3029,7 @@ def test_class_2a_an_existing_tracking_folder_stops_the_run_at_the_start(
 
     run_2a(caplog)
 
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert sorted(path.name for path in env.run_dir.iterdir()) == ["keep.txt"]
 
 
@@ -3018,12 +3050,12 @@ def test_class_2a_a_scoring_error_from_a_scripted_model(
     run_2a(caplog)
 
     assert "ScoringError" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
 
 
-def test_class_2a_a_temporary_file_write_failure(tmp_path, monkeypatch, conn, command_model, caplog):
-    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+def test_class_2a_a_temporary_file_write_failure(tmp_path, monkeypatch, conn, calibrated_fit, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, calibrated_fit)
 
     def failing_write(path, data):
         raise OSError("disk full")
@@ -3033,7 +3065,7 @@ def test_class_2a_a_temporary_file_write_failure(tmp_path, monkeypatch, conn, co
     run_2a(caplog)
 
     assert "OutputGenerationError" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
 
 
@@ -3048,7 +3080,7 @@ def test_class_2a_an_unexpected_error_while_scoring(tmp_path, monkeypatch, conn,
     run_2a(caplog)
 
     assert "RuntimeError" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert_no_metrics(env)
 
 
@@ -3064,7 +3096,7 @@ def test_class_2a_a_database_error(tmp_path, monkeypatch, conn, command_model, c
 
     run_2a(caplog)
 
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
     assert not env.run_dir.exists()
 
 
@@ -3079,38 +3111,38 @@ def test_class_2a_a_configuration_error(tmp_path, monkeypatch, conn, command_mod
     run_2a(caplog)
 
     assert "the configuration is broken" in caplog.text
-    assert_previous_pair_unchanged(env.outputs_dir)
+    assert_old_set_unchanged(env.outputs_dir)
 
 
 # Class 2b
 
 
-def test_class_2b_a_failed_summary_replacement(tmp_path, monkeypatch, conn, command_model, caplog):
-    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+def test_class_2b_a_failed_summary_replacement(tmp_path, monkeypatch, conn, calibrated_fit, caplog):
+    env = failure_env(tmp_path, monkeypatch, conn, calibrated_fit)
     fail_summary_replace(monkeypatch)
 
     with caplog.at_level(logging.ERROR):
         run_command()
 
     assert "class 2b" in caplog.text
-    assert f"{OUTREACH_FILE} was replaced" in caplog.text
+    for name in (OUTREACH_FILE, ECONOMICS_FILE, RECOMMENDATIONS_FILE):
+        assert f"{name} was replaced" in caplog.text
+        assert (env.outputs_dir / name).read_bytes() != OLD_FILES[name]
     assert f"{SUMMARY_FILE} was not replaced" in caplog.text
     assert "may be inconsistent" in caplog.text
-    new_csv = (env.outputs_dir / OUTREACH_FILE).read_bytes()
-    assert new_csv != OLD_CSV
-    assert len(parse_csv(new_csv)) == 1409
+    assert len(parse_csv((env.outputs_dir / OUTREACH_FILE).read_bytes())) == 1409
     assert (env.outputs_dir / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
-    assert sorted(path.name for path in env.outputs_dir.iterdir()) == sorted([OUTREACH_FILE, SUMMARY_FILE])
+    assert folder_names(env.outputs_dir) == sorted(FINAL_NAMES)
     assert_no_metrics(env)
 
 
 # Class 3
 
 
-def test_class_3_a_tracking_failure_after_publication_keeps_both_files(
-    tmp_path, monkeypatch, conn, command_model, caplog
+def test_class_3_a_tracking_failure_after_publication_keeps_all_four_files(
+    tmp_path, monkeypatch, conn, calibrated_fit, caplog
 ):
-    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+    env = failure_env(tmp_path, monkeypatch, conn, calibrated_fit)
 
     def broken_write_metrics(self, metrics):
         raise TrackingError("disk full")
@@ -3126,15 +3158,16 @@ def test_class_3_a_tracking_failure_after_publication_keeps_both_files(
     assert COMMAND_RUN_ID in caplog.text
     assert "disk full" in caplog.text
     assert len(parse_csv((env.outputs_dir / OUTREACH_FILE).read_bytes())) == 1409
-    assert (env.outputs_dir / SUMMARY_FILE).read_bytes() != OLD_SUMMARY
+    for name in FINAL_NAMES:
+        assert (env.outputs_dir / name).read_bytes() != OLD_FILES[name], name
     assert json.loads((env.outputs_dir / SUMMARY_FILE).read_text(encoding="utf-8"))["scoring_run_id"] == COMMAND_RUN_ID
     assert_no_metrics(env)
 
 
 def test_run_scoring_raises_the_class_3_error_with_the_scoring_run_id(
-    tmp_path, conn, command_model, monkeypatch
+    tmp_path, conn, calibrated_fit, monkeypatch
 ):
-    env = make_command_env(tmp_path, command_model)
+    env = make_command_env(tmp_path, calibrated_fit)
 
     def broken_write_metrics(self, metrics):
         raise TrackingError("disk full")
@@ -3146,6 +3179,240 @@ def test_run_scoring_raises_the_class_3_error_with_the_scoring_run_id(
 
     assert exc_info.value.scoring_run_id == COMMAND_RUN_ID
     assert isinstance(exc_info.value.__cause__, TrackingError)
+
+
+# The full output set
+
+
+def test_a_run_publishes_the_four_outputs_of_contract_v2(tmp_path, conn, calibrated_fit):
+    env = make_command_env(tmp_path, calibrated_fit)
+
+    run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert folder_names(env.outputs_dir) == sorted(FINAL_NAMES)
+    rows = parse_csv((env.outputs_dir / OUTREACH_FILE).read_bytes())
+    assert rows[0] == EXTENDED_COLUMNS
+    summary = json.loads((env.outputs_dir / SUMMARY_FILE).read_text(encoding="utf-8"))
+    assert list(summary) == SUMMARY_KEYS_V2
+    assert len(summary) == 9
+    assert summary["contract_version"] == CONTRACT_VERSION_V2 == "2"
+    for name, title in ((ECONOMICS_FILE, "Economics Summary"), (RECOMMENDATIONS_FILE, "Business Recommendations")):
+        lines = document_lines(env.outputs_dir / name)
+        assert lines[0] == f"# {title}"
+        assert lines[1] == ""
+        assert lines[2] == SCORING_RUN_ID_LABEL + COMMAND_RUN_ID
+        assert lines[3] == MODEL_RUN_ID_LABEL + env.model_ids[0]
+
+
+def test_run_scoring_on_the_real_population_gives_the_reference_counts_and_tiers(
+    tmp_path, conn, calibrated_fit
+):
+    env = make_command_env(tmp_path, calibrated_fit)
+
+    result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert (result.customers_scored, result.customers_flagged) == (1408, 141)
+    rows = parse_csv(result.outreach_path.read_bytes())
+    tiers = [row[4] for row in rows[1:]]
+    assert [tiers.count(name) for name in ("High", "Medium", "Low")] == [141, 211, 1056]
+    assert tiers == ["High"] * 141 + ["Medium"] * 211 + ["Low"] * 1056
+    assert all(cell != "" for row in rows for cell in row)
+    assert {row[5] for row in rows[1:]} <= set(DRIVER_LABELS.values())
+    assert json.loads((env.run_dir / "metrics.json").read_text(encoding="utf-8")) == {
+        "k": 0.1,
+        "customers_scored": 1408,
+        "customers_flagged": 141,
+        "model_run_id": env.model_ids[0],
+    }
+    for path in (result.outreach_path, result.economics_path, result.recommendations_path, result.summary_path):
+        assert path.parent == env.outputs_dir
+        assert path.is_file()
+
+
+def test_one_assumptions_object_and_one_results_object_reach_the_documents(
+    tmp_path, monkeypatch, conn, calibrated_fit
+):
+    env = make_command_env(tmp_path, calibrated_fit)
+    built, analyzed, economics_calls, recommendations_calls = [], [], [], []
+    real_build = score._economics_assumptions
+    real_analyze = score.analyze_economics
+    real_economics_document = score.render_economics_document
+    real_recommendations_document = score.render_recommendations_document
+
+    def spy_build(config):
+        assumptions = real_build(config)
+        built.append(assumptions)
+        return assumptions
+
+    def spy_analyze(table, monthly_charge, k_frac, k_values, assumptions):
+        results = real_analyze(table, monthly_charge, k_frac, k_values, assumptions)
+        analyzed.append((assumptions, results))
+        return results
+
+    def spy_economics_document(results, assumptions, *rest):
+        economics_calls.append((results, assumptions))
+        return real_economics_document(results, assumptions, *rest)
+
+    def spy_recommendations_document(facts, recommendations, results, *rest):
+        recommendations_calls.append(results)
+        return real_recommendations_document(facts, recommendations, results, *rest)
+
+    monkeypatch.setattr(score, "_economics_assumptions", spy_build)
+    monkeypatch.setattr(score, "analyze_economics", spy_analyze)
+    monkeypatch.setattr(score, "render_economics_document", spy_economics_document)
+    monkeypatch.setattr(score, "render_recommendations_document", spy_recommendations_document)
+
+    run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert len(built) == len(analyzed) == len(economics_calls) == len(recommendations_calls) == 1
+    assert analyzed[0][0] is built[0]
+    assert economics_calls[0][1] is built[0]
+    assert economics_calls[0][0] is analyzed[0][1]
+    assert recommendations_calls[0] is analyzed[0][1]
+
+
+def test_the_assumptions_come_from_the_economics_configuration():
+    config = {"business": {"economics": {"save_rate": 0.3, "months_kept": 4, "offer_cost": 15, "arpu_proxy": 70.0}}}
+
+    assumptions = score._economics_assumptions(config)
+
+    assert assumptions == EconomicsAssumptions(save_rate=0.3, months_kept=4, offer_cost=15, arpu_proxy=70.0)
+
+
+def test_metrics_do_not_exist_when_publication_returns_and_appear_after_it(
+    tmp_path, monkeypatch, conn, calibrated_fit
+):
+    env = make_command_env(tmp_path, calibrated_fit)
+    real_publish = score.publish_output_set
+    observed = {}
+
+    def spy_publish(*args, **kwargs):
+        paths = real_publish(*args, **kwargs)
+        observed["metrics_exist_at_return"] = (env.run_dir / "metrics.json").exists()
+        return paths
+
+    monkeypatch.setattr(score, "publish_output_set", spy_publish)
+
+    run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    assert observed == {"metrics_exist_at_return": False}
+    assert (env.run_dir / "metrics.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "attribute,error",
+    [
+        ("averaged_contributions", DriverError("fold models disagree")),
+        ("analyze_economics", EconomicsError("flags disagree with k")),
+        ("compute_recommendation_facts", RecommendationsError("unlabelled feature")),
+    ],
+    ids=["drivers", "economics", "recommendations"],
+)
+def test_class_2a_a_failure_in_a_new_step_changes_nothing(
+    tmp_path, monkeypatch, conn, calibrated_fit, caplog, attribute, error
+):
+    env = failure_env(tmp_path, monkeypatch, conn, calibrated_fit)
+
+    def raising(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(score, attribute, raising)
+
+    run_2a(caplog)
+
+    assert type(error).__name__ in caplog.text
+    assert str(error) in caplog.text
+    assert "Unexpected error" not in caplog.text
+    assert_old_set_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+def test_class_2a_a_model_without_fold_models_stops_at_the_driver_check(
+    tmp_path, monkeypatch, conn, command_model, caplog
+):
+    env = failure_env(tmp_path, monkeypatch, conn, command_model)
+
+    run_2a(caplog)
+
+    assert "DriverError" in caplog.text
+    assert_old_set_unchanged(env.outputs_dir)
+    assert_no_metrics(env)
+
+
+# extend_outreach_table matches drivers by customer_id
+
+
+def hand_made_extension_inputs():
+    """Five ranked customers and a driver frame in a different row order,
+    where every customer has its own three features."""
+    ids = ["C10", "C11", "C12", "C13", "C14"]
+    table = pd.DataFrame(
+        {
+            "customer_id": pd.Series(ids, dtype=object),
+            "churn_probability": pd.Series([0.9, 0.8, 0.6, 0.4, 0.1], dtype="float64"),
+            "rank": pd.Series([1, 2, 3, 4, 5], dtype="int64"),
+            "in_top_k": [True, True, False, False, False],
+        }
+    )
+    keys = list(DRIVER_LABELS)
+    rows = []
+    for position in range(len(ids)):
+        row = []
+        for slot in range(3):
+            row.append(keys[position * 3 + slot])
+            row.append(DIRECTION_RAISES if (position + slot) % 2 == 0 else DIRECTION_LOWERS)
+        rows.append(row)
+    drivers = pd.DataFrame(rows, index=ids, columns=DRIVER_COLUMNS, dtype=object).iloc[::-1]
+    return table, drivers
+
+
+def test_each_customer_gets_their_own_drivers_whatever_the_driver_row_order():
+    table, drivers = hand_made_extension_inputs()
+    assert list(drivers.index) != list(table["customer_id"])
+
+    extended = extend_outreach_table(table, drivers, 0.4, 0.6)
+
+    assert list(extended.columns) == EXTENDED_TABLE_COLUMNS
+    assert extended[TABLE_COLUMNS].equals(table)
+    tiers = assign_risk_tiers(table["rank"], 0.4, 0.6).tolist()
+    for position, customer in enumerate(table["customer_id"]):
+        row = extended.iloc[position]
+        source = drivers.loc[customer]
+        assert row["risk_tier"] == tiers[position]
+        for slot in (1, 2, 3):
+            assert row[f"driver_{slot}"] == DRIVER_LABELS[source[f"driver_{slot}"]]
+            assert row[f"driver_{slot}_direction"] == source[f"driver_{slot}_direction"]
+
+
+def test_extending_the_table_does_not_change_the_table_or_the_drivers():
+    table, drivers = hand_made_extension_inputs()
+    table_before = table.copy(deep=True)
+    drivers_before = drivers.copy(deep=True)
+
+    extend_outreach_table(table, drivers, 0.4, 0.6)
+
+    pd.testing.assert_frame_equal(table, table_before)
+    pd.testing.assert_frame_equal(drivers, drivers_before)
+
+
+def test_the_published_list_equals_the_table_built_from_the_real_contributions(
+    tmp_path, conn, calibrated_fit, driver_data, driver_contributions
+):
+    env = make_command_env(tmp_path, calibrated_fit)
+    k_frac = env.config["business"]["k"]
+    medium_edge = env.config["business"]["risk_tiers"]["medium_edge"]
+
+    result = run_scoring(env.config, conn, SCORING_INSTANT, outputs_dir=env.outputs_dir)
+
+    expected = real_extended_table(driver_data, driver_contributions, k_frac, medium_edge)
+    expected_rows = parse_csv(extended_outreach_csv_bytes(expected, k_frac, medium_edge))
+    written_rows = parse_csv(result.outreach_path.read_bytes())
+    assert written_rows[0] == expected_rows[0] == EXTENDED_COLUMNS
+    assert [row[0] for row in written_rows] == [row[0] for row in expected_rows]
+    expected_by_id = {row[0]: row for row in expected_rows[1:]}
+    assert len(expected_by_id) == len(written_rows) - 1 == 1408
+    for row in written_rows[1:]:
+        assert row == expected_by_id[row[0]], row[0]
 
 
 # main: exit codes and messages for each error type
@@ -3174,6 +3441,12 @@ def test_run_scoring_raises_the_class_3_error_with_the_scoring_run_id(
         (ModelLoadError("no valid model"), ["class 2a", "before anything was published"]),
         (ScoringError("bad probabilities"), ["class 2a", "before anything was published"]),
         (OutputGenerationError("cannot build"), ["class 2a", "before anything was published"]),
+        (DriverError("fold models missing"), ["class 2a", "before anything was published", "DriverError"]),
+        (EconomicsError("bad economics input"), ["class 2a", "before anything was published", "EconomicsError"]),
+        (
+            RecommendationsError("unlabelled feature"),
+            ["class 2a", "before anything was published", "RecommendationsError"],
+        ),
         (duckdb.IOException("db broken"), ["class 2a", "before anything was published"]),
         (RuntimeError("boom"), ["class 2a", "before anything was published", "RuntimeError"]),
     ],
@@ -3185,6 +3458,9 @@ def test_run_scoring_raises_the_class_3_error_with_the_scoring_run_id(
         "model-load",
         "scoring",
         "output-generation",
+        "drivers",
+        "economics",
+        "recommendations",
         "database",
         "unexpected",
     ],
@@ -3219,6 +3495,8 @@ def test_main_succeeds_without_exiting_and_logs_the_result(
         customers_scored=1408,
         customers_flagged=141,
         outreach_path=env.outputs_dir / OUTREACH_FILE,
+        economics_path=env.outputs_dir / ECONOMICS_FILE,
+        recommendations_path=env.outputs_dir / RECOMMENDATIONS_FILE,
         summary_path=env.outputs_dir / SUMMARY_FILE,
     )
     monkeypatch.setattr(score, "run_scoring", lambda *args, **kwargs: result)
@@ -3231,6 +3509,8 @@ def test_main_succeeds_without_exiting_and_logs_the_result(
     assert COMMAND_RUN_ID in caplog.text
     assert env.model_ids[0] in caplog.text
     assert "1408" in caplog.text and "141" in caplog.text
+    for name in FINAL_NAMES:
+        assert name in caplog.text, name
 
 
 def test_main_passes_the_run_id_option_to_run_scoring(tmp_path, monkeypatch, conn, command_model):
@@ -3240,7 +3520,7 @@ def test_main_passes_the_run_id_option_to_run_scoring(tmp_path, monkeypatch, con
 
     def spy_run_scoring(config, connection, instant, *, run_id=None, outputs_dir=None):
         seen.update(run_id=run_id, outputs_dir=outputs_dir, instant=instant)
-        return ScoringResult(COMMAND_RUN_ID, "x", 1, 1, Path("a"), Path("b"))
+        return ScoringResult(COMMAND_RUN_ID, "x", 1, 1, Path("a"), Path("b"), Path("c"), Path("d"))
 
     monkeypatch.setattr(score, "run_scoring", spy_run_scoring)
 
@@ -3441,20 +3721,14 @@ def test_invalid_ranks_are_rejected(ranks, problem):
 
 
 @pytest.fixture(scope="module")
-def driver_data(conn):
+def driver_data(conn, calibrated_fit):
     """The real preprocessor and schema, a small calibrated XGBoost model
     fitted on the real training rows, and the real scoring population."""
-    inputs = prepare_model_inputs(conn)
-    schema = build_input_schema(read_feat_churn_types(conn), inputs.preprocessor)
-    model = CalibratedClassifierCV(
-        xgb.XGBClassifier(n_estimators=20, max_depth=3, random_state=0),
-        method="sigmoid",
-        cv=5,
-    ).fit(inputs.X_train, inputs.y_train.astype(int))
+    schema = calibrated_fit.schema
     names = [column["name"] for column in schema["columns"]]
     population = select_scoring_population(conn, schema)
     return SimpleNamespace(
-        run=make_run(schema, inputs.preprocessor, model),
+        run=make_run(schema, calibrated_fit.preprocessor, calibrated_fit.model),
         names=names,
         inputs=population[names].reset_index(drop=True),
         ids=[str(value) for value in population[schema["identifier_column"]]],

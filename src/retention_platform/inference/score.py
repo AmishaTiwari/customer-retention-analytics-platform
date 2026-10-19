@@ -6,7 +6,7 @@ in_top_k). The table is validated first; a column that is not a model
 input is never given to the model, and no label column is read.
 
 The command (main, run_scoring) selects the held-out test population,
-scores it, publishes the two output files and tracks the run. Run it with
+scores it, builds and publishes the four outputs and tracks the run. Run it with
 `python -m retention_platform.inference.score`.
 """
 
@@ -24,13 +24,34 @@ import numpy as np
 import pandas as pd
 
 from retention_platform.config import REPO_ROOT, ConfigValidationError, load_config
+from retention_platform.inference.drivers import (
+    DRIVER_COLUMNS,
+    DRIVER_LABELS,
+    DriverError,
+    averaged_contributions,
+    global_importance,
+    select_top_drivers,
+)
+from retention_platform.inference.economics import (
+    EconomicsAssumptions,
+    EconomicsError,
+    analyze_economics,
+    render_economics_document,
+)
 from retention_platform.inference.outputs import (
+    EXTENDED_TABLE_COLUMNS,
     OutputGenerationError,
     OutputPublicationError,
-    build_run_summary,
-    publish_outputs,
+    build_extended_run_summary,
+    publish_output_set,
 )
-from retention_platform.inference.ranking import top_k_count
+from retention_platform.inference.ranking import assign_risk_tiers, top_k_count
+from retention_platform.inference.recommendations import (
+    RecommendationsError,
+    compute_recommendation_facts,
+    render_recommendations_document,
+    select_recommendations,
+)
 from retention_platform.inference.validate import InputValidationError, validate_scoring_table
 from retention_platform.logging_setup import setup_logging
 from retention_platform.models.persist import LoadedRun, ModelLoadError, load_run
@@ -110,6 +131,40 @@ def score_batch(frame: pd.DataFrame, loaded_run: LoadedRun, k_frac: float) -> pd
     return table[["customer_id", "churn_probability", "rank", "in_top_k"]]
 
 
+def extend_outreach_table(
+    table: pd.DataFrame, drivers: pd.DataFrame, k_frac: float, medium_edge: float
+) -> pd.DataFrame:
+    """The eleven-column outreach table: the score_batch table plus the risk
+    tier and the three labelled drivers with their directions.
+
+    drivers is the select_top_drivers output, indexed by customer_id; its
+    rows are matched to the table by customer_id, not by position. Driver
+    features are turned into labels with DRIVER_LABELS. The inputs are not
+    changed.
+    """
+    matched = drivers.loc[table["customer_id"]]
+    extended = table.copy()
+    extended["risk_tier"] = assign_risk_tiers(table["rank"], k_frac, medium_edge).to_numpy()
+    for column in DRIVER_COLUMNS:
+        values = matched[column].tolist()
+        if column.endswith("_direction"):
+            extended[column] = values
+        else:
+            extended[column] = [DRIVER_LABELS[feature] for feature in values]
+    return extended[EXTENDED_TABLE_COLUMNS]
+
+
+def _economics_assumptions(config: dict) -> EconomicsAssumptions:
+    """The base economics assumptions from business.economics."""
+    economics = config["business"]["economics"]
+    return EconomicsAssumptions(
+        save_rate=economics["save_rate"],
+        months_kept=economics["months_kept"],
+        offer_cost=economics["offer_cost"],
+        arpu_proxy=economics["arpu_proxy"],
+    )
+
+
 @dataclass(frozen=True)
 class ScoringResult:
     """What a finished scoring run produced."""
@@ -119,11 +174,13 @@ class ScoringResult:
     customers_scored: int
     customers_flagged: int
     outreach_path: Path
+    economics_path: Path
+    recommendations_path: Path
     summary_path: Path
 
 
 class PostPublicationTrackingError(Exception):
-    """Both outputs were published, but a required tracking write failed."""
+    """All four outputs were published, but a required tracking write failed."""
 
     def __init__(self, scoring_run_id: str, message: str):
         super().__init__(message)
@@ -150,9 +207,10 @@ def run_scoring(
     """Score the test population inside a tracked scoring run.
 
     run_id picks a model run; None means the newest valid one. The outputs
-    go to outputs_dir. metrics.json is written last, only after both
-    outputs are published; if that write fails the outputs are kept and
-    PostPublicationTrackingError is raised.
+    go to outputs_dir. All four outputs are built in memory before the
+    first file is replaced. metrics.json is written last, only after the
+    four outputs are published; if that write fails the outputs are kept
+    and PostPublicationTrackingError is raised.
     """
     with track_run(config, "score", instant) as run:
         try:
@@ -162,14 +220,55 @@ def run_scoring(
             population = select_scoring_population(conn, loaded_run.schema)
             k_frac = config["business"]["k"]
             table = score_batch(population, loaded_run, k_frac)
-            summary = build_run_summary(
-                table,
+
+            medium_edge = config["business"]["risk_tiers"]["medium_edge"]
+            identifier = loaded_run.schema["identifier_column"]
+            input_columns = [column["name"] for column in loaded_run.schema["columns"]]
+            ids = [str(value) for value in population[identifier].astype(object).tolist()]
+            inputs = population[input_columns].set_axis(ids, axis=0)
+            drivers = select_top_drivers(averaged_contributions(loaded_run, inputs, ids))
+            extended = extend_outreach_table(table, drivers, k_frac, medium_edge)
+
+            assumptions = _economics_assumptions(config)
+            results = analyze_economics(
+                table, inputs["monthly_charge"], k_frac, config["business"]["k_sensitivity"], assumptions
+            )
+            economics_text = render_economics_document(
+                results, assumptions, k_frac, len(table), run.run_id, loaded_run.run_id
+            )
+
+            facts = compute_recommendation_facts(
+                table, inputs, drivers, global_importance(loaded_run), k_frac, medium_edge
+            )
+            recommendations = select_recommendations(facts, results.base_case, DRIVER_LABELS)
+            recommendations_text = render_recommendations_document(
+                facts,
+                recommendations,
+                results,
+                DRIVER_LABELS,
+                k_frac,
+                medium_edge,
+                run.run_id,
+                loaded_run.run_id,
+            )
+
+            summary = build_extended_run_summary(
+                extended,
                 k_frac=k_frac,
+                medium_edge=medium_edge,
                 model_run_id=loaded_run.run_id,
                 scoring_run_id=run.run_id,
                 manifest=loaded_run.manifest,
             )
-            outreach_path, summary_path = publish_outputs(outputs_dir, table, summary)
+            outreach_path, economics_path, recommendations_path, summary_path = publish_output_set(
+                outputs_dir,
+                extended,
+                economics_text,
+                recommendations_text,
+                summary,
+                k_frac=k_frac,
+                medium_edge=medium_edge,
+            )
         except Exception as exc:
             logger.error("Scoring run %s failed: %s: %s", run.run_id, type(exc).__name__, exc)
             raise
@@ -198,6 +297,8 @@ def run_scoring(
             customers_scored=int(len(table)),
             customers_flagged=customers_flagged,
             outreach_path=outreach_path,
+            economics_path=economics_path,
+            recommendations_path=recommendations_path,
             summary_path=summary_path,
         )
 
@@ -206,7 +307,7 @@ def main(argv: list[str] | None = None) -> None:
     setup_logging()
 
     parser = argparse.ArgumentParser(
-        prog="score", description="Score the held-out test split and publish the outputs."
+        prog="score", description="Score the held-out test split and publish the four outputs."
     )
     parser.add_argument(
         "--run-id",
@@ -242,6 +343,9 @@ def main(argv: list[str] | None = None) -> None:
         ModelLoadError,
         ScoringError,
         OutputGenerationError,
+        DriverError,
+        EconomicsError,
+        RecommendationsError,
         duckdb.Error,
     ) as exc:
         logger.error(
@@ -264,12 +368,14 @@ def main(argv: list[str] | None = None) -> None:
             conn.close()
 
     logger.info(
-        "Scoring complete: run %s, model run %s, %d customers scored, %d flagged, outputs %s and %s",
+        "Scoring complete: run %s, model run %s, %d customers scored, %d flagged, outputs %s, %s, %s and %s",
         result.run_id,
         result.model_run_id,
         result.customers_scored,
         result.customers_flagged,
         result.outreach_path,
+        result.economics_path,
+        result.recommendations_path,
         result.summary_path,
     )
 
