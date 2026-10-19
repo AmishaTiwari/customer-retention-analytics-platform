@@ -1,11 +1,16 @@
-"""Build and publish the two scoring outputs: the prioritized outreach CSV
-and the run summary JSON.
+"""Build and publish the scoring outputs.
 
-The CSV and the summary are built as bytes first, so a table or manifest
-that cannot be written fails before any file is touched. Publication
-replaces each file as a whole, the CSV first and the summary second, using
-a temporary file next to each final file. No backup of an earlier file is
-made, and nothing is rolled back.
+Two publication paths exist. publish_outputs replaces the four-column
+outreach CSV and then the run summary, using a temporary file next to each
+final file. publish_output_set writes the eleven-column outreach CSV, the
+economics document, the recommendations document and the run summary to
+temporary files first, replaces the CSV, the economics document and the
+recommendations document in that order, checks the three files and the run
+IDs read back from the two documents, and replaces the run summary last.
+
+Every output is built as bytes in memory before any file is touched, so a
+table, text or manifest that cannot be written fails before a replacement.
+On a replacement failure nothing is rolled back and no backup is made.
 """
 
 from __future__ import annotations
@@ -36,6 +41,15 @@ logger = logging.getLogger(__name__)
 OUTREACH_FILE = "prioritized_outreach_list.csv"
 SUMMARY_FILE = "run_summary.json"
 CONTRACT_VERSION = "1"
+CONTRACT_VERSION_V2 = "2"
+ECONOMICS_FILE = "economics_summary.md"
+RECOMMENDATIONS_FILE = "business_recommendations.md"
+OUTPUT_FILES_PREFIX = "outputs/"
+OUTPUT_FILES = {
+    "outreach_list": OUTPUT_FILES_PREFIX + OUTREACH_FILE,
+    "economics_summary": OUTPUT_FILES_PREFIX + ECONOMICS_FILE,
+    "business_recommendations": OUTPUT_FILES_PREFIX + RECOMMENDATIONS_FILE,
+}
 SNAPSHOT_NOTICE = (
     "Historical snapshot: this list scores the held-out test split for "
     "demonstration. It is not a live outreach list."
@@ -86,12 +100,22 @@ class OutputGenerationError(Exception):
 
 
 class OutputPublicationError(Exception):
-    """A file replacement failed. csv_replaced and summary_replaced say
-    which final files now hold the new content."""
+    """A file replacement or a check before the summary replacement failed.
+    The flags say which final files this run replaced."""
 
-    def __init__(self, message: str, *, csv_replaced: bool, summary_replaced: bool):
+    def __init__(
+        self,
+        message: str,
+        *,
+        csv_replaced: bool,
+        summary_replaced: bool,
+        economics_replaced: bool = False,
+        recommendations_replaced: bool = False,
+    ):
         super().__init__(message)
         self.csv_replaced = csv_replaced
+        self.economics_replaced = economics_replaced
+        self.recommendations_replaced = recommendations_replaced
         self.summary_replaced = summary_replaced
 
 
@@ -405,36 +429,187 @@ def publish_outputs(
     return csv_path, summary_path
 
 
-def write_extended_outreach_csv(
-    outputs_dir: str | Path, table: pd.DataFrame, k_frac: float, medium_edge: float
-) -> Path:
-    """Replace the outreach CSV in outputs_dir with the eleven-column list.
+def build_extended_run_summary(
+    table: pd.DataFrame,
+    *,
+    k_frac: float,
+    medium_edge: float,
+    model_run_id: str,
+    scoring_run_id: str,
+    manifest: dict,
+) -> dict:
+    """Build the contract v2 run summary as plain Python data, with the keys
+    and key order of the contract. model_health is a deep copy of the
+    manifest's values."""
+    check_extended_outreach_table(table, k_frac, medium_edge)
+    for name, value in (("model_run_id", model_run_id), ("scoring_run_id", scoring_run_id)):
+        if not is_valid_run_id(value):
+            raise OutputGenerationError(f"{name} is not a valid run id: {value!r}")
+    model_health = _check_manifest_health(manifest)
 
-    The file goes through a temporary file in the same folder and is then
-    replaced as a whole. Returns the path of the CSV.
+    return {
+        "contract_version": CONTRACT_VERSION_V2,
+        "k": float(k_frac),
+        "customers_scored": int(len(table)),
+        "customers_flagged": int(table["in_top_k"].sum()),
+        "model_run_id": model_run_id,
+        "scoring_run_id": scoring_run_id,
+        "snapshot_notice": SNAPSHOT_NOTICE,
+        "model_health": model_health,
+        "output_files": dict(OUTPUT_FILES),
+    }
+
+
+def _check_set_inputs(
+    table: pd.DataFrame,
+    economics_text: object,
+    recommendations_text: object,
+    summary: object,
+    k_frac: float,
+    medium_edge: float,
+) -> None:
+    check_extended_outreach_table(table, k_frac, medium_edge)
+    for name, text in (("economics_text", economics_text), ("recommendations_text", recommendations_text)):
+        if not isinstance(text, str) or not text.strip():
+            raise OutputGenerationError(f"{name} must be non-empty text, got {text!r}")
+    if not isinstance(summary, dict):
+        raise OutputGenerationError(f"the run summary must be a dict, got {type(summary).__name__}")
+    for name in ("scoring_run_id", "model_run_id"):
+        if not is_valid_run_id(summary.get(name)):
+            raise OutputGenerationError(f"summary {name} is not a valid run id: {summary.get(name)!r}")
+    scored, flagged = summary.get("customers_scored"), summary.get("customers_flagged")
+    if isinstance(scored, bool) or scored != len(table):
+        raise OutputGenerationError(
+            f"summary customers_scored ({scored!r}) does not match the {len(table)} rows of the table"
+        )
+    if isinstance(flagged, bool) or flagged != int(table["in_top_k"].sum()):
+        raise OutputGenerationError(
+            f"summary customers_flagged ({flagged!r}) does not match the {int(table['in_top_k'].sum())} "
+            "flagged rows of the table"
+        )
+    if not _is_number(summary.get("k")) or summary["k"] != k_frac:
+        raise OutputGenerationError(f"summary k ({summary.get('k')!r}) does not match k_frac ({k_frac!r})")
+
+
+def _set_publication_error(replaced: dict, cause: str) -> OutputPublicationError:
+    """The class 2b error: for each of the four files, whether this run replaced it."""
+    status = "; ".join(
+        f"{name} {'was replaced' if replaced[name] else 'was not replaced'}"
+        for name in (OUTREACH_FILE, ECONOMICS_FILE, RECOMMENDATIONS_FILE, SUMMARY_FILE)
+    )
+    message = (
+        f"Publication failed: {status}. The output set may be inconsistent until a successful "
+        "run. Previous files were not restored and no copy of them is kept. "
+        f"Cause: {cause}"
+    )
+    return OutputPublicationError(
+        message,
+        csv_replaced=replaced[OUTREACH_FILE],
+        economics_replaced=replaced[ECONOMICS_FILE],
+        recommendations_replaced=replaced[RECOMMENDATIONS_FILE],
+        summary_replaced=replaced[SUMMARY_FILE],
+    )
+
+
+def _problem_before_summary(
+    deliverables: tuple[Path, Path, Path], documents: tuple[Path, Path], summary: dict
+) -> str | None:
+    """Why the three deliverables or the run IDs in the two documents are not
+    as expected, or None. The documents are read back from disk and only
+    lines 3 and 4 count."""
+    for path in deliverables:
+        if not path.is_file():
+            return f"{path.name} does not exist as a file in {path.parent}"
+
+    expected = (
+        (3, SCORING_RUN_ID_LABEL + summary["scoring_run_id"]),
+        (4, MODEL_RUN_ID_LABEL + summary["model_run_id"]),
+    )
+    for path in documents:
+        try:
+            lines = path.read_bytes().decode("utf-8").split("\n")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"{path.name} could not be read back: {exc}"
+        for number, wanted in expected:
+            found = lines[number - 1] if len(lines) >= number else None
+            if found != wanted:
+                return f"{path.name} line {number} is {found!r}, expected {wanted!r}"
+    return None
+
+
+def publish_output_set(
+    outputs_dir: str | Path,
+    table: pd.DataFrame,
+    economics_text: str,
+    recommendations_text: str,
+    summary: dict,
+    *,
+    k_frac: float,
+    medium_edge: float,
+) -> tuple[Path, Path, Path, Path]:
+    """Replace the four outputs in outputs_dir and return their paths.
+
+    All four are written to temporary files next to their final files first.
+    The CSV, the economics document and the recommendations document are
+    then replaced in that order, the three files and the run IDs read back
+    from the two documents are checked, and the run summary is replaced
+    last. The first failure stops publication: nothing is rolled back, and
+    the error says for each of the four files whether this run replaced it.
     """
-    csv_bytes = extended_outreach_csv_bytes(table, k_frac, medium_edge)
+    _check_set_inputs(table, economics_text, recommendations_text, summary, k_frac, medium_edge)
+    try:
+        payloads = {
+            OUTREACH_FILE: extended_outreach_csv_bytes(table, k_frac, medium_edge),
+            ECONOMICS_FILE: economics_text.encode("utf-8"),
+            RECOMMENDATIONS_FILE: recommendations_text.encode("utf-8"),
+            SUMMARY_FILE: summary_json_bytes(summary),
+        }
+    except UnicodeEncodeError as exc:
+        raise OutputGenerationError(f"a document cannot be encoded as UTF-8: {exc}") from exc
 
     folder = Path(outputs_dir)
-    csv_path = folder / OUTREACH_FILE
-    csv_temp = folder / (_TEMP_PREFIX + OUTREACH_FILE)
+    finals = {name: folder / name for name in payloads}
+    temps = {name: folder / (_TEMP_PREFIX + name) for name in payloads}
 
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        _write_file(csv_temp, csv_bytes)
+        for name, data in payloads.items():
+            _write_file(temps[name], data)
     except OSError as exc:
-        _remove_quietly(csv_temp)
+        _remove_quietly(*temps.values())
         raise OutputGenerationError(
-            f"the outreach list could not be written to a temporary file in {folder}: {exc}"
+            f"the outputs could not be written to temporary files in {folder}: {exc}"
         ) from exc
 
+    replaced = {name: False for name in payloads}
+    for name in (OUTREACH_FILE, ECONOMICS_FILE, RECOMMENDATIONS_FILE):
+        try:
+            os.replace(temps[name], finals[name])
+        except OSError as exc:
+            _remove_quietly(*temps.values())
+            raise _set_publication_error(replaced, str(exc)) from exc
+        replaced[name] = True
+
+    problem = _problem_before_summary(
+        (finals[OUTREACH_FILE], finals[ECONOMICS_FILE], finals[RECOMMENDATIONS_FILE]),
+        (finals[ECONOMICS_FILE], finals[RECOMMENDATIONS_FILE]),
+        summary,
+    )
+    if problem is not None:
+        _remove_quietly(*temps.values())
+        raise _set_publication_error(replaced, f"check before the run summary failed: {problem}")
+
     try:
-        os.replace(csv_temp, csv_path)
+        os.replace(temps[SUMMARY_FILE], finals[SUMMARY_FILE])
     except OSError as exc:
-        _remove_quietly(csv_temp)
-        raise OutputPublicationError(
-            f"Publication failed: {csv_path.name} was not replaced. Cause: {exc}",
-            csv_replaced=False,
-            summary_replaced=False,
-        ) from exc
-    return csv_path
+        _remove_quietly(*temps.values())
+        raise _set_publication_error(replaced, str(exc)) from exc
+    replaced[SUMMARY_FILE] = True
+
+    logger.info("Published %s in %s", ", ".join(payloads), folder)
+    return (
+        finals[OUTREACH_FILE],
+        finals[ECONOMICS_FILE],
+        finals[RECOMMENDATIONS_FILE],
+        finals[SUMMARY_FILE],
+    )

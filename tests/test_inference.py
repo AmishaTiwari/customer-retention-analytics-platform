@@ -64,22 +64,27 @@ from retention_platform.inference.economics import (
     render_economics_document,
 )
 from retention_platform.inference.outputs import (
+    CONTRACT_VERSION_V2,
+    ECONOMICS_FILE,
     EXTENDED_TABLE_COLUMNS,
     MODEL_RUN_ID_LABEL,
+    OUTPUT_FILES,
     OUTREACH_FILE,
+    RECOMMENDATIONS_FILE,
     SCORING_RUN_ID_LABEL,
     SNAPSHOT_NOTICE,
     SUMMARY_FILE,
     OutputGenerationError,
     OutputPublicationError,
+    build_extended_run_summary,
     build_run_summary,
     check_extended_outreach_table,
     document_header,
     extended_outreach_csv_bytes,
     outreach_csv_bytes,
+    publish_output_set,
     publish_outputs,
     summary_json_bytes,
-    write_extended_outreach_csv,
 )
 from retention_platform.inference.recommendations import (
     ACTIONABILITY,
@@ -1974,73 +1979,6 @@ def test_customer_ids_with_a_comma_a_quotation_mark_and_a_line_break_read_back_u
     assert rows[1:] == expected_extended_rows(table)
 
 
-def test_the_extended_writer_replaces_the_csv_through_a_temporary_file(tmp_path):
-    folder = tmp_path / "outputs"
-    folder.mkdir()
-    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
-
-    path = write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
-
-    assert path == folder / OUTREACH_FILE
-    assert path.read_bytes() == extended_bytes()
-    assert folder_names(folder) == [OUTREACH_FILE]
-
-
-def test_the_extended_writer_creates_a_missing_folder(tmp_path):
-    folder = tmp_path / "does" / "not" / "exist"
-
-    write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
-
-    assert folder_names(folder) == [OUTREACH_FILE]
-
-
-def test_a_failed_temporary_write_changes_nothing_for_the_extended_writer(tmp_path, monkeypatch):
-    folder = tmp_path / "outputs"
-    folder.mkdir()
-    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
-
-    def failing_write(path, data):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(outputs, "_write_file", failing_write)
-
-    with pytest.raises(OutputGenerationError, match="disk full"):
-        write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
-
-    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
-    assert folder_names(folder) == [OUTREACH_FILE]
-
-
-def test_a_failed_replace_keeps_the_previous_csv_and_leaves_no_temporary_file(tmp_path, monkeypatch):
-    folder = tmp_path / "outputs"
-    folder.mkdir()
-    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
-
-    def failing_replace(source, target):
-        raise OSError("locked by another program")
-
-    monkeypatch.setattr(outputs.os, "replace", failing_replace)
-
-    with pytest.raises(OutputPublicationError, match="locked by another program") as exc_info:
-        write_extended_outreach_csv(folder, extended_table(), EXT_K, EXT_EDGE)
-
-    assert exc_info.value.csv_replaced is False
-    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
-    assert folder_names(folder) == [OUTREACH_FILE]
-
-
-def test_a_bad_table_is_refused_before_any_file_is_touched(tmp_path):
-    folder = tmp_path / "outputs"
-    folder.mkdir()
-    (folder / OUTREACH_FILE).write_bytes(OLD_CSV)
-
-    with pytest.raises(OutputGenerationError):
-        write_extended_outreach_csv(folder, with_cell("driver_1", 0, "nope")(extended_table()), EXT_K, EXT_EDGE)
-
-    assert (folder / OUTREACH_FILE).read_bytes() == OLD_CSV
-    assert folder_names(folder) == [OUTREACH_FILE]
-
-
 def real_extended_table(driver_data, driver_contributions, k_frac, medium_edge):
     """The eleven-column table for the real population, assembled in the test
     from score_batch, assign_risk_tiers, select_top_drivers and DRIVER_LABELS."""
@@ -2056,14 +1994,11 @@ def real_extended_table(driver_data, driver_contributions, k_frac, medium_edge):
     return extended[EXTENDED_COLUMNS]
 
 
-def test_the_real_population_table_is_accepted_written_and_read_back(
-    tmp_path, driver_data, driver_contributions
-):
+def test_the_real_population_table_is_accepted_written_and_read_back(driver_data, driver_contributions):
     table = real_extended_table(driver_data, driver_contributions, 0.10, 0.25)
 
     check_extended_outreach_table(table, 0.10, 0.25)
-    path = write_extended_outreach_csv(tmp_path / "outputs", table, 0.10, 0.25)
-    rows = parse_csv(path.read_bytes())
+    rows = parse_csv(extended_outreach_csv_bytes(table, 0.10, 0.25))
 
     assert rows[0] == EXTENDED_COLUMNS
     assert len(rows) == 1 + 1408
@@ -2079,6 +2014,590 @@ def test_the_real_population_table_is_accepted_written_and_read_back(
     }
     assert {row[5] for row in rows[1:]} <= set(DRIVER_LABELS.values())
     assert [row[0] for row in rows[1:]] == list(table["customer_id"])
+
+
+# Four-file publication
+
+SET_ECONOMICS = document_header("Economics Summary", SCORING_RUN_ID, MODEL_RUN_ID) + "\n## Section\n\nBody text.\n"
+SET_RECOMMENDATIONS = (
+    document_header("Business Recommendations", SCORING_RUN_ID, MODEL_RUN_ID) + "\n## Section\n\nBody text.\n"
+)
+OLD_ECONOMICS = b"previous economics\n"
+OLD_RECOMMENDATIONS = b"previous recommendations\n"
+FINAL_NAMES = [OUTREACH_FILE, ECONOMICS_FILE, RECOMMENDATIONS_FILE, SUMMARY_FILE]
+OLD_FILES = {
+    OUTREACH_FILE: OLD_CSV,
+    ECONOMICS_FILE: OLD_ECONOMICS,
+    RECOMMENDATIONS_FILE: OLD_RECOMMENDATIONS,
+    SUMMARY_FILE: OLD_SUMMARY,
+}
+SUMMARY_KEYS_V2 = [*SUMMARY_KEYS, "output_files"]
+OUTPUT_FILES_V2 = {
+    "outreach_list": "outputs/prioritized_outreach_list.csv",
+    "economics_summary": "outputs/economics_summary.md",
+    "business_recommendations": "outputs/business_recommendations.md",
+}
+
+
+def write_old_files(folder, names=FINAL_NAMES):
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (folder / name).write_bytes(OLD_FILES[name])
+
+
+def assert_old_files(folder, names):
+    for name in names:
+        assert (folder / name).read_bytes() == OLD_FILES[name], name
+
+
+@pytest.fixture
+def output_set(tmp_path, output_manifest):
+    table = extended_table()
+    summary = build_extended_run_summary(
+        table,
+        k_frac=EXT_K,
+        medium_edge=EXT_EDGE,
+        model_run_id=MODEL_RUN_ID,
+        scoring_run_id=SCORING_RUN_ID,
+        manifest=output_manifest,
+    )
+    folder = tmp_path / "outputs"
+
+    def publish(**overrides):
+        arguments = dict(
+            outputs_dir=folder,
+            table=table,
+            economics_text=SET_ECONOMICS,
+            recommendations_text=SET_RECOMMENDATIONS,
+            summary=summary,
+            k_frac=EXT_K,
+            medium_edge=EXT_EDGE,
+        )
+        arguments.update(overrides)
+        return publish_output_set(**arguments)
+
+    return SimpleNamespace(
+        folder=folder, table=table, summary=summary, publish=publish, manifest=output_manifest
+    )
+
+
+def spy_replace(monkeypatch, fail_on=None, skip=None, corrupt=None):
+    """Record every replacement target; optionally fail on one target, do
+    nothing for one target, or corrupt one target after it is replaced."""
+    real_replace = os.replace
+    calls = []
+
+    def replace(source, target):
+        name = Path(target).name
+        calls.append(name)
+        if name == fail_on:
+            raise OSError("locked by another program")
+        if name == skip:
+            return None
+        real_replace(source, target)
+        if name == corrupt:
+            Path(target).write_bytes(bytes([0xFF, 0xFE, 0x80]) + b" not utf-8\n")
+        return None
+
+    monkeypatch.setattr(outputs.os, "replace", replace)
+    return calls
+
+
+# Constants and the version 2 summary
+
+
+def test_the_new_file_name_constants_and_output_paths():
+    assert ECONOMICS_FILE == "economics_summary.md"
+    assert RECOMMENDATIONS_FILE == "business_recommendations.md"
+    assert CONTRACT_VERSION_V2 == "2"
+    assert OUTPUT_FILES == OUTPUT_FILES_V2
+    assert list(OUTPUT_FILES) == ["outreach_list", "economics_summary", "business_recommendations"]
+
+
+def expected_summary_v2(output_manifest):
+    return {
+        "contract_version": "2",
+        "k": EXT_K,
+        "customers_scored": 10,
+        "customers_flagged": 2,
+        "model_run_id": MODEL_RUN_ID,
+        "scoring_run_id": SCORING_RUN_ID,
+        "snapshot_notice": (
+            "Historical snapshot: this list scores the held-out test split for "
+            "demonstration. It is not a live outreach list."
+        ),
+        "model_health": {
+            "trained_at_utc": "2026-10-11T12:00:00Z",
+            "package_version": output_manifest["package_version"],
+            "training_cv_metrics": OUTPUT_METRICS,
+            "held_out_results_reference": "ADR-0014",
+        },
+        "output_files": OUTPUT_FILES_V2,
+    }
+
+
+def test_the_version_two_summary_is_the_exact_dict_with_the_nine_fields_in_order(output_set):
+    summary = output_set.summary
+
+    assert summary == expected_summary_v2(output_set.manifest)
+    assert list(summary) == SUMMARY_KEYS_V2
+    assert list(summary["output_files"]) == ["outreach_list", "economics_summary", "business_recommendations"]
+    assert list(summary["model_health"]) == MODEL_HEALTH_KEYS
+    assert type(summary["k"]) is float and type(summary["customers_scored"]) is int
+
+
+def test_the_version_two_summary_model_health_is_a_deep_copy(output_set):
+    manifest_before = copy.deepcopy(output_set.manifest)
+
+    output_set.summary["model_health"]["training_cv_metrics"]["pr_auc"] = 0.0
+    output_set.summary["output_files"]["outreach_list"] = "changed"
+
+    assert output_set.manifest == manifest_before
+    assert OUTPUT_FILES == OUTPUT_FILES_V2
+
+
+def summary_arguments(manifest, **overrides):
+    arguments = dict(
+        k_frac=EXT_K,
+        medium_edge=EXT_EDGE,
+        model_run_id=MODEL_RUN_ID,
+        scoring_run_id=SCORING_RUN_ID,
+        manifest=manifest,
+    )
+    arguments.update(overrides)
+    return arguments
+
+
+def test_the_version_two_summary_refuses_a_bad_table(output_manifest):
+    table = with_cell("driver_1", 0, "nope")(extended_table())
+
+    with pytest.raises(OutputGenerationError, match="not a label of the label map"):
+        build_extended_run_summary(table, **summary_arguments(output_manifest))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"k_frac": 0.5},
+        {"k_frac": 0},
+        {"k_frac": True},
+        {"medium_edge": 0.2},
+        {"medium_edge": 1.5},
+        {"medium_edge": None},
+        {"model_run_id": "not-a-run-id"},
+        {"scoring_run_id": "../20261011T123500Z"},
+        {"scoring_run_id": ""},
+    ],
+    ids=["k-equal-to-edge-ish", "k-zero", "k-bool", "edge-below-k", "edge-above-one", "edge-none",
+         "bad-model-run-id", "bad-scoring-run-id", "empty-scoring-run-id"],
+)
+def test_the_version_two_summary_refuses_bad_arguments(output_manifest, overrides):
+    with pytest.raises(OutputGenerationError):
+        build_extended_run_summary(extended_table(), **summary_arguments(output_manifest, **overrides))
+
+
+@pytest.mark.parametrize("damage", list(MANIFEST_DAMAGE.values()), ids=list(MANIFEST_DAMAGE))
+def test_the_version_two_summary_refuses_a_manifest_that_breaks_the_contract(output_manifest, damage):
+    manifest = copy.deepcopy(output_manifest)
+    damage(manifest)
+
+    with pytest.raises(OutputGenerationError):
+        build_extended_run_summary(extended_table(), **summary_arguments(manifest))
+
+
+def test_the_version_one_summary_and_error_constructions_are_unchanged(ranked_table, output_manifest):
+    summary = make_summary(ranked_table, output_manifest)
+    error = OutputPublicationError("m", csv_replaced=True, summary_replaced=False)
+
+    assert summary["contract_version"] == "1"
+    assert list(summary) == SUMMARY_KEYS
+    assert (error.csv_replaced, error.summary_replaced) == (True, False)
+    assert (error.economics_replaced, error.recommendations_replaced) == (False, False)
+
+
+# Success path
+
+
+def test_publishing_the_set_writes_the_four_files_with_the_exact_bytes(output_set):
+    paths = output_set.publish()
+
+    folder = output_set.folder
+    assert paths == tuple(folder / name for name in FINAL_NAMES)
+    assert paths[0].read_bytes() == extended_outreach_csv_bytes(output_set.table, EXT_K, EXT_EDGE)
+    assert paths[1].read_bytes() == SET_ECONOMICS.encode("utf-8")
+    assert paths[2].read_bytes() == SET_RECOMMENDATIONS.encode("utf-8")
+    parsed = json.loads(paths[3].read_text(encoding="utf-8"))
+    assert parsed == output_set.summary
+    assert list(parsed) == SUMMARY_KEYS_V2
+    assert parsed["contract_version"] == "2"
+    assert parsed["output_files"] == OUTPUT_FILES_V2
+    assert (parsed["customers_scored"], parsed["customers_flagged"], parsed["k"]) == (10, 2, EXT_K)
+    assert folder_names(folder) == sorted(FINAL_NAMES)
+    assert not any(name.startswith(".tmp-") for name in folder_names(folder))
+
+
+def test_the_documents_keep_their_line_feeds_on_disk(output_set):
+    output_set.publish()
+
+    for name, text in ((ECONOMICS_FILE, SET_ECONOMICS), (RECOMMENDATIONS_FILE, SET_RECOMMENDATIONS)):
+        data = (output_set.folder / name).read_bytes()
+        assert b"\r" not in data
+        assert data == text.encode("utf-8")
+
+
+def test_publishing_replaces_a_previous_set_and_is_deterministic(output_set, tmp_path):
+    write_old_files(output_set.folder)
+    first_paths = output_set.publish()
+    first = [path.read_bytes() for path in first_paths]
+    other = tmp_path / "other"
+
+    output_set.publish(outputs_dir=other)
+
+    assert [(other / name).read_bytes() for name in FINAL_NAMES] == first
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+def test_the_inputs_are_not_changed_by_publishing(output_set):
+    table_before = output_set.table.copy(deep=True)
+    summary_before = copy.deepcopy(output_set.summary)
+
+    output_set.publish()
+
+    pd.testing.assert_frame_equal(output_set.table, table_before)
+    assert output_set.summary == summary_before
+
+
+def test_the_replacements_happen_in_the_fixed_order(output_set, monkeypatch):
+    calls = spy_replace(monkeypatch)
+
+    output_set.publish()
+
+    assert calls == FINAL_NAMES
+
+
+# Class 2a: nothing replaced
+
+
+@pytest.mark.parametrize("failing", FINAL_NAMES, ids=["csv-temp", "economics-temp", "recommendations-temp", "summary-temp"])
+def test_a_failed_temporary_write_of_any_of_the_four_files_changes_nothing(output_set, monkeypatch, failing):
+    write_old_files(output_set.folder)
+    real_write = outputs._write_file
+
+    def failing_write(path, data):
+        if path.name == ".tmp-" + failing:
+            raise OSError("disk full")
+        return real_write(path, data)
+
+    monkeypatch.setattr(outputs, "_write_file", failing_write)
+    calls = spy_replace(monkeypatch)
+
+    with pytest.raises(OutputGenerationError, match="disk full"):
+        output_set.publish()
+
+    assert calls == []
+    assert_old_files(output_set.folder, FINAL_NAMES)
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+def lone_surrogate_text():
+    return "text " + chr(0xD800)
+
+
+SET_REFUSALS = {
+    "bad-table": (lambda s: dict(table=with_cell("driver_1", 0, "nope")(s.table)), "not a label of the label map"),
+    "four-column-table": (lambda s: dict(table=s.table[TABLE_COLUMNS]), "exactly the columns"),
+    "empty-economics": (lambda s: dict(economics_text=""), "economics_text must be non-empty text"),
+    "blank-recommendations": (lambda s: dict(recommendations_text="  \n"), "recommendations_text must be non-empty text"),
+    "economics-not-text": (lambda s: dict(economics_text=5), "economics_text must be non-empty text"),
+    "recommendations-bytes": (lambda s: dict(recommendations_text=b"text"), "recommendations_text must be non-empty text"),
+    "text-that-cannot-be-encoded": (lambda s: dict(economics_text=lone_surrogate_text()), "UTF-8"),
+    "summary-not-a-dict": (lambda s: dict(summary=[1]), "must be a dict"),
+    "summary-bad-scoring-run-id": (lambda s: dict(summary={**s.summary, "scoring_run_id": "x"}), "scoring_run_id"),
+    "summary-bad-model-run-id": (lambda s: dict(summary={**s.summary, "model_run_id": ""}), "model_run_id"),
+    "summary-without-a-run-id": (lambda s: dict(summary={k: v for k, v in s.summary.items() if k != "model_run_id"}), "model_run_id"),
+    "summary-customers-scored-differs": (lambda s: dict(summary={**s.summary, "customers_scored": 9}), "customers_scored"),
+    "summary-customers-scored-bool": (lambda s: dict(summary={**s.summary, "customers_scored": True}), "customers_scored"),
+    "summary-customers-flagged-differs": (lambda s: dict(summary={**s.summary, "customers_flagged": 3}), "customers_flagged"),
+    "summary-k-differs": (lambda s: dict(summary={**s.summary, "k": 0.3}), "summary k"),
+    "summary-k-missing": (lambda s: dict(summary={k: v for k, v in s.summary.items() if k != "k"}), "summary k"),
+    "summary-cannot-be-serialized": (lambda s: dict(summary={**s.summary, "extra": float("nan")}), "JSON"),
+    "pair-with-k-at-the-edge": (lambda s: dict(k_frac=0.5, medium_edge=0.5), "0 < k_frac < medium_edge <= 1"),
+    "pair-with-bad-edge": (lambda s: dict(medium_edge=1.5), "0 < k_frac < medium_edge <= 1"),
+}
+
+
+@pytest.mark.parametrize("build,fragment", list(SET_REFUSALS.values()), ids=list(SET_REFUSALS))
+def test_bad_input_is_refused_before_any_file_is_touched(output_set, monkeypatch, build, fragment):
+    write_old_files(output_set.folder)
+    calls = spy_replace(monkeypatch)
+
+    with pytest.raises(OutputGenerationError) as exc_info:
+        output_set.publish(**build(output_set))
+
+    assert fragment in str(exc_info.value)
+    assert calls == []
+    assert_old_files(output_set.folder, FINAL_NAMES)
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+def test_a_refusal_creates_no_folder(output_set):
+    with pytest.raises(OutputGenerationError):
+        output_set.publish(economics_text="")
+
+    assert not output_set.folder.exists()
+
+
+# Class 2b: failure at each replacement
+
+
+EXPECTED_FLAGS = [
+    (False, False, False, False),
+    (True, False, False, False),
+    (True, True, False, False),
+    (True, True, True, False),
+]
+
+
+@pytest.mark.parametrize("index", range(4), ids=["csv", "economics", "recommendations", "summary"])
+def test_a_failed_replacement_stops_publication_and_reports_each_file(output_set, monkeypatch, index):
+    write_old_files(output_set.folder)
+    calls = spy_replace(monkeypatch, fail_on=FINAL_NAMES[index])
+    new_bytes = {
+        OUTREACH_FILE: extended_outreach_csv_bytes(output_set.table, EXT_K, EXT_EDGE),
+        ECONOMICS_FILE: SET_ECONOMICS.encode("utf-8"),
+        RECOMMENDATIONS_FILE: SET_RECOMMENDATIONS.encode("utf-8"),
+    }
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish()
+
+    error = exc_info.value
+    message = str(error)
+    assert (
+        error.csv_replaced,
+        error.economics_replaced,
+        error.recommendations_replaced,
+        error.summary_replaced,
+    ) == EXPECTED_FLAGS[index]
+    assert calls == FINAL_NAMES[: index + 1]
+    for position, name in enumerate(FINAL_NAMES):
+        assert (f"{name} was replaced" in message) is (position < index)
+        assert (f"{name} was not replaced" in message) is (position >= index)
+        if position < index:
+            assert (output_set.folder / name).read_bytes() == new_bytes[name]
+        else:
+            assert (output_set.folder / name).read_bytes() == OLD_FILES[name]
+    assert "may be inconsistent" in message
+    assert "not restored" in message and "no copy" in message
+    assert "locked by another program" in message
+    assert isinstance(error.__cause__, OSError)
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+@pytest.mark.parametrize("index", range(3), ids=["csv", "economics", "recommendations"])
+def test_a_failure_before_the_summary_leaves_the_previous_summary_unchanged(output_set, monkeypatch, index):
+    write_old_files(output_set.folder)
+    spy_replace(monkeypatch, fail_on=FINAL_NAMES[index])
+
+    with pytest.raises(OutputPublicationError):
+        output_set.publish()
+
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+
+
+def test_a_first_run_failure_at_the_summary_leaves_the_three_new_files_and_no_summary(output_set, monkeypatch):
+    spy_replace(monkeypatch, fail_on=SUMMARY_FILE)
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish()
+
+    assert exc_info.value.summary_replaced is False
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES[:3])
+
+
+def test_a_failing_cleanup_does_not_mask_the_original_error_for_the_set(output_set, monkeypatch):
+    spy_replace(monkeypatch, fail_on=ECONOMICS_FILE)
+
+    def failing_remove(path):
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(outputs.os, "remove", failing_remove)
+
+    with pytest.raises(OutputPublicationError, match="locked by another program") as exc_info:
+        output_set.publish()
+
+    assert "cleanup failure" not in str(exc_info.value)
+
+
+# Class 2b: the checks before the summary
+
+
+@pytest.mark.parametrize("target", FINAL_NAMES[:3], ids=["csv", "economics", "recommendations"])
+def test_a_deliverable_that_is_missing_after_its_replacement_stops_the_summary(output_set, monkeypatch, target):
+    write_old_files(output_set.folder, [SUMMARY_FILE])
+    spy_replace(monkeypatch, skip=target)
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish()
+
+    error = exc_info.value
+    assert f"{target} does not exist as a file" in str(error)
+    assert (error.csv_replaced, error.economics_replaced, error.recommendations_replaced) == (True, True, True)
+    assert error.summary_replaced is False
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+    assert not any(name.startswith(".tmp-") for name in folder_names(output_set.folder))
+
+
+@pytest.mark.parametrize("target", FINAL_NAMES[:3], ids=["csv", "economics", "recommendations"])
+def test_a_deliverable_path_that_holds_a_directory_stops_the_summary(output_set, monkeypatch, target):
+    write_old_files(output_set.folder, [SUMMARY_FILE])
+    (output_set.folder / target).mkdir()
+    spy_replace(monkeypatch, skip=target)
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish()
+
+    error = exc_info.value
+    assert f"{target} does not exist as a file" in str(error)
+    assert (error.csv_replaced, error.economics_replaced, error.recommendations_replaced) == (True, True, True)
+    assert error.summary_replaced is False
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+    assert (output_set.folder / target).is_dir()
+    assert not any(name.startswith(".tmp-") for name in folder_names(output_set.folder))
+
+
+def header_text(scoring="20261011T123500Z", model="20261011T120000Z", newline="\n"):
+    return newline.join(["# Title", "", f"Scoring run ID: {scoring}", f"Model run ID: {model}", "", "Body", ""])
+
+
+READ_BACK_CASES = {
+    "wrong-scoring-run-id": (header_text(scoring="20260101T000000Z"), 3),
+    "wrong-model-run-id": (header_text(model="20260101T000000Z"), 4),
+    "no-header-at-all": ("Just a body\nwithout any header\n\nmore\n", 3),
+    "ids-on-the-wrong-lines": (
+        "\n".join(["# Title", "", "Model run ID: 20261011T120000Z", "Scoring run ID: 20261011T123500Z", ""]),
+        3,
+    ),
+    "right-ids-only-in-the-body": (
+        "\n".join(
+            [
+                "# Title",
+                "",
+                "Scoring run ID: 20260101T000000Z",
+                "Model run ID: 20260101T000000Z",
+                "Scoring run ID: 20261011T123500Z",
+                "Model run ID: 20261011T120000Z",
+                "",
+            ]
+        ),
+        3,
+    ),
+    "crlf-header": (header_text(newline="\r\n"), 3),
+    "fewer-than-four-lines": ("# Title\n", 3),
+}
+
+
+@pytest.mark.parametrize("target", [ECONOMICS_FILE, RECOMMENDATIONS_FILE], ids=["economics", "recommendations"])
+@pytest.mark.parametrize("text,line", list(READ_BACK_CASES.values()), ids=list(READ_BACK_CASES))
+def test_a_document_with_the_wrong_run_ids_stops_the_summary(output_set, monkeypatch, target, text, line):
+    write_old_files(output_set.folder)
+    spy_replace(monkeypatch)
+    keyword = "economics_text" if target == ECONOMICS_FILE else "recommendations_text"
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish(**{keyword: text})
+
+    error = exc_info.value
+    message = str(error)
+    assert f"{target} line {line}" in message
+    assert (error.csv_replaced, error.economics_replaced, error.recommendations_replaced) == (True, True, True)
+    assert error.summary_replaced is False
+    assert f"{SUMMARY_FILE} was not replaced" in message
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+    assert (output_set.folder / target).read_bytes() == text.encode("utf-8")
+    assert folder_names(output_set.folder) == sorted(FINAL_NAMES)
+
+
+@pytest.mark.parametrize("target", [ECONOMICS_FILE, RECOMMENDATIONS_FILE], ids=["economics", "recommendations"])
+def test_a_document_that_is_not_valid_utf_8_stops_the_summary(output_set, monkeypatch, target):
+    write_old_files(output_set.folder)
+    spy_replace(monkeypatch, corrupt=target)
+
+    with pytest.raises(OutputPublicationError) as exc_info:
+        output_set.publish()
+
+    error = exc_info.value
+    assert f"{target} could not be read back" in str(error)
+    assert (error.csv_replaced, error.economics_replaced, error.recommendations_replaced) == (True, True, True)
+    assert error.summary_replaced is False
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+    assert not any(name.startswith(".tmp-") for name in folder_names(output_set.folder))
+
+
+def test_a_document_that_cannot_be_read_back_stops_the_summary(output_set, monkeypatch):
+    write_old_files(output_set.folder)
+    real_read_bytes = Path.read_bytes
+
+    def failing_read(self):
+        if self.name == ECONOMICS_FILE:
+            raise OSError("read failure")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", failing_read)
+
+    with pytest.raises(OutputPublicationError, match="read failure"):
+        output_set.publish()
+
+    monkeypatch.undo()
+    assert (output_set.folder / SUMMARY_FILE).read_bytes() == OLD_SUMMARY
+
+
+def test_a_matching_header_with_the_ids_also_in_the_body_is_accepted(output_set):
+    text = header_text() + "Scoring run ID: 20260101T000000Z\n"
+
+    output_set.publish(economics_text=text)
+
+    assert (output_set.folder / ECONOMICS_FILE).read_bytes() == text.encode("utf-8")
+
+
+# Real population
+
+
+def test_the_real_population_set_is_published_and_read_back(
+    tmp_path, driver_data, driver_contributions, output_manifest
+):
+    table = real_extended_table(driver_data, driver_contributions, 0.10, 0.25)
+    summary = build_extended_run_summary(
+        table,
+        k_frac=0.10,
+        medium_edge=0.25,
+        model_run_id=MODEL_RUN_ID,
+        scoring_run_id=SCORING_RUN_ID,
+        manifest=output_manifest,
+    )
+    economics_text = document_header("Economics Summary", SCORING_RUN_ID, MODEL_RUN_ID) + "\n## Section\n\nA short body.\n"
+    recommendations_text = (
+        document_header("Business Recommendations", SCORING_RUN_ID, MODEL_RUN_ID) + "\n## Section\n\nA short body.\n"
+    )
+    folder = tmp_path / "outputs"
+
+    paths = publish_output_set(
+        folder, table, economics_text, recommendations_text, summary, k_frac=0.10, medium_edge=0.25
+    )
+
+    assert [path.name for path in paths] == FINAL_NAMES
+    rows = parse_csv(paths[0].read_bytes())
+    tiers = [row[4] for row in rows[1:]]
+    assert len(rows) == 1 + 1408
+    assert [tiers.count(name) for name in ("High", "Medium", "Low")] == [141, 211, 1056]
+    parsed = json.loads(paths[3].read_text(encoding="utf-8"))
+    assert (parsed["contract_version"], parsed["customers_scored"], parsed["customers_flagged"]) == ("2", 1408, 141)
+    assert parsed["output_files"] == OUTPUT_FILES_V2
+    for path in paths[1:3]:
+        lines = path.read_bytes().decode("utf-8").split("\n")
+        assert lines[2] == SCORING_RUN_ID_LABEL + SCORING_RUN_ID
+        assert lines[3] == MODEL_RUN_ID_LABEL + MODEL_RUN_ID
+    assert folder_names(folder) == sorted(FINAL_NAMES)
 
 
 # =============================================================================
